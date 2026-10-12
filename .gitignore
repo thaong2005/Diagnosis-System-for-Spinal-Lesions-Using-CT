@@ -1,0 +1,9 @@
+# Môi trường Python
+.venv/
+
+# Dữ liệu bệnh nhân và dữ liệu đã xử lý
+/data/
+
+# File tạm của Python
+__pycache__/
+*.pyc
