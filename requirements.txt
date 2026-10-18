@@ -1,1 +1,6 @@
-pydicom
+# Các dependency trực tiếp của project (Python 3.13)
+matplotlib==3.11.2
+numpy==2.5.3
+pydicom==3.0.2
+PySide6==6.12.0
+SimpleITK==2.5.6

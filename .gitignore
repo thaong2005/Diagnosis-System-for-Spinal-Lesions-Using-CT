@@ -1,9 +1,25 @@
-# Môi trường Python
-.venv/
+# Môi trường Python cục bộ
+.venv*/
+.env
+.env.*
+!.env.example
 
 # Dữ liệu bệnh nhân và dữ liệu đã xử lý
 /data/
 
-# File tạm của Python
+# Cache và file sinh tự động bởi Python/công cụ phát triển
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tmp/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Cấu hình riêng của máy phát triển và ảnh CT minh họa chưa ẩn danh
+.vscode/
+/Expected_output/
