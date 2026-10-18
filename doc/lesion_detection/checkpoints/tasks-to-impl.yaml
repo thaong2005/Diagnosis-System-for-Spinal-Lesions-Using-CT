@@ -1,0 +1,22 @@
+tasks:
+  T001:
+    status: complete
+    evidence:
+      - spinal_ct/labels.py
+  T002:
+    status: complete
+    evidence:
+      - tools/audit_dataset.py
+  T003:
+    status: complete
+    evidence:
+      - tests/test_labels.py
+  T004:
+    status: complete
+    evidence:
+      - data/processed/dataset_audit.json
+    note: Generated artifact is ignored by Git because it summarizes local clinical data.
+  T005:
+    status: blocked
+    reason: Only 4 of 10 distinct DICOM PatientID values match CSV identifiers directly.
+
