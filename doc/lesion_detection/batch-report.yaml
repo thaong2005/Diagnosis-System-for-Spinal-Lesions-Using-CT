@@ -1,0 +1,41 @@
+batch: lesion-detection-foundation-001
+status: partial_success
+implemented_tasks: [T001, T002, T003, T004]
+blocked_tasks: [T005]
+requirements_addressed: [REQ-002, REQ-003, REQ-010]
+files_created:
+  - spinal_ct/__init__.py
+  - spinal_ct/labels.py
+  - tools/__init__.py
+  - tools/audit_dataset.py
+  - tests/test_labels.py
+  - doc/lesion_detection/spec.md
+  - doc/lesion_detection/research.md
+  - doc/lesion_detection/plan.md
+validation:
+  unit_tests:
+    passed: 3
+    failed: 0
+    skipped: 0
+  compile_check: passed
+  dataset_audit:
+    candidate_files: 7739
+    ct_image_files: 7638
+    ct_series: 53
+    distinct_dicom_patient_ids: 10
+    matched_dicom_patient_ids: 4
+    invalid_specific_character_set_files: 668
+privacy:
+  aggregate_output_contains_patient_identifiers: false
+  raw_data_committed: false
+warnings:
+  - severity: HIGH
+    message: DICOM-to-CSV linkage is incomplete; do not create train/validation/test splits yet.
+  - severity: HIGH
+    message: Dataset currently contains only labelled fracture cases, so false positives per scan cannot be evaluated.
+  - severity: MEDIUM
+    message: Six-class labels are strongly imbalanced; A1 and B3 each have one case.
+  - severity: MEDIUM
+    message: 668 DICOM files contain the non-standard charset value ISO IR 192.
+next_task: T005
+
