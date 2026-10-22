@@ -1,0 +1,2 @@
+Cách xác định mức độ tổn thương xương cột sống bằng ảnh chụp CT
+dùng phương pháp monte caclo model

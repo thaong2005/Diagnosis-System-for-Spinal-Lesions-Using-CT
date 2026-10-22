@@ -1,120 +1,179 @@
-# FS — Mô tả và kế hoạch dự án
+# FS — Mô tả, tiến độ và lộ trình dự án
 
 - **Tên dự án:** Development of a Deep Learning-Based Computer-Aided Diagnosis System for Spinal Lesions Using CT
-- **Ngày cập nhật:** 18/10/2026
-- **Công cụ:** Python, VS Code, Windows. Máy phát triển hiện tại không có GPU.
+- **Ngày cập nhật:** 19/10/2026
+- **Môi trường:** Python 3.13, VS Code, Windows, CPU; máy phát triển hiện tại chưa có GPU.
+- **Phạm vi bản thử nghiệm:** Nhận biết vị trí và đánh giá tổn thương xương cột sống ngực–thắt lưng từ ảnh CT.
 
-## 1. Dự án làm gì?
+## 1. Định nghĩa dự án
 
-Dự án xây dựng phần mềm hỗ trợ đánh giá tổn thương cột sống từ ảnh CT của bệnh nhân.
+Dự án xây dựng phần mềm hỗ trợ đánh giá tổn thương cột sống từ **ảnh CT của một bệnh nhân**. Hệ thống phải tự kiểm tra bộ ảnh, dựng thể tích 3D, xác định các đốt sống, tìm vùng nghi tổn thương, đánh giá biến dạng và đưa ra kết quả có thể kiểm tra được.
 
-Phần mềm nối các lát cắt CT thành hình ảnh thể tích 3D, tìm các vùng thay đổi bất thường, đánh giá sự biến dạng và đưa ra vị trí, mức độ, phân loại tổn thương. Deep learning được sử dụng ở các bước phân tích phù hợp với dữ liệu và nhãn có sẵn.
+Deep learning chỉ được dùng khi dữ liệu, nhãn và tài nguyên tính toán phù hợp. Bản thử nghiệm không thay thế chẩn đoán của bác sĩ; kết quả phải hiển thị độ tin cậy và trạng thái chưa kết luận khi dữ liệu không đủ.
 
-Bản thử nghiệm đầu tiên tập trung vào gãy đốt sống vùng ngực–thắt lưng. Kết quả cần được chuyên gia kiểm tra, không thay thế chẩn đoán của bác sĩ.
+### Ranh giới đầu vào bắt buộc
 
-## 2. Input — Dữ liệu đầu vào
-
-**Đầu vào khi hệ thống chạy thực tế chỉ là một bộ ảnh CT cột sống của một bệnh nhân.** Bộ ảnh có thể nằm trong một thư mục hoặc được đóng gói thành một file ZIP. Hệ thống không được nhận trước vị trí đốt gãy, vùng tổn thương hoặc mã phân loại.
-
-Ưu tiên ảnh **DICOM**, vì định dạng này chứa vị trí lát cắt, hướng ảnh, khoảng cách và giá trị cường độ cần thiết để dựng CT đúng. Nếu đầu vào là JPG/PNG, phải kiểm tra thông tin hình học đi kèm; không mặc định rằng các ảnh này đủ để dựng 3D hoặc đo biến dạng chính xác.
-
-Trong giai đoạn phát triển, file CSV hiện có cung cấp **nhãn tham chiếu** gồm vị trí đốt gãy và mã phân loại cho 54 ca. Các nhãn này dùng để tạo dữ liệu huấn luyện, kiểm tra và đo độ chính xác; không được truyền vào mô hình khi đánh giá trên ca mới hoặc khi hệ thống chạy thực tế. CSV chưa có nhãn mức độ độc lập ngoài mã phân loại.
-
-## 3. Các nhiệm vụ chính
-
-| Bước | Phần mềm thực hiện | Kết quả của bước |
-|---|---|---|
-| 1. Nối ảnh | Chọn đúng bộ lát cắt, sắp xếp theo vị trí và dựng thể tích 3D | CT có hình học đúng, xem được ba mặt phẳng |
-| 2. Tìm biến đổi bất thường | Tự quét toàn bộ CT, xác định cấu trúc đốt sống và tìm thay đổi hình dạng đột ngột mà không biết trước vị trí tổn thương | Vị trí đốt sống và vùng nghi ngờ cần đánh giá |
-| 3. Đánh giá biến dạng | Đo đặc điểm hình dạng phù hợp, như chiều cao thân đốt, tỷ lệ giảm chiều cao hoặc góc biến dạng | Các phép đo và mức độ theo tiêu chí đã thống nhất |
-| 4. Phân loại | Phân tích vùng nghi ngờ bằng mô hình và tiêu chí chuyên gia | Nhóm tổn thương dự đoán |
-| 5. Hiển thị kết quả | Đánh dấu vùng trên CT và tổng hợp kết quả | Báo cáo vị trí, mức độ, phân loại |
-
-Biến đổi đột ngột chỉ là dấu hiệu nghi ngờ. Phần mềm cần phân biệt tổn thương với cấu trúc giải phẫu bình thường, nhiễu và lỗi ảnh; không kết luận gãy chỉ từ một thay đổi giữa hai lát cắt.
-
-## 4. Output — Kết quả đầu ra
-
-| Đầu ra | Nội dung |
-|---|---|
-| **Vị trí tổn thương** | Tên đốt sống hoặc đoạn cột sống và vùng được đánh dấu trên ảnh CT |
-| **Mức độ tổn thương** | Mức đánh giá theo thang đã được chuyên gia xác nhận, kèm phép đo hỗ trợ nếu phù hợp |
-| **Phân loại tổn thương** | Mã hoặc tên nhóm tổn thương theo hệ phân loại được chọn |
-
-Giao diện hiển thị ảnh CT và các kết quả trên, có thể xuất báo cáo. Trường hợp chưa đủ dữ liệu để kết luận phải được ghi rõ là chưa xác định.
-
-**Điểm cần thống nhất:** CSV hiện có vị trí và các mã A1, A3, A4, B2, B3, C, nhưng chưa có nhãn mức độ độc lập. Cần xác nhận hệ phân loại và thang mức độ với người gán nhãn. Không tự chuyển các mã này thành nhẹ, vừa, nặng.
-
-## 5. Luồng hoạt động
+Khi chạy thực tế, hệ thống chỉ nhận:
 
 ```text
-Bộ ảnh CT của một bệnh nhân
-    ↓
-Kiểm tra và nối lát cắt thành thể tích 3D
-    ↓
-Tự quét toàn bộ cột sống và tìm vùng biến dạng bất thường
-    ↓
-Đánh giá biến dạng và phân loại
-    ↓
-Vị trí tổn thương + Mức độ tổn thương + Phân loại
+Một bộ ảnh CT cột sống của một bệnh nhân
 ```
 
-Hệ thống đích tự phân tích CT mới mà **không nhận trước vị trí tổn thương**. Vị trí đốt gãy và mã phân loại trong CSV chỉ là ground truth của giai đoạn phát triển. Công cụ đánh dấu thủ công hiện tại phục vụ tạo nhãn không gian và kiểm chứng; không phải bước người dùng phải làm trong hệ thống tự động hoàn chỉnh.
+Ưu tiên DICOM vì DICOM chứa thứ tự lát cắt, spacing, origin, direction và giá trị cường độ cần để dựng hình học đúng. Không được yêu cầu người dùng cung cấp trước vị trí đốt gãy, ROI, mã phân loại hoặc file nhãn.
 
-## 6. Chúng ta đã hoàn thành gì?
+File [data ngày 27.09.2026.csv](../data/raw/A4/data%20ngay%2027.09.2026.csv) chỉ là **ground truth dùng trong phát triển**. File này dùng để liên kết ca, tạo annotation, huấn luyện và đánh giá. Nó không được đưa vào đường suy luận production.
+
+## 2. Chức năng mục tiêu
+
+| Bước | Hệ thống thực hiện | Kết quả |
+|---|---|---|
+| 1. Tiền xử lý | Chọn CT series, sắp xếp lát cắt, chuyển HU và kiểm tra hình học | Volume CT hợp lệ |
+| 2. Định vị giải phẫu | Xác định các đốt sống và ROI/mask của từng đốt | Danh sách đốt sống có tọa độ |
+| 3. Phát hiện tổn thương | Chấm điểm biến dạng hoặc đặc trưng bất thường trên từng đốt | Các ứng viên nghi tổn thương |
+| 4. Đánh giá | Đo chiều cao, tỷ lệ giảm chiều cao, góc biến dạng hoặc đặc trưng phù hợp | Phép đo hỗ trợ |
+| 5. Phân loại | Dự đoán nhóm tổn thương khi đủ dữ liệu và nhãn | Mã/lớp dự đoán |
+| 6. Hiển thị | Overlay ROI, mức đốt, điểm tin cậy và trạng thái từ chối | Kết quả có thể kiểm tra |
+
+Một thay đổi hình dạng giữa hai lát cắt chỉ là dấu hiệu nghi ngờ. Hệ thống phải phân biệt tổn thương với cấu trúc bình thường, nhiễu, kim loại và lỗi ảnh.
+
+## 3. Tách pipeline phát triển và pipeline thực tế
+
+### Pipeline phát triển
+
+```text
+CT + ánh xạ ca + nhãn tham chiếu
+    ↓
+Kiểm tra dữ liệu và tạo annotation
+    ↓
+Huấn luyện / hiệu chỉnh / đánh giá
+```
+
+### Pipeline thực tế
+
+```text
+CT
+    ↓
+Tiền xử lý và dựng volume
+    ↓
+Định vị đốt sống
+    ↓
+Xếp hạng vùng nghi tổn thương
+    ↓
+Đánh giá và phân loại
+    ↓
+Vị trí + ROI + kết quả + độ tin cậy
+```
+
+CSV và ground truth chỉ được mở **sau khi suy luận** để tính metric. Không được dùng nhãn có sẵn để chọn vùng đầu vào cho mô hình trong bước đánh giá.
+
+## 4. Dữ liệu hiện có
+
+- CSV có 54 ca, 54/54 ca có mức đốt và mã phân loại.
+- Các mã hiện có: A1, A3, A4, B2, B3 và C.
+- Phân bố nhãn không cân bằng: A1 và B3 mỗi lớp chỉ có một ca; C có năm ca.
+- CSV có 5 dòng chứa nhiều mức đốt.
+- Audit DICOM hiện ghi nhận 10 PatientID, 53 CT series và 7.638 ảnh CT; chỉ 4 PatientID khớp trực tiếp với giá trị trong CSV.
+- Có 668 ảnh dùng giá trị Specific Character Set không chuẩn và cần được giữ lại như cảnh báo chất lượng.
+- Chưa có ca không gãy đủ đại diện để đánh giá false positive trên toàn scan.
+
+Các con số audit là thống kê tổng hợp. Không đưa tên, năm sinh, PatientID hoặc ID lâm sàng vào log, artifact commit hoặc báo cáo demo.
+
+## 5. Đã hoàn thành
 
 | Hạng mục | Tình trạng |
 |---|---|
-| Môi trường Python và cửa sổ xem ảnh trên Windows CPU | Đã chạy thành công |
-| Đọc DICOM và chọn bộ ảnh BONEPLUS của ca mẫu | Đã hoàn thành |
-| Sắp xếp 333 lát cắt, kiểm tra hình học, chuyển cường độ sang HU | Đã hoàn thành |
+| Môi trường Python và viewer trên Windows CPU | Đã chạy |
+| Đọc DICOM, chọn BONEPLUS, sắp xếp lát cắt và chuyển HU | Đã hoàn thành trên ca mẫu |
+| Kiểm tra shape, spacing, origin, direction và chuẩn hóa LPS | Đã triển khai trên ca mẫu |
 | Hiển thị axial, sagittal, coronal | Đã hoạt động |
-| Lưu ct_hu.npy và metadata.json; kiểm tra đọc lại | Đã hoàn thành |
-| Bỏ qua dữ liệu bệnh nhân và môi trường ảo trong Git | Đã kiểm tra |
-| Chọn khung trên ảnh sagittal và lưu JSON | Công cụ đã hoạt động |
-| Dựng lại hình học CT từ shape, spacing, origin và hướng DICOM bằng SimpleITK | Đã triển khai trên ca mẫu; chuẩn hóa về LPS và từ chối ảnh chụp xiên chưa được resample |
-| Sagittal MPR đúng tỷ lệ vật lý | Đã triển khai trên ca mẫu; resample hai trục về cùng spacing để tránh méo hình khi hiển thị |
-| Trình xem sagittal nâng cao | Đã triển khai: đổi lát cắt, WL/WW, preset Bone/Soft tissue và chọn nội suy hiển thị |
-| Xuất ảnh sagittal và thông số tái lập | Đã chạy thành công; xuất PNG kèm JSON chứa lát cắt, WL/WW, spacing, origin và direction LPS |
-| Nhãn mức đốt tổn thương của các ca | Đã có trong CSV: 54/54 ca có vị trí đốt gãy và mã phân loại |
-| ROI không gian chính xác quanh tổn thương của ca mẫu | Chưa hoàn thành; vị trí L1 đã biết nhưng khung mới nhất còn bao nhiều đốt |
-| Vùng quan tâm 3D và kiểm tra đồng bộ trên ba mặt phẳng | Chưa triển khai trong trình xem nâng cao |
-| Tự phát hiện, đánh giá mức độ và phân loại | Chưa triển khai |
+| Lưu `ct_hu.npy` và `metadata.json` | Đã hoàn thành trên ca mẫu |
+| Sagittal MPR đúng tỷ lệ vật lý | Đã hoàn thành trên ca mẫu |
+| Viewer sagittal nâng cao, WL/WW và preset | Đã hoàn thành |
+| Xuất ảnh sagittal và metadata tái lập | Đã hoàn thành |
+| Đọc/chuẩn hóa nhãn CSV và audit DICOM | Đã có trong mã nguồn |
+| Unit test parser nhãn và bảo vệ PII | Đã có |
+| Schema ROI 3D và validator geometry | Đã triển khai |
+| Viewer annotation axial/sagittal/coronal | Đã triển khai; chưa có ROI reviewed |
+| ROI không gian chính xác và suy luận tự động | Chưa hoàn thành |
 
-Hiện mới xác minh pipeline trên **một ca mẫu (`case_053`)**, chưa phải toàn bộ dữ liệu. `view_ct_enhanced.py` là công cụ **chỉ xem và xuất ảnh**, chưa phát hiện hay dự đoán tổn thương. L1/A1 là ground truth đã được cung cấp trước để phát triển và đối chiếu; hệ thống cuối cùng phải tự tìm ra vị trí và phân loại này chỉ từ CT.
+## 6. Trạng thái hiện tại
 
-## 7. Kế hoạch tiến độ đề xuất
+Dự án đang ở điểm chuyển từ **tiền xử lý và hiển thị** sang **tạo ground truth không gian và lập trình nhận biết vị trí tổn thương**.
 
-Kế hoạch gồm **8 tuần kể từ khi bắt đầu giai đoạn tiếp theo**, dành cho bản thử nghiệm nghiên cứu. Thời gian phụ thuộc dữ liệu, việc xác nhận nhãn và tài nguyên tính toán.
+Hiện mới xác minh pipeline ảnh trên `case_053`. Ca này có nhãn tham chiếu L1/A1, nhưng ROI sagittal hiện tại vẫn là bản nháp và còn bao nhiều đốt. Viewer hiện tại chỉ xem và xuất ảnh; chưa tự phát hiện, định vị, đánh giá mức độ hoặc phân loại.
 
-| Thời gian | Việc cần làm | Kết quả cần đạt | Tiến độ đến 18/10/2026 |
-|---|---|---|---|
-| Tuần 1 | Dùng vị trí L1 đã có để sửa ROI ca mẫu; thống nhất ý nghĩa hệ phân loại và cách đánh giá mức độ | Một ca mẫu có ROI ground truth đúng và quy tắc gán nhãn rõ ràng | **Chưa hoàn thành:** đã có nhãn mức đốt L1 và công cụ lưu khung, nhưng ROI còn bao nhiều đốt; quy tắc mức độ chưa được xác nhận |
-| Tuần 2 | Bổ sung chọn vùng 3D; liên kết CT với CSV bằng mã ca | Vùng đốt sống kiểm tra được trên ba mặt phẳng và danh mục ca | **Đang thực hiện:** đã có sagittal MPR đúng hình học và xuất ảnh kèm metadata; chưa có ROI 3D, kiểm tra liên kết ba mặt phẳng hoặc liên kết CSV |
-| Tuần 3 | Xử lý các ca còn lại, kiểm tra ảnh và tạo nhãn | Tập dữ liệu có danh sách lỗi, thiếu nhãn và ca đủ điều kiện | **Chưa bắt đầu:** mới xác minh `case_053` |
-| Tuần 4 | Chia dữ liệu theo bệnh nhân; xây cách phân tích hình dạng và biến đổi ban đầu | Pipeline tạo mẫu và phương pháp đối chiếu ban đầu | **Chưa bắt đầu** |
-| Tuần 5 | Thử mô hình deep learning nhỏ; đo thời gian CPU, cân nhắc GPU nếu cần | Mô hình thử nghiệm cho nhiệm vụ đã chốt | **Chưa bắt đầu** |
-| Tuần 6 | Đánh giá vị trí, phân loại và phép đo biến dạng; mức độ chỉ đánh giá khi có nhãn | Báo cáo kết quả và lỗi trên bệnh nhân chưa dùng huấn luyện | **Chưa bắt đầu** |
-| Tuần 7 | Tích hợp giao diện, vùng đánh dấu và báo cáo; kiểm tra thành phần định vị tự động nếu đã có | Demo thể hiện rõ bước tự động và bước còn thủ công | **Khởi tạo một phần giao diện:** đã có trình xem sagittal và export; chưa có vùng dự đoán, kết quả chẩn đoán hoặc báo cáo tổng hợp |
-| Tuần 8 | Kiểm thử lại, hoàn thiện tài liệu và báo cáo dự án | Bản demo tái lập được và hướng dẫn sử dụng | **Chưa bắt đầu** |
+| Hạng mục | Trạng thái hiện tại |
+|---|---|
+| Liên kết CT–CSV theo ca | Chưa xác nhận đầy đủ; đây là gate dữ liệu đầu tiên |
+| Manifest ẩn danh và split theo bệnh nhân | Chưa tạo |
+| Schema ROI 3D có geometry và trạng thái review | Đã có validator; chưa có ROI reviewed |
+| Annotation đồng bộ axial/sagittal/coronal | Đã có trong `annotate_ct.py`; chưa xác nhận ROI |
+| Định vị từng đốt sống | Chưa triển khai |
+| Baseline xếp hạng biến dạng | Chưa triển khai |
+| Suy luận chỉ nhận CT | Chưa đóng gói thành API |
+| Phân loại sáu lớp | Chưa đủ dữ liệu để đánh giá đáng tin cậy |
 
-Tiến độ hiện tại tập trung ở **nền tảng tiền xử lý và hiển thị của bước 1**. Nhãn mức đốt và phân loại đã có, nhưng chưa thể coi Tuần 1 hoặc Tuần 2 là hoàn thành vì ROI 3D, quy tắc mức độ và liên kết CT–CSV vẫn còn thiếu. Các chức năng tự quét, định vị, đánh giá và phân loại của bước 2–4 chưa được triển khai.
+## 7. Việc cần làm tiếp theo
 
-**Lưu ý về tính khả thi:** CSV có 54 ca; A1 và B3 mỗi lớp chỉ có một ca. Chưa đủ để đánh giá đáng tin cậy mô hình đầy đủ sáu lớp. Cần bổ sung dữ liệu, hoặc giới hạn rõ phạm vi bản thử nghiệm. Muốn phát hiện gãy trên CT bất kỳ cần thêm ca không gãy. Các bước tự động hóa đầy đủ có thể cần giai đoạn bổ sung ngoài 8 tuần.
+### Giai đoạn A — Chốt hợp đồng dữ liệu
 
-## 8. Kiểm tra dự án đã làm đúng hay chưa
+1. Xác nhận quy tắc liên kết giữa thư mục/series DICOM và từng dòng CSV.
+2. Tạo manifest ẩn danh với `case_id`, đường dẫn series, nhãn tham chiếu và trạng thái liên kết.
+3. Tách ca `matched`, `ambiguous` và `unmatched`; chỉ dùng ca đã xác nhận cho phát triển.
+4. Tạo split theo bệnh nhân có seed và kiểm tra leakage.
+5. Refactor loader DICOM thành CLI không hard-code `case_053`.
 
-- **Nối ảnh:** chọn đúng series, đúng thứ tự, không trùng vị trí; hình học và dữ liệu lưu khớp nhau.
-- **Vị trí:** khi chạy đánh giá, chỉ đưa CT vào hệ thống; sau khi có dự đoán mới so sánh vị trí đốt và ROI dự đoán với ground truth.
-- **Phân loại:** đánh giá theo từng lớp, ghi rõ số bệnh nhân và loại chưa đủ dữ liệu đánh giá.
-- **Mức độ:** đối chiếu thang đo hoặc phép đo đã thống nhất với chuyên gia.
-- **Dữ liệu:** chia theo bệnh nhân; ảnh của cùng một bệnh nhân không nằm trong nhiều tập train/validation/test.
-- **Demo:** phân biệt rõ nhãn tham chiếu và dự đoán; báo trường hợp không hỗ trợ.
+**Điều kiện hoàn thành:** mỗi ca DICOM có trạng thái liên kết rõ ràng; pipeline không ghi thông tin định danh vào output.
 
-Không đưa thông tin định danh và CT vào GitHub. Giữ dữ liệu đã ẩn danh trong thư mục data, được .gitignore bỏ qua.
+### Giai đoạn B — Tạo ROI 3D
 
-## 9. Việc cần làm ngay
+1. Định nghĩa schema annotation gồm `case_id`, mức đốt, bounding box/mask 3D, geometry LPS, trạng thái `draft/reviewed/rejected` và phiên bản annotation.
+2. Viết validator kiểm tra giới hạn ROI, spacing, shape và geometry.
+3. Sửa ROI L1 của `case_053` để chỉ bao một thân đốt.
+4. Kiểm tra viewer ba mặt phẳng đồng bộ trên `case_053`, có crosshair và ROI chung.
+5. Lưu một annotation 3D ở trạng thái `draft`, sau đó tạo tập ROI validation đã được chuyên gia kiểm tra.
 
-1. **Dùng nhãn vị trí L1 đã có để chọn lại ROI chỉ bao một thân đốt sống.** Không cần tìm lại tên đốt bằng tay; cần chuyển nhãn mức đốt đã biết thành ground truth không gian chính xác. Lưu JSON thành công chỉ chứng minh chức năng lưu hoạt động; chưa chứng minh ROI được chọn là đúng.
-2. Thống nhất ý nghĩa các mã A1, A3, A4, B2, B3, C và tiêu chí đánh giá mức độ với người gán nhãn.
-3. Mở rộng công cụ từ lát sagittal đơn sang ROI 3D có thể kiểm tra đồng bộ trên axial, sagittal và coronal.
-4. Liên kết từng CT với dòng nhãn CSV bằng mã ca để tạo ground truth, sau đó xử lý và kiểm tra chất lượng các ca còn lại. Tách pipeline dữ liệu nhãn khỏi pipeline suy luận để bảo đảm ca mới chỉ nhận CT làm đầu vào.
+**Điều kiện hoàn thành:** ít nhất một ca có ROI 3D chính xác; sau đó mở rộng sang các ca đại diện khác.
+
+### Giai đoạn C — Định vị đốt sống và baseline
+
+1. Benchmark một công cụ phân đoạn đốt sống tiền huấn luyện trên vài ca đại diện.
+2. Chuyển mask từng đốt thành ROI chuẩn hóa và kiểm tra thứ tự T/D–L.
+3. Trích đặc trưng hình học: chiều cao trước/giữa/sau, tỷ lệ giảm chiều cao, góc chêm và so sánh với đốt lân cận.
+4. Xây baseline xếp hạng vùng nghi tổn thương trước khi thử CNN.
+5. Chỉ thử CNN 2.5D sau khi baseline và dữ liệu đã ổn định; 3D CNN cần đánh giá riêng về GPU.
+
+### Giai đoạn D — Đánh giá và tích hợp
+
+1. Đóng băng test set theo bệnh nhân.
+2. Chạy inference chỉ với CT.
+3. Sau inference mới mở ground truth để tính top-1/top-k level accuracy, khoảng cách mức đốt, candidate recall và sai lệch ROI.
+4. Chỉ báo sensitivity/false positives per scan khi có đủ ca không gãy.
+5. Tích hợp overlay prediction, confidence, model version và trạng thái từ chối vào viewer.
+
+## 8. Tiêu chí không được vi phạm
+
+- Không đọc CSV trong API suy luận production.
+- Không đưa vị trí đốt, ROI hoặc mã phân loại vào đầu vào mô hình khi đánh giá.
+- Không coi đốt không được ghi trong CSV là âm tính chắc chắn khi chưa xác nhận.
+- Không dùng ROI nháp làm ground truth chính thức.
+- Không chia lát cắt ngẫu nhiên; phải chia theo bệnh nhân.
+- Không công bố metric sáu lớp khi lớp test không đủ số mẫu.
+- Không báo false-positive rate khi chưa có ca không gãy phù hợp.
+- Không commit CT, CSV, ánh xạ ID hoặc artifact chứa thông tin bệnh nhân.
+- Ca lỗi hình học, thiếu series hoặc ngoài phạm vi phải trả về trạng thái từ chối rõ ràng.
+
+## 9. Kết quả kỳ vọng của bản thử nghiệm đầu tiên
+
+Bản thử nghiệm đầu tiên nên chứng minh được chuỗi sau:
+
+```text
+CT mới
+  → volume có geometry đúng
+  → danh sách đốt sống/ROI
+  → vùng nghi tổn thương được xếp hạng
+  → vị trí và confidence
+  → báo cáo chưa kết luận nếu không đủ điều kiện
+```
+
+Phân loại sáu lớp chỉ là nhánh mở rộng sau khi ý nghĩa lâm sàng của các mã được xác nhận và dữ liệu đủ để đánh giá.
