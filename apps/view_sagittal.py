@@ -1,3 +1,4 @@
+import argparse
 import json
 import sys
 from datetime import datetime
@@ -14,9 +15,7 @@ from matplotlib.figure import Figure
 from matplotlib.widgets import Button, RadioButtons, Slider
 
 
-PROJECT_DIR = Path(__file__).resolve().parent
-CASE_DIR = PROJECT_DIR / "data" / "processed" / "case_053"
-EXPORT_DIR = CASE_DIR / "exports"
+from spinal_ct.ct_io import load_ct
 
 
 def configure_console_encoding():
@@ -25,66 +24,6 @@ def configure_console_encoding():
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
             reconfigure(encoding="utf-8", errors="replace")
-
-
-def build_ct_image(volume, metadata):
-    """Dựng ảnh SimpleITK 3D cùng hình học vật lý DICOM (hệ tọa độ LPS)."""
-    if volume.ndim != 3:
-        raise ValueError("Thể tích phải có ba chiều [z, y, x].")
-
-    if list(volume.shape) != metadata.get("shape_zyx"):
-        raise ValueError("Kích thước thể tích không khớp metadata.")
-
-    spacing_zyx = np.asarray(metadata.get("spacing_zyx_mm"), dtype=float)
-    origin_lps = np.asarray(metadata.get("origin_lps_mm"), dtype=float)
-    orientation = np.asarray(
-        metadata.get("image_orientation_patient"), dtype=float
-    )
-
-    if (
-        spacing_zyx.shape != (3,)
-        or not np.all(np.isfinite(spacing_zyx))
-        or np.any(spacing_zyx <= 0)
-    ):
-        raise ValueError("Kích thước voxel không hợp lệ.")
-
-    if origin_lps.shape != (3,) or not np.all(np.isfinite(origin_lps)):
-        raise ValueError("Tọa độ gốc LPS không hợp lệ.")
-
-    if orientation.shape != (6,) or not np.all(np.isfinite(orientation)):
-        raise ValueError("ImageOrientationPatient không hợp lệ.")
-
-    axis_x = orientation[:3]
-    axis_y = orientation[3:]
-    if (
-        not np.isclose(np.linalg.norm(axis_x), 1.0, atol=1e-5)
-        or not np.isclose(np.linalg.norm(axis_y), 1.0, atol=1e-5)
-        or not np.isclose(np.dot(axis_x, axis_y), 0.0, atol=1e-5)
-    ):
-        raise ValueError("Các vector hướng DICOM không trực chuẩn.")
-
-    axis_z = np.cross(axis_x, axis_y)
-    direction = np.column_stack((axis_x, axis_y, axis_z))
-
-    image = sitk.GetImageFromArray(np.asarray(volume, dtype=np.float32))
-    image.SetSpacing(tuple(float(value) for value in spacing_zyx[::-1]))
-    image.SetOrigin(tuple(float(value) for value in origin_lps))
-    image.SetDirection(tuple(float(value) for value in direction.ravel()))
-
-    # Đưa các ca có trục bị hoán vị/lật về LPS mà không đổi vị trí vật lý
-    # của voxel.
-    image = sitk.DICOMOrient(image, "LPS")
-    if not np.allclose(
-        np.asarray(image.GetDirection()).reshape(3, 3),
-        np.eye(3),
-        atol=1e-5,
-    ):
-        raise ValueError(
-            "CT có mặt phẳng chụp xiên; cần resample sang lưới LPS "
-            "trước khi xem."
-        )
-
-    return image
 
 
 def get_sagittal_array(image, x_index, target_spacing_mm=None):
@@ -137,23 +76,14 @@ def get_sagittal_array(image, x_index, target_spacing_mm=None):
 def main():
     configure_console_encoding()
 
-    volume = np.load(
-        CASE_DIR / "ct_hu.npy",
-        mmap_mode="r",
-        allow_pickle=False,
-    )
-    metadata = json.loads(
-        (CASE_DIR / "metadata.json").read_text(encoding="utf-8")
-    )
-
-    try:
-        ct_image = build_ct_image(volume, metadata)
-    except (KeyError, TypeError, ValueError, RuntimeError) as error:
-        raise SystemExit(
-            f"Không thể dựng ảnh CT bằng SimpleITK: {error}"
-        ) from error
-    finally:
-        del volume
+    parser = argparse.ArgumentParser(description="View and export sagittal CT slices.")
+    parser.add_argument('--case', type=Path, required=True, help='Prepared CT directory')
+    args = parser.parse_args()
+    export_dir = args.case / 'exports'
+    metadata = json.loads((args.case / 'metadata.json').read_text(encoding='utf-8'))
+    ct_image = sitk.DICOMOrient(load_ct(args.case / 'ct_hu.npy'), 'LPS')
+    if not np.allclose(np.asarray(ct_image.GetDirection()).reshape(3, 3), np.eye(3), atol=1e-5):
+        raise SystemExit('Oblique CT requires resampling before sagittal viewing.')
 
     nx, ny, nz = ct_image.GetSize()
     dx, dy, dz = ct_image.GetSpacing()
@@ -303,9 +233,9 @@ def main():
         output_ax.set_axis_off()
 
         try:
-            EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+            export_dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            path = EXPORT_DIR / f"sagittal_x{x:03d}_{stamp}.png"
+            path = export_dir / f"sagittal_x{x:03d}_{stamp}.png"
             output.savefig(path, dpi=dpi, facecolor="black")
 
             settings = {

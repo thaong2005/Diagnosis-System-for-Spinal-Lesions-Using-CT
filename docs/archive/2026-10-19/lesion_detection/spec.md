@@ -1,3 +1,5 @@
+> Kế hoạch lịch sử của nhánh nền tảng; không đại diện cho tiến độ hiện tại. Xem [README](../../../../README.md).
+
 # Đặc tả phát hiện vị trí tổn thương cột sống — phiên bản 0
 
 ## Phạm vi
