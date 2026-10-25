@@ -1,7 +1,14 @@
 # Diagnosis System for Spinal Lesions Using CT
 
-Dự án nghiên cứu xử lý CT cột sống, annotation 3D, định vị đốt sống bằng
-TotalSegmentator và đánh giá độ nhạy phân đoạn bằng nhiễu Monte Carlo.
+Dự án nghiên cứu xây dựng công cụ hỗ trợ kiểm tra CT cột sống. Người dùng chọn
+ảnh của một bệnh nhân, chạy mô hình định vị đốt sống và xem vùng xương được
+phân đoạn trên ba mặt phẳng. Kết quả gồm tên đốt, vùng quan tâm (ROI), thể tích,
+ảnh minh họa và báo cáo.
+
+Hiện dự án dùng TotalSegmentator để phân đoạn và Monte Carlo để kiểm tra mức
+thay đổi của kết quả khi thêm nhiễu vào CT. Mục tiêu tiếp theo là tính diện tích
+thân đốt sống và đánh giá trên dữ liệu có nhãn chuyên gia. Chức năng phát hiện
+tổn thương và phân loại AO chưa được triển khai.
 
 ## Demo cho giáo viên
 
@@ -16,12 +23,40 @@ và sửa dòng `SAMPLE_DIR`. File cấu hình cục bộ này không được c
 .\.venv\Scripts\python.exe -m apps.demo
 ```
 
-## Trạng thái hiện tại
+## Tiến độ dự án
 
-- Đã chạy baseline và Monte Carlo 2 mẫu trên Windows CPU cho `case_053`.
-- Có mask, ROI, thể tích, bản đồ bất đồng và ảnh QC. Cảnh báo biên ảnh vẫn cần review.
-- Chưa có tính diện tích bằng lấy mẫu điểm, phân loại AO hoặc đánh giá trên tập tham chiếu.
-- Viewer, annotation và inference là các công cụ riêng.
+Cập nhật ngày **25/10/2026**. Dự án đã có demo chạy từ CT đầu vào đến báo cáo;
+chưa hoàn thành hệ thống chẩn đoán tổn thương.
+
+| Hạng mục | Tiến độ |
+|---|---|
+| Đọc DICOM, NIfTI và NPY | Đã có bộ đọc chung, kiểm tra HU và hình học ảnh |
+| Định vị và phân đoạn đốt sống | Đã chạy mô hình thật trên Windows CPU; xuất mask, ROI và thể tích toàn đốt |
+| Giao diện demo | Đã chọn/đổi ca, xem ba mặt phẳng, mở kết quả và xuất HTML |
+| Monte Carlo nhiễu HU | Đã có baseline, đồng thuận và bản đồ bất đồng; đã chạy 2 mẫu trên `case_053` |
+| Annotation 3D | Đã có công cụ tạo và kiểm tra ROI nháp; cần chuyên gia duyệt |
+| Diện tích thân đốt bằng Monte Carlo | Chưa triển khai lấy mẫu điểm để ước lượng diện tích |
+| Đánh giá độ chính xác | Chưa có kết quả trên tập tham chiếu được chuyên gia duyệt |
+| Phát hiện tổn thương, phân loại AO | Chưa triển khai |
+
+**Kiểm chứng gần nhất:**
+
+- Bộ kiểm thử: **35 đạt, 1 bỏ qua trên Windows** vì fixture dùng script Unix.
+- Cả 10 lệnh CLI mở được trợ giúp; hai môi trường Python không có xung đột dependency.
+- Baseline trên ca CT 567 lát: hoàn tất trong khoảng **7 phút 29 giây** trên máy
+  kiểm tra, xuất 13 mức T6–S1. Đây là thời gian của một lượt chạy, không phải cam kết
+  cho mọi máy. Kết quả `indeterminate` vì mask T6/T7 chạm biên ảnh.
+- Đã xác minh kết quả khớp CT gốc, mở lại trong demo và xuất báo cáo HTML.
+- Đã sửa lỗi thiếu RAM khi lưu mask song song bằng cách yêu cầu backend lưu tuần tự.
+  Ca 567 lát mới kiểm tra baseline; chưa chạy Monte Carlo trên ca này.
+
+Các kiểm tra trên xác nhận luồng phần mềm hoạt động, chưa chứng minh độ chính xác
+phân đoạn. Tiến độ tiếp theo:
+
+1. Thống nhất cách chọn lát cắt và vùng thân đốt để đo diện tích.
+2. Triển khai ước lượng diện tích bằng lấy mẫu Monte Carlo và kiểm tra sai số.
+3. Đối chiếu phân đoạn, tên đốt và phép đo với nhãn chuyên gia trên nhiều ca;
+   sau đó phát triển và đánh giá chức năng phân loại tổn thương.
 
 ## Cấu trúc
 
@@ -45,6 +80,8 @@ docs/
   architecture.md           Lựa chọn cấu trúc và thay đổi đường dẫn
   archive/                  Tài liệu lịch sử
 data/                      Dữ liệu và kết quả cục bộ, không commit
+sample_config.example.py   Mẫu cấu hình đường dẫn ca demo
+sample_config.py           Cấu hình ca trên máy, không commit
 .tmp/totalsegmentator/      Cache trọng số, không commit
 ```
 

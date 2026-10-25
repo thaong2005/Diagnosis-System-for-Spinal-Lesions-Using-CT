@@ -5,6 +5,8 @@
 Mã định vị và Monte Carlo đã tích hợp vào repository. Baseline và 2 mẫu nhiễu
 đã chạy trên Windows CPU với `case_053` ngày 24/10/2026. Kết quả có cảnh báo
 T8/T9 chạm biên; việc chạy thành công không xác nhận độ chính xác phân đoạn.
+Demo đã hỗ trợ chạy mô hình, xem overlay và xuất báo cáo. Xem
+[hướng dẫn demo](teacher_demo.md) và [tiến độ hiện tại](../../README.md#tiến-độ-dự-án).
 
 ## 1. Mã đã tích hợp
 
@@ -13,8 +15,8 @@ test trong `tests/` và hướng dẫn trong `docs/guides/`. Không cần gói Z
 
 ## 2. Cài đặt bằng PowerShell tại thư mục gốc dự án
 
-Môi trường ứng dụng đã có `.venv`; sử dụng trực tiếp executable để không phụ
-thuộc chính sách chạy `Activate.ps1`:
+Nếu chưa có `.venv`, tạo bằng `py -3.13 -m venv .venv`. Sau đó cài dependency
+bằng executable của môi trường, không cần chạy `Activate.ps1`:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -85,7 +87,8 @@ có nhiều series. Không dùng tên thư mục phân loại A1/A3/... làm đ�
 
 Mở `levels_mpr.png`, `monte_carlo/consensus_mpr.png` và `prediction.json` trong
 thư mục output. Mask 3D có thể xem bằng trình xem NIfTI như 3D Slicer.
-Viewer Qt hiện có chưa được thêm nút chạy hoặc overlay dự đoán.
+Giao diện `apps.demo` đã có nút chạy và overlay dự đoán trên ba mặt phẳng.
+Mở bằng `start_demo.bat`; xem [hướng dẫn demo](teacher_demo.md).
 
 **Annotation và prediction là hai loại dữ liệu khác nhau:**
 

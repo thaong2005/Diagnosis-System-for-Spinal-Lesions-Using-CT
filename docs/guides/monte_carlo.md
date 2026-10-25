@@ -128,11 +128,10 @@ người. Đánh giá thực tế cần CT và mask/tên đốt đã được ch
 4. Khóa tham số trước khi chạy test theo bệnh nhân. Báo thời gian, bộ nhớ,
    tỷ lệ thiếu phát hiện và `indeterminate` bên cạnh chỉ số chất lượng.
 
-Chưa có dữ liệu CT người trong workspace để đánh giá độ chính xác hoặc chọn
+Đã chạy backend thật với baseline và 2 mẫu nhiễu trên CT `case_053` ở Windows
+CPU ngày 24/10/2026. Kết quả có mask đồng thuận, bản đồ bất đồng và cảnh báo
+cần kiểm tra; chưa có đánh giá độ chính xác bằng nhãn chuyên gia hoặc xác nhận
 sigma phù hợp. Không dùng các chỉ số ổn định này để quyết định phân loại AO.
 
-Kiểm chứng ngày 22/10/2026: 15/15 unit/integration tests đạt. Backend thật đã
-chạy baseline + 2 mẫu nhiễu trên phantom tổng hợp, không tìm thấy đốt và trả
-`indeterminate`; disagreement bằng 0 vì mọi mẫu đều rỗng. Điều này cũng minh
-họa vì sao bất đồng thấp không chứng minh kết quả đúng. Nhánh crop rỗng đã
-được thực thi; chưa kiểm chứng phân đoạn đầy đủ giải phẫu người trong MC.
+Monte Carlo hiện tại thêm nhiễu HU để đánh giá độ nhạy phân đoạn, chưa thực hiện
+lấy mẫu điểm để tính diện tích. Xem [tiến độ và kiểm thử mới nhất](../../README.md#tiến-độ-dự-án).

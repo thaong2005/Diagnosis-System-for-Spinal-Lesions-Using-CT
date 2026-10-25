@@ -97,11 +97,11 @@ Benchmark trên CT thực tế còn cần CT và nhãn đốt/ROI được chuy�
 ca thất bại và thời gian/RAM; giữ test độc lập. Không đánh dấu hoàn thành
 benchmark T011 chỉ dựa trên cài backend hoặc chạy ảnh tổng hợp.
 
-Kiểm chứng tại môi trường cloud (22/10/2026): 10/10 unit/integration tests đạt;
-backend 2.18.0 và torch/torchvision CPU chạy được. Chạy `--fast` với volume
-phantom tổng hợp đã thực thi mô hình định vị thô để crop, trả crop rỗng và
-25 mask rỗng; adapter xuất `indeterminate`. Nhánh phân đoạn chi tiết khi crop
-có giải phẫu chưa được kiểm chứng bằng CT người; chưa đo độ chính xác gán đốt.
+Đã chạy phân đoạn trên CT thực tế bằng backend 2.18.0 trên Windows CPU.
+Lượt kiểm tra ngày 25/10/2026 với CT 567 lát xuất 13 mức T6–S1, có cảnh báo
+T6/T7 chạm biên ảnh. Kết quả đã mở lại trong demo và xác nhận khớp CT nguồn.
+Chưa đo độ chính xác gán đốt bằng nhãn chuyên gia. Xem
+[tiến độ và kiểm thử mới nhất](../../README.md#tiến-độ-dự-án).
 
 ## Monte Carlo tùy chọn
 
