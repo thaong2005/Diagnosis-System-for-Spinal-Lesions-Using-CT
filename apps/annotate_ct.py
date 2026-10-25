@@ -7,6 +7,7 @@ an input to production inference.
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -20,11 +21,6 @@ from matplotlib.patches import Rectangle
 from matplotlib.widgets import Button, RectangleSelector, Slider
 
 from spinal_ct.labels import parse_vertebral_levels
-
-
-PROJECT_DIR = Path(__file__).resolve().parent
-CASE_DIR = PROJECT_DIR / "data" / "processed" / "case_053"
-OUTPUT = CASE_DIR / "annotation_3d_draft.json"
 
 
 def configure_console_encoding() -> None:
@@ -191,7 +187,7 @@ def _clamped_bounds(
     return x0, x1, y0, y1
 
 
-def run_annotation(case_dir: Path = CASE_DIR, output: Path = OUTPUT) -> None:
+def run_annotation(case_dir: Path, output: Path) -> None:
     """Open the synchronized three-plane annotation window."""
     volume, metadata = load_case(case_dir)
     direction_lps = direction_from_metadata(metadata)
@@ -423,8 +419,12 @@ def run_annotation(case_dir: Path = CASE_DIR, output: Path = OUTPUT) -> None:
 
 def main() -> None:
     configure_console_encoding()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--case', type=Path, required=True, help='Prepared CT directory')
+    parser.add_argument('--output', type=Path, help='Draft annotation JSON')
+    args = parser.parse_args()
     try:
-        run_annotation()
+        run_annotation(args.case, args.output or args.case / 'annotation_3d_draft.json')
     except (OSError, ValueError, KeyError) as error:
         raise SystemExit(f"Không thể mở annotation: {error}") from error
 

@@ -6,6 +6,8 @@
 
 # Dữ liệu bệnh nhân và dữ liệu đã xử lý
 /data/
+# Đường dẫn ca mẫu riêng của máy, có thể chứa tên bệnh nhân
+/sample_config.py
 
 # Cache và file sinh tự động bởi Python/công cụ phát triển
 __pycache__/

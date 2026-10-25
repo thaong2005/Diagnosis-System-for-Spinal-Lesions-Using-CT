@@ -1,3 +1,5 @@
+> Bản lưu lịch sử ngày 19/10/2026. Trạng thái và đường dẫn mã trong nội dung có thể đã lỗi thời. Xem [README hiện tại](../../../README.md).
+
 # FS Spinal CT — Tài liệu vận hành cho AI agent
 
 ## 0. Mục đích
@@ -64,7 +66,7 @@ Không import module CSV/label vào đường gọi `predict`.
 
 ## 3. Development-only assets
 
-File [data ngày 27.09.2026.csv](../data/raw/A4/data%20ngay%2027.09.2026.csv) là ground truth phát triển, gồm 54 dòng có mức đốt và mã phân loại. Không coi nó là input thực tế.
+File [data ngày 27.09.2026.csv](../../../data/raw/A4/data%20ngay%2027.09.2026.csv) là ground truth phát triển, gồm 54 dòng có mức đốt và mã phân loại. Không coi nó là input thực tế.
 
 CSV được dùng để:
 
@@ -82,13 +84,13 @@ Phân bố mã: A1=1, A3=14, A4=19, B2=14, B3=1, C=5. Không suy diễn các mã
 - Python 3.13, Windows CPU.
 - Pipeline DICOM/HU/geometry đã xác minh trên một ca mẫu `case_053`.
 - Có `ct_hu.npy`, `metadata.json`, MPR và viewer sagittal nâng cao cho ca mẫu.
-- Reader/normalizer nhãn: [spinal_ct/labels.py](../spinal_ct/labels.py).
-- Schema/validator ROI 3D: [spinal_ct/annotations.py](../spinal_ct/annotations.py).
-- CLI kiểm tra annotation: [tools/validate_annotation.py](../tools/validate_annotation.py).
-- Audit DICOM: [tools/audit_dataset.py](../tools/audit_dataset.py).
-- Unit test parser: [tests/test_labels.py](../tests/test_labels.py).
-- Unit test annotation: [tests/test_annotations.py](../tests/test_annotations.py).
-- Audit tổng hợp: [data/processed/dataset_audit.json](../data/processed/dataset_audit.json).
+- Reader/normalizer nhãn: [spinal_ct/labels.py](../../../spinal_ct/labels.py).
+- Schema/validator ROI 3D: [spinal_ct/annotations.py](../../../spinal_ct/annotations.py).
+- CLI kiểm tra annotation: [tools/validate_annotation.py](../../../tools/validate_annotation.py).
+- Audit DICOM: [tools/audit_dataset.py](../../../tools/audit_dataset.py).
+- Unit test parser: [tests/test_labels.py](../../../tests/test_labels.py).
+- Unit test annotation: [tests/test_annotations.py](../../../tests/test_annotations.py).
+- Audit tổng hợp: [data/processed/dataset_audit.json](../../../data/processed/dataset_audit.json).
 - Audit có 10 PatientID, 53 CT series, 7.638 CT images; chỉ 4 PatientID khớp trực tiếp với CSV.
 - JSON annotation cũ vẫn là sagittal 2D nháp; `annotate_ct.py` hiện đã hỗ trợ tạo ROI 3D draft, chưa có ROI 3D reviewed.
 - Viewer hiện chỉ xem/xuất, chưa tự phát hiện hoặc phân loại.

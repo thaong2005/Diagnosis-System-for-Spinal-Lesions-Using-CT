@@ -1,3 +1,5 @@
+> Kế hoạch lịch sử của nhánh nền tảng; không đại diện cho tiến độ hiện tại. Xem [README](../../../../README.md).
+
 # Quyết định và điểm chưa biết
 
 ## Quyết định 1 — Tách định vị giải phẫu khỏi phát hiện tổn thương
