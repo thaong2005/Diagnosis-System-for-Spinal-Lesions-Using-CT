@@ -6,7 +6,10 @@ import tempfile
 import numpy as np
 import SimpleITK as sitk
 
-from spinal_ct.localization import LEVELS
+from spinal_ct.localization import (LEVELS, validate_label_image, label_statistics,
+                                    summarize_labels, export_binary_masks)
+
+VOTE_CHUNK_VOXELS = 262_144
 
 
 def perturb_hu(image: sitk.Image, rng: np.random.Generator, sigma_hu: float) -> sitk.Image:
@@ -21,7 +24,8 @@ def perturb_hu(image: sitk.Image, rng: np.random.Generator, sigma_hu: float) -> 
     return result
 
 
-def aggregate_samples(image: sitk.Image, paths: list[Path], output: Path) -> dict:
+def aggregate_samples(image: sitk.Image, paths: list[Path], output: Path,
+                      *, binary_masks: bool = False, check_cancelled=None) -> dict:
     """Strict majority consensus, including background, on the unchanged CT grid.
 
     Label arrays are loaded one at a time and stored as uint8 memory maps to
@@ -34,64 +38,73 @@ def aggregate_samples(image: sitk.Image, paths: list[Path], output: Path) -> dic
     with tempfile.TemporaryDirectory(dir=output, prefix='.votes-') as tmp, ExitStack() as resources:
         shape = tuple(reversed(image.GetSize()))
         samples = []
+        volumes = np.zeros((len(paths), len(LEVELS)), dtype=np.float64)
+        centroids = [[] for _ in LEVELS]
         for i, path in enumerate(paths):
+            if check_cancelled:
+                check_cancelled()
             sample = sitk.ReadImage(str(path))
-            if (sample.GetSize() != image.GetSize()
-                    or sample.GetNumberOfComponentsPerPixel() != 1
-                    or not np.allclose(sample.GetSpacing(), image.GetSpacing(), atol=1e-5)
-                    or not np.allclose(sample.GetOrigin(), image.GetOrigin(), atol=1e-4)
-                    or not np.allclose(sample.GetDirection(), image.GetDirection(), atol=1e-5)):
-                raise ValueError('Monte Carlo sample geometry mismatch.')
-            values = sitk.GetArrayFromImage(sample)
-            if not np.isin(values, np.arange(len(LEVELS)+1)).all():
-                raise ValueError('Invalid vertebral label in Monte Carlo sample.')
+            validate_label_image(image, sample)
+            # Count and find centres once per sample, instead of 25 scans + argwhere.
+            measures = label_statistics(sample, image)
+            voxel_volume = float(np.prod(image.GetSpacing()))
+            for label_id in measures.GetLabels():
+                volumes[i, label_id-1] = measures.GetNumberOfPixels(label_id)*voxel_volume
+                centroids[label_id-1].append(measures.GetCentroid(label_id))
             mapped = np.memmap(Path(tmp)/f'{i}.bin', dtype=np.uint8, mode='w+', shape=shape)
             resources.callback(mapped._mmap.close)
-            mapped[:] = values
-            samples.append(mapped)
+            mapped[:] = sitk.GetArrayViewFromImage(sample)
+            samples.append(mapped.reshape(-1))
+            del sample
         n = len(samples)
-        consensus = np.zeros(shape, dtype=np.uint8)
-        max_votes = np.zeros(shape, dtype=np.uint8)
+        consensus = np.empty(shape, dtype=np.uint8)
+        disagreement = np.empty(shape, dtype=np.float32)
+        flat_consensus, flat_disagreement = consensus.reshape(-1), disagreement.reshape(-1)
+        ambiguous = 0
+        # Keep votes cache-sized, independent of full CT size and number of samples.
+        for start in range(0, consensus.size, VOTE_CHUNK_VOXELS):
+            if check_cancelled:
+                check_cancelled()
+            end = min(start+VOTE_CHUNK_VOXELS, consensus.size)
+            if n == 2:
+                # Strict majority of two is exactly agreement, including background.
+                a, b = samples[0][start:end], samples[1][start:end]
+                agreed = a == b
+                flat_consensus[start:end] = np.where(agreed, a, 0)
+                flat_disagreement[start:end] = np.where(agreed, 0., .5)
+                ambiguous += int(np.count_nonzero(~agreed))
+            else:
+                votes = np.zeros((end-start, len(LEVELS)+1), dtype=np.uint8)
+                positions = np.arange(end-start)
+                for sample in samples:
+                    # Unique positions mean fancy indexed += has no repeated indices.
+                    votes[positions, sample[start:end]] += 1
+                winner = votes.argmax(axis=1)
+                maximum = votes[positions, winner]
+                majority = maximum > n/2
+                flat_consensus[start:end] = np.where(majority, winner, 0)
+                flat_disagreement[start:end] = 1-maximum.astype(np.float32)/n
+                ambiguous += int(np.count_nonzero(~majority))
         stats = []
-        mask_dir = output/'consensus_masks'
-        mask_dir.mkdir()
-        for label_id in range(len(LEVELS)+1):
-            counts = np.zeros(shape, dtype=np.uint8)
-            volumes, centroids = [], []
-            for sample in samples:
-                region = sample == label_id
-                counts += region
-                if label_id:
-                    volume = int(region.sum())
-                    volumes.append(volume * float(np.prod(image.GetSpacing())))
-                    if volume:
-                        xyz = np.argwhere(region)[:, ::-1].mean(axis=0)
-                        centroids.append(image.TransformContinuousIndexToPhysicalPoint(tuple(map(float, xyz))))
-            np.maximum(max_votes, counts, out=max_votes)
-            if not label_id:
-                continue
-            level = LEVELS[label_id-1]
-            selected = counts > n/2
-            consensus[selected] = label_id
-            mask = sitk.GetImageFromArray(selected.astype(np.uint8))
-            mask.CopyInformation(image)
-            sitk.WriteImage(mask, str(mask_dir/f'vertebrae_{level}.nii.gz'))
-            stats.append(dict(level=level, detected_samples=len(centroids),
-                detection_frequency=len(centroids)/n,
-                volume_mean_mm3=float(np.mean(volumes)),
-                volume_std_mm3=float(np.std(volumes, ddof=1)),
-                centroid_mean_lps_mm=np.mean(centroids, axis=0).tolist() if centroids else None,
-                centroid_std_lps_mm=np.std(centroids, axis=0, ddof=1).tolist() if len(centroids)>1 else None))
-        # 1 - modal frequency measures disagreement even if labels alternate
-        # between two vertebrae. A no-majority voxel is left as background.
-        disagreement = (1 - max_votes.astype(np.float32)/n)
+        for index, level in enumerate(LEVELS):
+            centres = centroids[index]
+            stats.append(dict(level=level, detected_samples=len(centres),
+                detection_frequency=len(centres)/n,
+                volume_mean_mm3=float(np.mean(volumes[:, index])),
+                volume_std_mm3=float(np.std(volumes[:, index], ddof=1)),
+                centroid_mean_lps_mm=np.mean(centres, axis=0).tolist() if centres else None,
+                centroid_std_lps_mm=np.std(centres, axis=0, ddof=1).tolist() if len(centres)>1 else None))
         for name, array in [('consensus.nii.gz', consensus), ('disagreement.nii.gz', disagreement)]:
             result = sitk.GetImageFromArray(array)
             result.CopyInformation(image)
             sitk.WriteImage(result, str(output/name))
-        ambiguous = int(np.count_nonzero(max_votes <= n/2))
+            if name == 'consensus.nii.gz':
+                consensus_report = summarize_labels(image, result, 'monte_carlo/consensus.nii.gz')
+                if binary_masks:
+                    export_binary_masks(result, output/'consensus_masks')
         # ExitStack closes all mappings before directory cleanup, including on failure.
     return dict(samples=n, per_level=stats, no_majority_voxels=ambiguous,
+                consensus=consensus_report,
                 consensus_rule='strict majority > N/2, otherwise background',
                 disagreement_definition='1 - highest label frequency, including background',
                 interpretation='Sensitivity to synthetic iid Gaussian HU noise; not calibrated confidence or a physical CT noise simulation.')

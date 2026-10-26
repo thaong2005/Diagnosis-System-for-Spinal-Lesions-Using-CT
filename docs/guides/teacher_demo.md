@@ -45,6 +45,12 @@ Tên nút tự cập nhật; không cần sửa số lát hay kernel. File cấu
 - **Gửi báo cáo:** bấm **Xuất báo cáo HTML**, mở file bằng trình duyệt để xem
   hoặc in thành PDF.
 
+Kết quả mới lưu các đốt trong một file label map để giảm thời gian đọc/ghi;
+cách mở Baseline/Consensus/Bất đồng giữ nguyên. Không cần thư mục `masks/`
+riêng để xem. Thời gian từng bước hiện trong tab **Tiến trình** và được lưu
+ở `timings_seconds` trong `prediction.json`. Nếu cần mask nhị phân từng đốt
+cho công cụ khác, CLI có tùy chọn `--export-binary-masks` (tốn thêm thời gian).
+
 ## Lưu ý khi xem
 
 **Tên đốt sống** được bật sẵn: trên Sagittal và Coronal, tên có cùng màu với
