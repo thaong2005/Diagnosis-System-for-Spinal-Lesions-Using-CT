@@ -55,6 +55,13 @@ bảo toàn geometry. SimpleITK áp dụng slope/intercept để chuyển sang H
 `--fast` dùng model 3 mm để kiểm tra nhanh; bỏ cờ này để dùng model 1.5 mm.
 Chọn chế độ dựa trên benchmark thực tế trước khi đánh giá chất lượng. Thời gian
 và RAM phụ thuộc kích thước volume; CPU có thể mất nhiều phút.
+Demo mặc định bỏ `--fast` để dùng mô hình 1,5 mm và bật `--robust-crop`:
+backend dùng bộ định vị vùng cắt 3 mm thay cho 6 mm khi chạy ROI subset.
+CLI truyền tùy chọn này thành `--robust_crop` của TotalSegmentator 2.18.0;
+baseline và tất cả mẫu Monte Carlo dùng cùng cấu hình. Báo cáo lưu
+`model.resolution` và `model.robust_crop` để đối chiếu các lượt chạy.
+Đây là lựa chọn phân đoạn chi tiết hơn, chưa phải bằng chứng tăng độ chính xác
+trên dữ liệu dự án; vẫn cần so sánh với nhãn chuyên gia.
 Thư mục output phải chưa tồn tại. Đầu ra chỉ được công bố sau khi toàn bộ xử lý
 thành công. Lỗi trả exit code 1; lỗi tham số trả 2. Có thể thêm
 `--backend-log <tệp-mới>` để giữ chẩn đoán backend; tệp này chỉ nhận log từ CT đã

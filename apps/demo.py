@@ -19,13 +19,12 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBo
     QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSlider,
     QScrollArea, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from matplotlib.colors import ListedColormap
 from matplotlib.figure import Figure
-from matplotlib import colormaps
 from matplotlib import get_data_path
 
 from spinal_ct.ct_io import list_ct_series, load_ct, select_sample_series
 from spinal_ct.review import ct_fingerprint, display_image, load_review, report_html
+from spinal_ct.overlays import draw_vertebral_overlay, vertebral_palette
 
 ROOT = Path(__file__).resolve().parents[1]
 # Keep patient-specific paths in the ignored local configuration.
@@ -166,8 +165,16 @@ class DemoWindow(QMainWindow):
         controls.addSpacing(12)
         controls.addWidget(QLabel('02  XỬ LÝ'))
         self.fast = QCheckBox('Chạy nhanh · mô hình 3 mm')
-        self.fast.setChecked(True)
+        self.fast.setChecked(False)
+        self.fast.setToolTip('Bỏ chọn để dùng mô hình 1,5 mm và định vị vùng cắt kỹ hơn. '
+                             'Chạy chậm hơn và cần nhiều RAM hơn, nhất là khi bật Monte Carlo.')
         controls.addWidget(self.fast)
+        self.resolution_note = QLabel()
+        self.resolution_note.setWordWrap(True)
+        self.resolution_note.setObjectName('muted')
+        controls.addWidget(self.resolution_note)
+        self.fast.toggled.connect(self.update_resolution_note)
+        self.update_resolution_note()
         self.mc = QCheckBox('Bổ sung Monte Carlo')
         self.mc.toggled.connect(self._sync)
         controls.addWidget(self.mc)
@@ -235,10 +242,15 @@ class DemoWindow(QMainWindow):
         self.overlay.setChecked(True)
         self.overlay.toggled.connect(self.redraw)
         toolbar.addWidget(self.overlay)
+        self.show_names = QCheckBox('Tên đốt sống')
+        self.show_names.setChecked(True)
+        self.show_names.setToolTip('Tên và đường dẫn tới mask trên lát Sagittal / Coronal đang xem.')
+        self.show_names.toggled.connect(self.redraw)
+        toolbar.addWidget(self.show_names)
         toolbar.addWidget(QLabel('Độ đậm'))
         self.opacity = QSlider(Qt.Horizontal)
         self.opacity.setRange(5, 90)
-        self.opacity.setValue(30)
+        self.opacity.setValue(18)
         self.opacity.setMaximumWidth(100)
         self.opacity.valueChanged.connect(self.redraw)
         toolbar.addWidget(self.opacity)
@@ -260,6 +272,7 @@ class DemoWindow(QMainWindow):
         self.canvas.setMinimumHeight(310)
         area.addWidget(self.canvas, 3)
         self.canvas.mpl_connect('button_press_event', self.click_plane)
+        self.canvas.mpl_connect('resize_event', self.redraw)
         sliders = QHBoxLayout()
         self.sliders = []
         self.slice_labels = []
@@ -326,6 +339,11 @@ class DemoWindow(QMainWindow):
 
     def _busy(self):
         return self.thread is not None or self.process is not None
+
+    def update_resolution_note(self, *_):
+        self.resolution_note.setText(
+            '3 mm · nhanh hơn; đường biên ít chi tiết.' if self.fast.isChecked() else
+            '1,5 mm · ưu tiên chi tiết; chạy lâu hơn và cần nhiều RAM hơn.')
 
     def _sync(self, *_):
         busy = self._busy()
@@ -497,6 +515,9 @@ class DemoWindow(QMainWindow):
             self.warnings.setPlainText('\n\n'.join(review['warnings']) or 'Không có cảnh báo tự động; vẫn cần review.')
             verified = 'CT đã xác nhận khớp' if review['verified'] else 'Kết quả cũ: cần xác nhận đúng ca'
             self.result_label.setText(f"{review['report']['status']} · {verified} · {folder.name}")
+            resolution = review['report'].get('model', {}).get('resolution')
+            if resolution:
+                self.result_label.setText(self.result_label.text()+f' · Mô hình: {resolution}')
             self._stage('Đã mở kết quả. Chọn đốt sống trong bảng để di chuyển đến vùng tương ứng.')
             self.mode_changed()
         self._task(lambda: load_review(folder, study['source'], study['reference'], study['fingerprint']),
@@ -530,6 +551,8 @@ class DemoWindow(QMainWindow):
             args += ['--series-uid', self.study['uid']]
         if self.fast.isChecked():
             args += ['--fast']
+        else:
+            args += ['--robust-crop']
         if self.mc.isChecked():
             args += ['--mc-samples', str(self.samples.value()), '--mc-noise-hu', str(self.noise.value()),
                      '--mc-seed', str(self.seed.value())]
@@ -638,6 +661,13 @@ class DemoWindow(QMainWindow):
         z, x, y = [s.value() for s in self.sliders]
         dx, dy, dz = self.study['reference'].GetSpacing()
         index = self.axes.index(event.inaxes)
+        shape = self.study['data'].shape
+        width, height, sx, sy = [(shape[2], shape[1], dx, dy),
+                               (shape[1], shape[0], dy, dz),
+                               (shape[2], shape[0], dx, dz)][index]
+        if not (-sx/2 <= event.xdata <= (width-.5)*sx and
+                -sy/2 <= event.ydata <= (height-.5)*sy):
+            return  # Clicking the name gutter must not move the CT crosshair.
         if index == 0:
             x, y = event.xdata/dx, event.ydata/dy
         elif index == 1:
@@ -649,6 +679,7 @@ class DemoWindow(QMainWindow):
     def redraw(self, *_):
         self.figure.clear()
         self.axes = list(self.figure.subplots(1, 3))
+        self.figure.subplots_adjust(left=.04, right=.98, bottom=.12, top=.90, wspace=.23)
         if not self.study:
             for ax, title in zip(self.axes, ('AXIAL', 'SAGITTAL', 'CORONAL')):
                 ax.set_facecolor('#111d29')
@@ -666,7 +697,7 @@ class DemoWindow(QMainWindow):
         titles = ['Axial · R → L / A → P', 'Sagittal · A → P / I → S', 'Coronal · R → L / I → S']
         mask = self.review['masks'].get(self.mode.currentText()) if self.review and self.overlay.isChecked() else None
         mask_planes = [mask[z], mask[:, :, x], mask[:, y, :]] if mask is not None else [None]*3
-        palette = ListedColormap([(0, 0, 0, 0)]+[colormaps['tab20'](i % 20) for i in range(25)])
+        palette = vertebral_palette()
         for i, (ax, plane, overlay, spacing, origin, title) in enumerate(zip(self.axes, planes, mask_planes, sizes, origins, titles)):
             sx, sy = spacing
             h, w = plane.shape
@@ -674,6 +705,8 @@ class DemoWindow(QMainWindow):
             ax.set_facecolor('#111d29')
             ax.imshow(plane, cmap='gray', vmin=self.window_level.value()-self.window_width.value()/2,
                       vmax=self.window_level.value()+self.window_width.value()/2, extent=extent, origin=origin, interpolation='bilinear')
+            ax.set_xlim(extent[:2])
+            ax.set_ylim(extent[2:])
             if overlay is not None:
                 if self.mode.currentText() == 'Bất đồng':
                     ax.imshow(np.ma.masked_less_equal(overlay, 0), cmap='magma', vmin=0, vmax=1,
@@ -681,24 +714,19 @@ class DemoWindow(QMainWindow):
                 else:
                     ax.imshow(np.ma.masked_equal(overlay, 0), cmap=palette, vmin=0, vmax=25,
                               extent=extent, origin=origin, alpha=self.opacity.value()/100, interpolation='nearest')
-                    for label_id in np.unique(overlay):
-                        if not label_id:
-                            continue
-                        ax.contour(np.arange(w)*sx, np.arange(h)*sy, overlay == label_id,
-                                   levels=[.5], colors=[palette(int(label_id))], linewidths=.65)
+                    draw_vertebral_overlay(ax, overlay, spacing,
+                        names=i in (1, 2) and self.show_names.isChecked(),
+                        label_map=self.review['report'].get('label_map'))
             cross = [(x*dx, y*dy), (y*dy, z*dz), (x*dx, z*dz)][i]
-            ax.axvline(cross[0], color='#7adee5', lw=.6, alpha=.6)
-            ax.axhline(cross[1], color='#7adee5', lw=.6, alpha=.6)
+            ax.vlines(cross[0], min(extent[2:]), max(extent[2:]), color='#7adee5', lw=.6, alpha=.6)
+            ax.hlines(cross[1], *extent[:2], color='#7adee5', lw=.6, alpha=.6)
             ax.set_title(title, color='#c5e0e8', fontsize=9, pad=12)
             ax.tick_params(colors='#94aebc', labelsize=7)
-            ax.set_xlim(extent[:2])
-            ax.set_ylim(extent[2:])
         for label, title, index, count in zip(self.slice_labels, ('Axial z', 'Sagittal x', 'Coronal y'),
                                              (z, x, y), (data.shape[0], data.shape[2], data.shape[1])):
             label.setText(f'{title}: {index+1} / {count}')
         caption = 'Bất đồng 0–1: đen → sáng; không phải xác suất sai.' if self.mode.currentText() == 'Bất đồng' else 'Vị trí được đồng bộ · khoảng cách theo mm · mask toàn đốt sống'
         self.figure.text(.5, .02, caption, ha='center', color='#94aebc', fontsize=8)
-        self.figure.subplots_adjust(left=.04, right=.98, bottom=.12, top=.90, wspace=.23)
         self.canvas.draw_idle()
 
     def export_report(self):
@@ -721,7 +749,9 @@ class DemoWindow(QMainWindow):
         QMessageBox.information(self, 'Hướng dẫn nhanh',
             '1. Chọn file CT hoặc thư mục DICOM; với DICOM, chọn series rồi bấm Đọc.\n'
             '2. Chạy baseline trước; bật Monte Carlo nếu cần đánh giá độ nhạy với nhiễu.\n'
+            '   Mặc định 1,5 mm; bật Chạy nhanh để dùng 3 mm khi cần giảm thời gian/RAM.\n'
             '3. Chọn Baseline / Consensus / Bất đồng; kéo thanh lát cắt hoặc nhấp trên ảnh.\n'
+            '   Tên đốt sống hiện trên Sagittal / Coronal khi lát cắt có mask tương ứng.\n'
             '4. Chọn một đốt trong bảng để di chuyển đến tâm mask.\n'
             '5. Xuất báo cáo HTML hoặc mở thư mục để lấy mask NIfTI và JSON.\n\n'
             'Mở kết quả cũ: chọn đúng CT trước, sau đó chọn thư mục chứa prediction.json.\n'

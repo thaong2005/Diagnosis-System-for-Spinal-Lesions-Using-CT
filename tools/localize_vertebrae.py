@@ -31,6 +31,8 @@ def main() -> int:
     parser.add_argument('--device', choices=['cpu', 'gpu', 'mps'], default='cpu')
     parser.add_argument('--model-cache', type=Path, default=Path('.tmp/totalsegmentator'), help='Persistent model weights directory')
     parser.add_argument('--fast', action='store_true', help='Use lower-resolution 3 mm model')
+    parser.add_argument('--robust-crop', action='store_true',
+                        help='Use the backend 3 mm crop locator for the 1.5 mm ROI model (slower)')
     parser.add_argument('--backend', default='TotalSegmentator', help='Path to TotalSegmentator executable')
     parser.add_argument('--progress-json', action='store_true', help='Emit stage events for the desktop UI')
     parser.add_argument('--cancel-file', type=Path, help='Stop after the current backend pass if this file exists')
@@ -77,6 +79,8 @@ def main() -> int:
                        *[f'vertebrae_{level}' for level in LEVELS]]
             if args.fast:
                 command.append('--fast')
+            if args.robust_crop:
+                command.append('--robust_crop')
             env = os.environ.copy()
             config_dir = root/'backend-config'
             config_dir.mkdir()
@@ -100,6 +104,7 @@ def main() -> int:
             report, labels = summarize_masks(image, root/'masks')
             report['model'] = dict(backend='TotalSegmentator', version=version, task='total',
                                    resolution='3mm' if args.fast else '1.5mm', device=args.device,
+                                   robust_crop=args.robust_crop,
                                    saving_threads=1)
             sitk.WriteImage(labels, str(root/'vertebrae.nii.gz'))
             render_preview(image, labels, root/'levels_mpr.png')

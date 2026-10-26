@@ -16,6 +16,12 @@ Nhấp đúp **start_demo.bat** để mở giao diện chọn CT, chạy định
 xem overlay ba mặt phẳng, mở lại kết quả và xuất báo cáo HTML.
 [Hướng dẫn từng bước](docs/guides/teacher_demo.md).
 
+Tên đốt và đường dẫn tới mask hiện trên Sagittal/Coronal ở chế độ Baseline hoặc
+Consensus. Đường biên khép kín ở mép ảnh và có viền tương phản; mask/thể tích
+giữ nguyên. Demo mặc định dùng mô hình 1,5 mm; bật **Chạy nhanh** để dùng 3 mm.
+Mô hình 1,5 mm tốn thời gian/RAM hơn, đặc biệt khi bổ sung Monte Carlo. Kết quả
+cũ có nhãn hiển thị ngay khi mở lại; đổi độ phân giải cần chạy phân đoạn mới.
+
 Để đặt ca mẫu riêng, sao chép `sample_config.example.py` thành `sample_config.py`
 và sửa dòng `SAMPLE_DIR`. File cấu hình cục bộ này không được commit lên GitHub.
 
@@ -73,6 +79,7 @@ spinal_ct/                  Thư viện xử lý dùng chung
   annotations.py            Schema / validator annotation
   labels.py                 Nhãn tham chiếu cho phát triển
   review.py                 Kiểm tra CT–mask, lưới hiển thị và báo cáo HTML
+  overlays.py               Vẽ biên theo voxel và tên đốt trên lát cắt
 tools/                     CLI prepare, inspect, audit, validate, localize, render
 tests/                     Kiểm thử tự động
 docs/

@@ -76,7 +76,7 @@ def render_preview(image: sitk.Image, labels: sitk.Image, path: Path,
     """Write a sagittal QC image; the 3D masks remain the authoritative output."""
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
-    from matplotlib import colormaps
+    from spinal_ct.overlays import draw_vertebral_overlay
     for overlay in (labels, disagreement):
         if overlay is None:
             continue
@@ -105,6 +105,7 @@ def render_preview(image: sitk.Image, labels: sitk.Image, path: Path,
     fig = Figure(figsize=(12 if disagreement is not None else 7, 10), facecolor='#101820')
     FigureCanvasAgg(fig)
     axes = np.atleast_1d(fig.subplots(1, 2 if disagreement is not None else 1))
+    fig.subplots_adjust(left=.09, right=.94, top=.91, bottom=.11, wspace=.35)
     ax = axes[0]
     height, width = plane.shape
     extent = (-spacing[1]/2, (width-.5)*spacing[1],
@@ -113,38 +114,14 @@ def render_preview(image: sitk.Image, labels: sitk.Image, path: Path,
         panel.set_facecolor('#101820')
         panel.imshow(data[:, :, x], cmap='gray', vmin=-200, vmax=1200,
                      origin='lower', extent=extent, interpolation='bilinear')
+        panel.set_xlim(extent[:2])
+        panel.set_ylim(extent[2:])
         panel.tick_params(colors='#b8c7d4', labelsize=8)
         panel.set_xlabel('Anterior → Posterior (mm)', color='#b8c7d4')
         panel.set_ylabel('Inferior → Superior (mm)', color='#b8c7d4')
         for spine in panel.spines.values():
             spine.set_color('#41515e')
-    annotations = []
-    for label_id in np.unique(plane):
-        if label_id == 0:
-            continue
-        region = plane == label_id
-        color = colormaps['tab20']((int(label_id)-1) % 20)
-        # Padding closes contours at the field-of-view edge. Coordinates describe
-        # voxel centres, so level 0.5 traces the boundary between voxel centres.
-        ax.contour(np.arange(-1, width+1)*spacing[1],
-                   np.arange(-1, height+1)*spacing[2],
-                   np.pad(region.astype(float), 1), levels=[0.5],
-                   colors=[color], linewidths=1.1, antialiased=True)
-        coords = np.argwhere(region)
-        z = float(np.median(coords[:, 0]))*spacing[2]
-        y = float(coords[:, 1].min())*spacing[1]
-        annotations.append((z, y, int(label_id), color))
-    # Reserve a label gutter; separate adjacent names even for small fragments.
-    previous_z = -np.inf
-    for z, y, label_id, color in sorted(annotations):
-        label_z = max(z, previous_z + 9)
-        previous_z = label_z
-        ax.annotate(LEVELS[label_id-1], xy=(y, z), xytext=(-12, label_z),
-                    fontsize=9, fontweight='bold', color=color, ha='right', va='center',
-                    arrowprops=dict(arrowstyle='-', color=color, lw=.7),
-                    annotation_clip=False)
-    ax.set_xlim(-28, extent[1])
-    ax.set_ylim(extent[2], max(extent[3], previous_z+8))
+    draw_vertebral_overlay(ax, plane, (spacing[1], spacing[2]), names=True)
     ax.set_title('Consensus boundaries' if disagreement is not None else 'Baseline boundaries',
                  color='white', pad=12)
     if disagreement is not None:
@@ -162,6 +139,5 @@ def render_preview(image: sitk.Image, labels: sitk.Image, path: Path,
     fig.text(.5, .025, 'Sagittal view · distances relative to image grid · contours follow stored masks\n'
              'Display only: no mask smoothing · disagreement is not calibrated confidence',
              ha='center', color='#b8c7d4', fontsize=8)
-    fig.subplots_adjust(left=.09, right=.94, top=.91, bottom=.11, wspace=.35)
     fig.savefig(path, dpi=180, facecolor=fig.get_facecolor())
     fig.clear()

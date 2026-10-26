@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
@@ -82,7 +83,7 @@ class DemoUITests(unittest.TestCase):
             mc = result/'monte_carlo'
             mc.mkdir(parents=True)
             sitk.WriteImage(mask, str(result/'vertebrae.nii.gz'))
-            sitk.WriteImage(mask, str(mc/'consensus.nii.gz'))
+            sitk.WriteImage(sitk.Cast(mask > 0, sitk.sitkUInt8)*21, str(mc/'consensus.nii.gz'))
             sitk.WriteImage(sitk.Cast(mask > 0, sitk.sitkFloat32)*.5, str(mc/'disagreement.nii.gz'))
             prediction = dict(level='L1', label_id=20, volume_mm3=100,
                               centroid_lps_mm=list(image.TransformIndexToPhysicalPoint((18, 24, 20))),
@@ -90,7 +91,7 @@ class DemoUITests(unittest.TestCase):
             report = dict(task='vertebral_localization', status='ok', predictions=[prediction], warnings=[],
                           input_fingerprint=ct_fingerprint(image),
                           monte_carlo=dict(samples=2, per_level=[dict(level='L1', detected_samples=2)],
-                                           consensus=dict(predictions=[prediction])))
+                                           consensus=dict(predictions=[dict(prediction, level='L2', label_id=21)])))
             (result/'prediction.json').write_text(json.dumps(report), encoding='utf-8')
             window = DemoWindow()
             window.resize(1320, 740)
@@ -108,9 +109,29 @@ class DemoUITests(unittest.TestCase):
             self.assertEqual(window.table.rowCount(), 1)
             window.table.selectRow(0)
             self.assertEqual([s.value() for s in window.sliders], [20, 18, 24])
+            for name, expected in (('Baseline', 'L1'), ('Consensus', 'L2')):
+                window.mode.setCurrentText(name)
+                window.canvas.draw()
+                self.assertEqual([t.get_text() for t in window.axes[0].texts], [])
+                for ax in window.axes[1:]:
+                    self.assertEqual([t.get_text() for t in ax.texts], [expected])
+                # The label gutter is outside the CT: clicking it must not move slices.
+                window.click_plane(SimpleNamespace(inaxes=window.axes[1], xdata=-3, ydata=20))
+                self.assertEqual([s.value() for s in window.sliders], [20, 18, 24])
+            window.show_names.setChecked(False)
+            self.assertTrue(all(not ax.texts for ax in window.axes))
+            window.show_names.setChecked(True)
+            window.overlay.setChecked(False)
+            self.assertTrue(all(not ax.texts for ax in window.axes))
+            window.overlay.setChecked(True)
+            window._set_indices(20, 0, 0)
+            self.assertTrue(all(not ax.texts for ax in window.axes[1:]))
+            window._set_indices(20, 18, 24)
+            self.assertEqual([t.get_text() for t in window.axes[1].texts], ['L2'])
             window.mode.setCurrentText('Bất đồng')
             window.canvas.draw()
             self.assertEqual(len(window.axes), 3)
+            self.assertTrue(all(not ax.texts for ax in window.axes))
             self.assertTrue(window.export_button.isEnabled())
             window.load_path(root/'missing.npy')
             self.wait_idle(window)
@@ -119,4 +140,29 @@ class DemoUITests(unittest.TestCase):
             self.assertFalse(window.run_button.isEnabled())
             self.assertEqual(window.table.rowCount(), 0)
             warning.assert_called_once()
+            window.close()
+
+    def test_detail_and_fast_run_options_reach_cli(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(DemoWindow, 'verify_environment'), \
+                patch('apps.demo.ROOT', Path(temporary)), patch('apps.demo.QProcess') as process:
+            window = DemoWindow()
+            data = np.zeros((4, 5, 6), np.float32)
+            window.study = dict(path=Path(temporary)/'ct.nii.gz', uid=None,
+                                data=data, reference=sitk.GetImageFromArray(data))
+            self.assertFalse(window.fast.isChecked())
+            window.mc.setChecked(True)
+            window.start_run()
+            arguments = process.return_value.setArguments.call_args.args[0]
+            self.assertIn('--robust-crop', arguments)
+            self.assertNotIn('--fast', arguments)
+            self.assertIn('--mc-samples', arguments)
+            window.process = None
+            window.fast.setChecked(True)
+            window.start_run()
+            arguments = process.return_value.setArguments.call_args.args[0]
+            self.assertIn('--fast', arguments)
+            self.assertNotIn('--robust-crop', arguments)
+            window.process = None
+            window.study = None
             window.close()
