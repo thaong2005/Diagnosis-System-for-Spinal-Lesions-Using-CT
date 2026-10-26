@@ -16,6 +16,18 @@ Nhấp đúp **start_demo.bat** để mở giao diện chọn CT, chạy định
 xem overlay ba mặt phẳng, mở lại kết quả và xuất báo cáo HTML.
 [Hướng dẫn từng bước](docs/guides/teacher_demo.md).
 
+Tên đốt và đường dẫn tới mask hiện trên Sagittal/Coronal ở chế độ Baseline hoặc
+Consensus. Đường biên khép kín ở mép ảnh và có viền tương phản; mask/thể tích
+giữ nguyên. Demo mặc định dùng mô hình 1,5 mm; bật **Chạy nhanh** để dùng 3 mm.
+Mô hình 1,5 mm tốn thời gian/RAM hơn, đặc biệt khi bổ sung Monte Carlo. Kết quả
+cũ có nhãn hiển thị ngay khi mở lại; đổi độ phân giải cần chạy phân đoạn mới.
+
+Pipeline tối ưu lưu một label map mỗi lượt thay vì 25 mask riêng, dùng CT tạm
+không nén và tổng hợp Monte Carlo theo khối. Kết quả mới dùng báo cáo schema 2
+(`mask_encoding=label_map` cùng `label_id`), có thời gian từng bước trong
+`timings_seconds`; demo vẫn mở kết quả cũ. CLI có `--export-binary-masks` nếu
+cần xuất thêm mask riêng từng đốt. Không đổi cấu hình mô hình hoặc công thức MC.
+
 Để đặt ca mẫu riêng, sao chép `sample_config.example.py` thành `sample_config.py`
 và sửa dòng `SAMPLE_DIR`. File cấu hình cục bộ này không được commit lên GitHub.
 
@@ -25,7 +37,7 @@ và sửa dòng `SAMPLE_DIR`. File cấu hình cục bộ này không được c
 
 ## Tiến độ dự án
 
-Cập nhật ngày **25/10/2026**. Dự án đã có demo chạy từ CT đầu vào đến báo cáo;
+Cập nhật ngày **26/10/2026**. Dự án đã có demo chạy từ CT đầu vào đến báo cáo;
 chưa hoàn thành hệ thống chẩn đoán tổn thương.
 
 | Hạng mục | Tiến độ |
@@ -39,7 +51,21 @@ chưa hoàn thành hệ thống chẩn đoán tổn thương.
 | Đánh giá độ chính xác | Chưa có kết quả trên tập tham chiếu được chuyên gia duyệt |
 | Phát hiện tổn thương, phân loại AO | Chưa triển khai |
 
-**Kiểm chứng gần nhất:**
+**Kiểm chứng tối ưu ngày 26/10/2026:**
+
+- **48 test đạt, 1 bỏ qua trên Windows** (fixture dùng script Unix).
+- Ca 567 lát, CPU, mô hình 3 mm, baseline + 2 mẫu MC (sigma 20 HU, seed 42):
+  lượt mới **248,34 giây**, so với **1.477,25 giây** của lượt cũ cùng CT/cấu hình.
+  Đây là so sánh hai lượt khác thời điểm, không kiểm soát tải hệ thống; không
+  suy ra mọi máy/ca đều nhanh hơn cùng tỷ lệ.
+- Baseline, hai mẫu MC, consensus và disagreement đều **0 voxel khác biệt**.
+  Thể tích/tâm và thống kê MC khớp trong sai số số học; kết quả mở lại được
+  với CT fingerprint đã xác nhận. Chưa chứng minh độ chính xác lâm sàng.
+- Chạy riêng tổng hợp cũ/mới tuần tự trên đúng hai mẫu MC đã lưu:
+  **48,005 giây → 8,376 giây**, kết quả giống nhau; không xóa cache hệ điều hành.
+  Bản mới bỏ xuất các mask nhị phân tùy chọn.
+
+**Kiểm chứng ngày 25/10/2026 (trước tối ưu):**
 
 - Bộ kiểm thử: **35 đạt, 1 bỏ qua trên Windows** vì fixture dùng script Unix.
 - Cả 10 lệnh CLI mở được trợ giúp; hai môi trường Python không có xung đột dependency.
@@ -73,6 +99,7 @@ spinal_ct/                  Thư viện xử lý dùng chung
   annotations.py            Schema / validator annotation
   labels.py                 Nhãn tham chiếu cho phát triển
   review.py                 Kiểm tra CT–mask, lưới hiển thị và báo cáo HTML
+  overlays.py               Vẽ biên theo voxel và tên đốt trên lát cắt
 tools/                     CLI prepare, inspect, audit, validate, localize, render
 tests/                     Kiểm thử tự động
 docs/

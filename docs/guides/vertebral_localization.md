@@ -55,6 +55,13 @@ bảo toàn geometry. SimpleITK áp dụng slope/intercept để chuyển sang H
 `--fast` dùng model 3 mm để kiểm tra nhanh; bỏ cờ này để dùng model 1.5 mm.
 Chọn chế độ dựa trên benchmark thực tế trước khi đánh giá chất lượng. Thời gian
 và RAM phụ thuộc kích thước volume; CPU có thể mất nhiều phút.
+Demo mặc định bỏ `--fast` để dùng mô hình 1,5 mm và bật `--robust-crop`:
+backend dùng bộ định vị vùng cắt 3 mm thay cho 6 mm khi chạy ROI subset.
+CLI truyền tùy chọn này thành `--robust_crop` của TotalSegmentator 2.18.0;
+baseline và tất cả mẫu Monte Carlo dùng cùng cấu hình. Báo cáo lưu
+`model.resolution` và `model.robust_crop` để đối chiếu các lượt chạy.
+Đây là lựa chọn phân đoạn chi tiết hơn, chưa phải bằng chứng tăng độ chính xác
+trên dữ liệu dự án; vẫn cần so sánh với nhãn chuyên gia.
 Thư mục output phải chưa tồn tại. Đầu ra chỉ được công bố sau khi toàn bộ xử lý
 thành công. Lỗi trả exit code 1; lỗi tham số trả 2. Có thể thêm
 `--backend-log <tệp-mới>` để giữ chẩn đoán backend; tệp này chỉ nhận log từ CT đã
@@ -62,13 +69,25 @@ loại metadata và đường dẫn làm việc tạm.
 
 ## Output
 
-- `masks/vertebrae_<level>.nii.gz`: mask nhị phân từng mức đốt; mask rỗng có
-  nghĩa backend không phát hiện mức đó, không chứng minh mức đó không tồn tại.
 - `vertebrae.nii.gz`: label map hợp nhất; bảng `label_map` trong JSON định nghĩa ID.
 - `prediction.json`: phiên bản backend, cấu hình chạy, geometry LPS, mức đốt,
-  tâm, thể tích và ROI.
+  tâm, thể tích, ROI và `timings_seconds` cho từng giai đoạn.
+- `masks/vertebrae_<level>.nii.gz`: chỉ xuất thêm khi dùng `--export-binary-masks`.
+  Mask rỗng nghĩa backend không phát hiện mức đó, không chứng minh mức đó không tồn tại.
 - `levels_mpr.png`: một mặt phẳng sagittal có nhiều voxel đốt sống nhất, có
   đường viền và tên đốt. Có thể không cắt qua mọi đốt; cần kiểm tra mask 3D.
+
+Từ bản tối ưu, báo cáo dùng `schema_version=2`. Mỗi prediction có
+`mask_encoding="label_map"`, `mask="vertebrae.nii.gz"` và `label_id`.
+Lấy mask nhị phân bằng `label_map == label_id`, không dùng toàn bộ các voxel
+khác 0 làm mask của một đốt. Tùy chọn xuất mask riêng chỉ thêm file tương thích;
+các prediction vẫn tham chiếu label map. Kết quả cũ schema 1 vẫn mở trong demo.
+
+Backend ghi một label map không nén cho mỗi lượt (`--ml`); adapter ánh xạ ID
+TotalSegmentator 2.18.0 sang ID của dự án. CT tạm dùng `.nii` không nén để giảm
+chi phí nén/giải nén, còn kết quả cuối vẫn lưu `.nii.gz`. Vì vậy cần thêm dung
+lượng đĩa tạm: CT float32 chiếm khoảng 4 byte/voxel, label map uint8 khoảng
+1 byte/voxel. Không đổi HU, spacing, độ phân giải mô hình hoặc nội suy mask.
 
 ROI voxel dùng thứ tự **x,y,z**, cận trên loại trừ. ROI LPS tính bằng tám góc
 biên voxel, đơn vị mm, là hộp bao song song trục LPS. Mask và label map giữ lưới

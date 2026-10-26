@@ -11,6 +11,104 @@ LEVELS = tuple([f'C{i}' for i in range(1, 8)] +
                [f'T{i}' for i in range(1, 13)] +
                [f'L{i}' for i in range(1, 6)] + ['S1'])
 
+# Frozen TotalSegmentator 2.18.0 / task total / v2 IDs. These are NOT our IDs:
+# backend C1=50, ..., L1=31, ..., S1=26; project C1=1, ..., L1=20, S1=25.
+BACKEND_LABEL_IDS = dict(zip(LEVELS, range(50, 25, -1)))
+
+
+def validate_label_image(image: sitk.Image, labels: sitk.Image) -> None:
+    from spinal_ct.review import same_geometry
+    if not same_geometry(image, labels):
+        raise ValueError('Vertebral label geometry mismatch.')
+    values = sitk.GetArrayViewFromImage(labels)
+    # Bound validation temporaries for large CT volumes, including float inputs.
+    for plane in values:
+        if not np.isin(plane, np.arange(len(LEVELS)+1)).all():
+            raise ValueError('Invalid vertebral label in label map.')
+
+
+def load_backend_labels(image: sitk.Image, path: Path) -> sitk.Image:
+    """Validate and remap a --ml output without interpolation or changing geometry."""
+    from spinal_ct.review import same_geometry
+    raw = sitk.ReadImage(str(path))
+    if not same_geometry(image, raw):
+        raise ValueError('Backend label geometry mismatch.')
+    values = sitk.GetArrayViewFromImage(raw)
+    lookup = np.zeros(51, dtype=np.uint8)
+    for project_id, level in enumerate(LEVELS, 1):
+        lookup[BACKEND_LABEL_IDS[level]] = project_id
+    combined = np.empty(values.shape, dtype=np.uint8)
+    allowed = [0, *BACKEND_LABEL_IDS.values()]
+    for z, plane in enumerate(values):
+        if not np.isin(plane, allowed).all():
+            raise ValueError('Unexpected label in TotalSegmentator 2.18.0 vertebral output.')
+        combined[z] = lookup[plane.astype(np.uint8)]
+    labels = sitk.GetImageFromArray(combined)
+    labels.CopyInformation(image)
+    return labels
+
+
+def label_statistics(labels: sitk.Image, reference: sitk.Image):
+    """One label-statistics pass; do not compute unused, expensive surface measures."""
+    stats = sitk.LabelShapeStatisticsImageFilter()
+    stats.SetComputePerimeter(False)
+    stats.SetComputeFeretDiameter(False)
+    stats.SetComputeOrientedBoundingBox(False)
+    measured = sitk.Cast(labels, sitk.sitkUInt8)
+    # NIfTI-1 rounds geometry to float32 on disk. Measurements must use the
+    # original CT geometry, as the binary-mask implementation does.
+    measured.CopyInformation(reference)
+    stats.Execute(measured)
+    return stats
+
+
+def summarize_labels(image: sitk.Image, labels: sitk.Image,
+                     mask_path: str = 'vertebrae.nii.gz') -> dict:
+    """Schema 2: each prediction references a shared label map plus its label_id."""
+    validate_label_image(image, labels)
+    stats = label_statistics(labels, image)
+    predictions, warnings = [], []
+    for label_id, level in enumerate(LEVELS, 1):
+        if not stats.HasLabel(label_id):
+            continue
+        box = stats.GetBoundingBox(label_id)
+        lower = np.array(box[:3])
+        upper = lower+box[3:]
+        corners = np.asarray([image.TransformContinuousIndexToPhysicalPoint(tuple(map(float, p)))
+                              for p in product(*zip(lower-.5, upper-.5))])
+        boundary = bool((lower == 0).any() or (upper == image.GetSize()).any())
+        if boundary:
+            warnings.append(f'{level}: mask touches image boundary; anatomy may be truncated.')
+        predictions.append(dict(level=level, label_id=label_id, mask=mask_path,
+            mask_encoding='label_map', confidence=None,
+            centroid_lps_mm=list(stats.GetCentroid(label_id)),
+            bbox_voxel_xyz=dict(min=lower.tolist(), max_exclusive=upper.tolist()),
+            roi_lps_mm=dict(min=corners.min(axis=0).tolist(), max=corners.max(axis=0).tolist()),
+            volume_mm3=float(stats.GetNumberOfPixels(label_id)*np.prod(image.GetSpacing())),
+            touches_boundary=boundary))
+    if any(a['centroid_lps_mm'][2] <= b['centroid_lps_mm'][2]
+           for a, b in zip(predictions, predictions[1:])):
+        warnings.append('Non-descending superior-to-inferior level order; manual review required.')
+    indices = [p['label_id'] for p in predictions]
+    if any(b-a > 1 for a, b in zip(indices, indices[1:])):
+        warnings.append('Missing levels between detected vertebrae; manual review required.')
+    if not predictions:
+        warnings.append('No vertebrae detected.')
+    return dict(schema_version=2, status='indeterminate' if warnings else 'ok',
+        review_required=True, task='vertebral_localization', predictions=predictions,
+        warnings=warnings, confidence_note='Backend provides hard masks; confidence is unavailable.',
+        geometry=dict(coordinate_system='LPS', size_xyz=list(image.GetSize()),
+                      spacing_xyz_mm=list(image.GetSpacing()), origin_lps_mm=list(image.GetOrigin()),
+                      direction_lps=list(image.GetDirection())),
+        label_map={str(i): level for i, level in enumerate(LEVELS, 1)})
+
+
+def export_binary_masks(labels: sitk.Image, folder: Path) -> None:
+    """Optional compatibility export. Never parallelize full-volume saving on Windows."""
+    folder.mkdir()
+    for label_id, level in enumerate(LEVELS, 1):
+        sitk.WriteImage(labels == label_id, str(folder/f'vertebrae_{level}.nii.gz'))
+
 
 def summarize_masks(image: sitk.Image, mask_dir: Path) -> tuple[dict, sitk.Image]:
     """Validate complete model outputs, then derive per-level masks and physical boxes."""
@@ -76,7 +174,7 @@ def render_preview(image: sitk.Image, labels: sitk.Image, path: Path,
     """Write a sagittal QC image; the 3D masks remain the authoritative output."""
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
-    from matplotlib import colormaps
+    from spinal_ct.overlays import draw_vertebral_overlay
     for overlay in (labels, disagreement):
         if overlay is None:
             continue
@@ -105,6 +203,7 @@ def render_preview(image: sitk.Image, labels: sitk.Image, path: Path,
     fig = Figure(figsize=(12 if disagreement is not None else 7, 10), facecolor='#101820')
     FigureCanvasAgg(fig)
     axes = np.atleast_1d(fig.subplots(1, 2 if disagreement is not None else 1))
+    fig.subplots_adjust(left=.09, right=.94, top=.91, bottom=.11, wspace=.35)
     ax = axes[0]
     height, width = plane.shape
     extent = (-spacing[1]/2, (width-.5)*spacing[1],
@@ -113,38 +212,14 @@ def render_preview(image: sitk.Image, labels: sitk.Image, path: Path,
         panel.set_facecolor('#101820')
         panel.imshow(data[:, :, x], cmap='gray', vmin=-200, vmax=1200,
                      origin='lower', extent=extent, interpolation='bilinear')
+        panel.set_xlim(extent[:2])
+        panel.set_ylim(extent[2:])
         panel.tick_params(colors='#b8c7d4', labelsize=8)
         panel.set_xlabel('Anterior → Posterior (mm)', color='#b8c7d4')
         panel.set_ylabel('Inferior → Superior (mm)', color='#b8c7d4')
         for spine in panel.spines.values():
             spine.set_color('#41515e')
-    annotations = []
-    for label_id in np.unique(plane):
-        if label_id == 0:
-            continue
-        region = plane == label_id
-        color = colormaps['tab20']((int(label_id)-1) % 20)
-        # Padding closes contours at the field-of-view edge. Coordinates describe
-        # voxel centres, so level 0.5 traces the boundary between voxel centres.
-        ax.contour(np.arange(-1, width+1)*spacing[1],
-                   np.arange(-1, height+1)*spacing[2],
-                   np.pad(region.astype(float), 1), levels=[0.5],
-                   colors=[color], linewidths=1.1, antialiased=True)
-        coords = np.argwhere(region)
-        z = float(np.median(coords[:, 0]))*spacing[2]
-        y = float(coords[:, 1].min())*spacing[1]
-        annotations.append((z, y, int(label_id), color))
-    # Reserve a label gutter; separate adjacent names even for small fragments.
-    previous_z = -np.inf
-    for z, y, label_id, color in sorted(annotations):
-        label_z = max(z, previous_z + 9)
-        previous_z = label_z
-        ax.annotate(LEVELS[label_id-1], xy=(y, z), xytext=(-12, label_z),
-                    fontsize=9, fontweight='bold', color=color, ha='right', va='center',
-                    arrowprops=dict(arrowstyle='-', color=color, lw=.7),
-                    annotation_clip=False)
-    ax.set_xlim(-28, extent[1])
-    ax.set_ylim(extent[2], max(extent[3], previous_z+8))
+    draw_vertebral_overlay(ax, plane, (spacing[1], spacing[2]), names=True)
     ax.set_title('Consensus boundaries' if disagreement is not None else 'Baseline boundaries',
                  color='white', pad=12)
     if disagreement is not None:
@@ -162,6 +237,5 @@ def render_preview(image: sitk.Image, labels: sitk.Image, path: Path,
     fig.text(.5, .025, 'Sagittal view · distances relative to image grid · contours follow stored masks\n'
              'Display only: no mask smoothing · disagreement is not calibrated confidence',
              ha='center', color='#b8c7d4', fontsize=8)
-    fig.subplots_adjust(left=.09, right=.94, top=.91, bottom=.11, wspace=.35)
     fig.savefig(path, dpi=180, facecolor=fig.get_facecolor())
     fig.clear()

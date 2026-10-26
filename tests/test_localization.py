@@ -177,12 +177,10 @@ import SimpleITK as s
 if '--version' in sys.argv:
     print('2.18.0'); sys.exit(0)
 image=s.ReadImage(sys.argv[sys.argv.index('-i')+1])
-out=Path(sys.argv[sys.argv.index('-o')+1]); out.mkdir()
-for level in {LEVELS!r}:
-    mask=s.Image(image.GetSize(), s.sitkUInt8); mask.CopyInformation(image)
-    if level == 'L1':
-        mask[2:5, 2:6, 3:7] = 1
-    s.WriteImage(mask,str(out/f'vertebrae_{{level}}.nii.gz'))
+out=Path(sys.argv[sys.argv.index('-o')+1])
+mask=s.Image(image.GetSize(), s.sitkUInt8); mask.CopyInformation(image)
+mask[2:5, 2:6, 3:7] = 31
+s.WriteImage(mask,str(out))
 ''')
         backend.chmod(0o755)
         output = self.root/'result'
@@ -229,8 +227,9 @@ for level in {LEVELS!r}:
         self.assertEqual(len(list((mc_output/'mc_samples').glob('*.nii.gz'))), 3)
         self.assertFalse((mc_output/'ct.nii.gz').exists())
         # A failed stochastic sample must invalidate the entire run.
-        backend.write_text(f"#!{sys.executable}\nimport sys\nif '--version' in sys.argv:\n    print('2.18.0'); sys.exit(0)\nif 'sample-masks' in sys.argv[sys.argv.index('-o')+1]:\n    sys.exit(9)\n" +
-                           "import shutil\nshutil.copytree(" + repr(str(output/'masks')) + ", sys.argv[sys.argv.index('-o')+1])\n")
+        backend.write_text(f"#!{sys.executable}\nimport sys\nfrom pathlib import Path\nimport SimpleITK as s\nif '--version' in sys.argv:\n    print('2.18.0'); sys.exit(0)\n" +
+                           "out=Path(sys.argv[sys.argv.index('-o')+1])\nmarker=out.parent/'called'\nif marker.exists():\n    sys.exit(9)\nmarker.touch()\n" +
+                           "mask=s.ReadImage(" + repr(str(output/'vertebrae.nii.gz')) + ")\ns.WriteImage(s.Cast(mask>0,s.sitkUInt8)*31,str(out))\n")
         failed_mc = self.root/'failed-mc'
         cmd = [str(failed_mc) if arg == str(mc_output) else arg for arg in mc_command]
         result = subprocess.run(cmd, capture_output=True, text=True)

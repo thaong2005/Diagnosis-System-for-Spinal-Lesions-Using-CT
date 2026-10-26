@@ -76,18 +76,40 @@ mask và đầu ra. Không đặt N lớn trước khi đo thời gian/RAM/dung 
 thay đổi hình học và phép đo. Bậc thang từ phân đoạn `--fast` 3 mm vẫn có thể thấy.
 Chạy `python -m tools.render_localization --help` để dựng ảnh từ kết quả có sẵn.
 
-Đầu ra baseline `masks/`, `vertebrae.nii.gz`, `levels_mpr.png` và
+Đầu ra baseline `vertebrae.nii.gz`, `levels_mpr.png` và
 `predictions` trong JSON vẫn mô tả phân đoạn ảnh gốc. Monte Carlo bổ sung:
 
 - `mc_samples/000.nii.gz`, ...: label map từng mẫu, dùng `label_map` chung.
 - `monte_carlo/consensus.nii.gz`: label map đồng thuận.
-- `monte_carlo/consensus_masks/vertebrae_<level>.nii.gz`: mask từng đốt đồng thuận.
+- `monte_carlo/consensus_masks/vertebrae_<level>.nii.gz`: mask từng đốt đồng thuận,
+  chỉ xuất thêm khi dùng `--export-binary-masks` (kèm `masks/` của baseline).
 - `monte_carlo/consensus_mpr.png`: ảnh sagittal của kết quả đồng thuận.
 - `monte_carlo/disagreement.nii.gz`: giá trị voxel `1 − max_k(count_k/N)`,
   tính cả background. 0 nghĩa mọi mẫu nhất trí, giá trị cao hơn nghĩa bất đồng
   lớn hơn; không diễn giải là xác suất sai.
 - `prediction.json → monte_carlo`: cấu hình, cảnh báo từng lần chạy,
   thống kê cho đủ 25 mức đốt và bản tóm tắt ROI đồng thuận.
+
+Báo cáo schema 2 tham chiếu file label map và `label_id` cho từng đốt;
+`mask_encoding="label_map"`. Trong báo cáo consensus, đường dẫn là
+`monte_carlo/consensus.nii.gz`. Không cần các file mask riêng để mở demo.
+
+## Tối ưu thời gian và đo từng giai đoạn
+
+- Mỗi lượt backend xuất một label map (`--ml`), thay vì ghi 25 mask rồi đọc lại.
+- CT tạm, gồm ảnh nhiễu, dùng NIfTI không nén; các label map cuối vẫn nén.
+- Thống kê label chạy một lượt mỗi ảnh; bỏ phép tính diện tích bề mặt không dùng.
+- Bỏ phiếu theo các khối tối đa 262.144 voxel, giới hạn bộ nhớ tạm.
+  Với hai mẫu, đa số nghiêm ngặt tương đương hai nhãn giống nhau; công thức
+  đồng thuận, bản đồ bất đồng và cách tính thống kê được giữ nguyên.
+- `prediction.json.timings_seconds` ghi đọc CT, fingerprint, chuẩn bị ảnh,
+  suy luận/hậu xử lý từng lượt, tổng hợp MC, dựng preview và dọn dữ liệu tạm.
+  Sự kiện `--progress-json` có thời gian khi kết thúc mỗi bước; demo hiện trong
+  tab **Tiến trình**. Tổng thời gian dùng `runtime_seconds`.
+
+Không mặc định tăng số tiến trình ghi file hoặc chạy song song các mẫu MC để
+tránh nhân bản volume trong RAM trên Windows. Thời gian benchmark phụ thuộc tải
+CPU, bộ nhớ và đĩa; cần so sánh cùng CT, mô hình, số mẫu, sigma và seed.
 
 Mask đồng thuận yêu cầu **hơn 50%** mẫu chọn cùng một nhãn. Voxel không có đa
 số được đặt thành background và đếm trong `no_majority_voxels`; tránh tự chọn

@@ -18,6 +18,8 @@ và một backend. Việc tách đó sẽ tăng cấu hình mà chưa có lợi 
 - `ct_io.py`: đọc CT và kiểm tra HU/geometry cho viewer, chuẩn bị CT và inference.
 - `localization.py`: chuyển mask thành ROI/báo cáo và dựng preview.
 - `monte_carlo.py`: nhiễu HU và tổng hợp mẫu; chưa phải thuật toán ước lượng diện tích.
+- `overlays.py`: dùng chung cách vẽ contour và tên đốt cho demo/ảnh QC; chỉ gắn
+  tên khi mask có trên lát đang xem, giữ nguyên dữ liệu phân đoạn và phép đo.
 - `apps/`: nhận đường dẫn từ CLI, chạy giao diện; không tự ghi volume khi mở viewer.
 - `tools/`: điều phối tác vụ; inference không nhận nhãn tham chiếu.
 - Annotation có quy ước ROI riêng, không tự gộp với mask toàn đốt sống.
