@@ -13,18 +13,18 @@ from uuid import uuid4
 import numpy as np
 import SimpleITK as sitk
 from PySide6.QtCore import QProcess, QProcessEnvironment, QThread, QTimer, Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase
+from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel,
     QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSlider,
     QScrollArea, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from matplotlib import get_data_path
 
 from spinal_ct.ct_io import list_ct_series, load_ct, select_sample_series
 from spinal_ct.review import ct_fingerprint, display_image, load_review, report_html
 from spinal_ct.overlays import draw_vertebral_overlay, vertebral_palette
+from apps.ui_fonts import ui_font
 
 ROOT = Path(__file__).resolve().parents[1]
 # Keep patient-specific paths in the ignored local configuration.
@@ -34,20 +34,6 @@ except ModuleNotFoundError as exc:
     if exc.name != 'sample_config':
         raise
     SAMPLE_DIR = ROOT / 'data/raw/sample_patient'
-
-
-def ui_font() -> str:
-    # Offscreen Qt and some Windows hosts do not populate the system font DB.
-    # Matplotlib ships DejaVu Sans, including the Vietnamese glyphs we need.
-    candidates = [Path('C:/Windows/Fonts/segoeui.ttf'),
-                  Path(get_data_path())/'fonts/ttf/DejaVuSans.ttf']
-    for path in candidates:
-        if path.is_file():
-            font_id = QFontDatabase.addApplicationFont(str(path))
-            families = QFontDatabase.applicationFontFamilies(font_id)
-            if families:
-                return families[0]
-    return QApplication.font().family()
 
 
 class Task(QThread):
@@ -214,11 +200,14 @@ class DemoWindow(QMainWindow):
         self.export_button = QPushButton('Xuất báo cáo HTML')
         self.export_button.clicked.connect(self.export_report)
         controls.addWidget(self.export_button)
+        self.body_button = QPushButton('Đo thân đốt · blob / diện tích')
+        self.body_button.clicked.connect(self.open_body_review)
+        controls.addWidget(self.body_button)
         self.folder_button = QPushButton('Mở vị trí kết quả')
         self.folder_button.clicked.connect(self.open_result_folder)
         controls.addWidget(self.folder_button)
         controls.addStretch()
-        note = QLabel('Mask toàn đốt sống · thể tích mm³\nChưa tính diện tích / phân loại AO.\nKết quả cần được kiểm tra.')
+        note = QLabel('Mask toàn đốt sống · thể tích mm³\nĐo thân đốt trên vùng được duyệt riêng.\nKết quả cần được kiểm tra.')
         note.setObjectName('muted')
         note.setWordWrap(True)
         controls.addWidget(note)
@@ -355,6 +344,10 @@ class DemoWindow(QMainWindow):
         self.run_button.setEnabled(not busy and self.study is not None and self.backend_ready)
         self.open_button.setEnabled(not busy and self.study is not None)
         self.export_button.setEnabled(not busy and self.review is not None)
+        self.body_button.setEnabled(not busy and self.review is not None
+                                    and self.mode.currentText() in ('Baseline', 'Consensus') and self.table.rowCount() > 0)
+        self.mode.setEnabled(not busy)
+        self.table.setEnabled(not busy)
         self.folder_button.setEnabled(self.review is not None)
         self.stop_button.setEnabled(self.process is not None and not (self.cancel_path and self.cancel_path.exists()))
         for widget in (self.fast, self.mc):
@@ -639,6 +632,24 @@ class DemoWindow(QMainWindow):
                     self.table.setItem(row, col, QTableWidgetItem(value))
         self.table.blockSignals(False)
         self.redraw()
+        self._sync()
+
+    def open_body_review(self):
+        if not self.study or not self.review or self._busy() or self.mode.currentText() not in ('Baseline', 'Consensus'):
+            return
+        row = max(0, self.table.currentRow())
+        if row >= len(self.current_predictions):
+            return
+        from apps.body_review import BodyReviewDialog
+        study, review = self.study, self.review
+        level, kind = self.current_predictions[row]['level'], self.mode.currentText()
+        path = review['folder']/('monte_carlo/consensus.nii.gz' if kind == 'Consensus' else 'vertebrae.nii.gz')
+        def accepted(labels):
+            if self.study is study and self.review is review:
+                dialog = BodyReviewDialog(study['source'], labels, study['fingerprint'], level, kind,
+                                          ROOT/'data/body_measurements', self)
+                dialog.exec()
+        self._task(lambda: sitk.ReadImage(str(path)), accepted, f'Mở công cụ đo thân đốt {level}…')
 
     def select_level(self):
         row = self.table.currentRow()

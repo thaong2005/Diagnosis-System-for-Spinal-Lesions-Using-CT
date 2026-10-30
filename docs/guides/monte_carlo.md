@@ -155,5 +155,6 @@ CPU ngày 24/10/2026. Kết quả có mask đồng thuận, bản đồ bất đ
 cần kiểm tra; chưa có đánh giá độ chính xác bằng nhãn chuyên gia hoặc xác nhận
 sigma phù hợp. Không dùng các chỉ số ổn định này để quyết định phân loại AO.
 
-Monte Carlo hiện tại thêm nhiễu HU để đánh giá độ nhạy phân đoạn, chưa thực hiện
-lấy mẫu điểm để tính diện tích. Xem [tiến độ và kiểm thử mới nhất](../../README.md#tiến-độ-dự-án).
+Monte Carlo trong hướng dẫn này thêm nhiễu HU để đánh giá độ nhạy phân đoạn.
+Lấy mẫu điểm để tính diện tích được triển khai riêng trong
+[công cụ đo thân đốt](body_morphometry.md). Xem [tiến độ và kiểm thử mới nhất](../../README.md#tiến-độ-dự-án).

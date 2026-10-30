@@ -6,8 +6,8 @@ phân đoạn trên ba mặt phẳng. Kết quả gồm tên đốt, vùng quan 
 ảnh minh họa và báo cáo.
 
 Hiện dự án dùng TotalSegmentator để phân đoạn và Monte Carlo để kiểm tra mức
-thay đổi của kết quả khi thêm nhiễu vào CT. Mục tiêu tiếp theo là tính diện tích
-thân đốt sống và đánh giá trên dữ liệu có nhãn chuyên gia. Chức năng phát hiện
+thay đổi của kết quả khi thêm nhiễu vào CT. Đã bổ sung công cụ vẽ/duyệt vùng thân
+đốt 2D, đo hình dạng và Monte Carlo diện tích; cần đánh giá trên nhãn chuyên gia. Chức năng phát hiện
 tổn thương và phân loại AO chưa được triển khai.
 
 ## Demo cho giáo viên
@@ -37,7 +37,7 @@ và sửa dòng `SAMPLE_DIR`. File cấu hình cục bộ này không được c
 
 ## Tiến độ dự án
 
-Cập nhật ngày **26/10/2026**. Dự án đã có demo chạy từ CT đầu vào đến báo cáo;
+Cập nhật ngày **30/10/2026**. Dự án đã có demo chạy từ CT đầu vào đến báo cáo;
 chưa hoàn thành hệ thống chẩn đoán tổn thương.
 
 | Hạng mục | Tiến độ |
@@ -47,9 +47,16 @@ chưa hoàn thành hệ thống chẩn đoán tổn thương.
 | Giao diện demo | Đã chọn/đổi ca, xem ba mặt phẳng, mở kết quả và xuất HTML |
 | Monte Carlo nhiễu HU | Đã có baseline, đồng thuận và bản đồ bất đồng; đã chạy 2 mẫu trên `case_053` |
 | Annotation 3D | Đã có công cụ tạo và kiểm tra ROI nháp; cần chuyên gia duyệt |
-| Diện tích thân đốt bằng Monte Carlo | Chưa triển khai lấy mẫu điểm để ước lượng diện tích |
+| Hình dạng và diện tích thân đốt | Đã có công cụ chọn mặt phẳng, chỉnh/duyệt mask 2D, ellipse, chuẩn hóa 128 × 128 và MC diện tích; kiểm thử bằng hình tổng hợp |
+| Blob detection / analysis | Đã phân tích mask thân đốt và thử LoG trong ROI; cần đánh giá hiệu quả trên ca có nhãn |
 | Đánh giá độ chính xác | Chưa có kết quả trên tập tham chiếu được chuyên gia duyệt |
 | Phát hiện tổn thương, phân loại AO | Chưa triển khai |
+
+**Kiểm chứng chức năng đo thân đốt ngày 30/10/2026:** 77 test đạt, 1 bỏ qua trên
+Windows. Test mới kiểm tra phép đo theo mm, ảnh xiên, chuẩn hóa giữ tỷ lệ, MC
+diện tích, LoG, lưu/mở vùng và thao tác giao diện. Trên hình tổng hợp, diện tích
+đếm pixel 915,20 mm²; MC 100.000 điểm, seed 42 cho 915,29 mm². Đã kiểm tra ảnh
+giao diện và báo cáo xuất ra. Chưa đối chiếu phép đo này với nhãn chuyên gia.
 
 **Kiểm chứng tối ưu ngày 26/10/2026:**
 
@@ -77,10 +84,12 @@ chưa hoàn thành hệ thống chẩn đoán tổn thương.
   Ca 567 lát mới kiểm tra baseline; chưa chạy Monte Carlo trên ca này.
 
 Các kiểm tra trên xác nhận luồng phần mềm hoạt động, chưa chứng minh độ chính xác
-phân đoạn. Tiến độ tiếp theo:
+phân đoạn. [Hướng dẫn đo thân đốt, blob và MC diện tích](docs/guides/body_morphometry.md).
+Trong demo, chọn đốt ở Baseline/Consensus rồi bấm **Đo thân đốt · blob / diện tích**.
+Tiến độ tiếp theo:
 
-1. Thống nhất cách chọn lát cắt và vùng thân đốt để đo diện tích.
-2. Triển khai ước lượng diện tích bằng lấy mẫu Monte Carlo và kiểm tra sai số.
+1. Đối chiếu quy tắc chọn mặt phẳng, vùng thân đốt và mốc chiều cao với chuyên gia.
+2. Kiểm chứng LoG và sai số phép đo trên nhiều ca được duyệt; khóa tham số đánh giá.
 3. Đối chiếu phân đoạn, tên đốt và phép đo với nhãn chuyên gia trên nhiều ca;
    sau đó phát triển và đánh giá chức năng phân loại tổn thương.
 

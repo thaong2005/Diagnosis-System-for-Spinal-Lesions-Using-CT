@@ -1,6 +1,6 @@
 # Cấu trúc và quyết định tổ chức dự án
 
-Cập nhật: 25/10/2026.
+Cập nhật: 30/10/2026.
 
 ## Các phương án
 
@@ -23,6 +23,15 @@ và một backend. Việc tách đó sẽ tăng cấu hình mà chưa có lợi 
 - `apps/`: nhận đường dẫn từ CLI, chạy giao diện; không tự ghi volume khi mở viewer.
 - `tools/`: điều phối tác vụ; inference không nhận nhãn tham chiếu.
 - Annotation có quy ước ROI riêng, không tự gộp với mask toàn đốt sống.
+- `body_region.py`: mặt phẳng LPS và vùng thân đốt 2D riêng; người dùng xác định
+  mask thân đốt, không tự chuyển mask toàn đốt thành vùng đo.
+- `blob_analysis.py`, `blob_detection.py`: đặc trưng theo ô pixel vật lý và ứng
+  viên LoG theo thang mm; `area_monte_carlo.py` lấy mẫu điểm để đo diện tích.
+- `morphometry.py`: vùng đã duyệt, hủy xác nhận khi sửa, schema lưu/mở và xuất
+  kết quả. `morphometry_render.py` dùng chung overlay cho UI và ảnh QC.
+- `apps/body_review.py`: cửa sổ chỉnh vùng/mốc, gắn với CT và đốt đang chọn
+  trong demo. CLI `tools.analyze_vertebral_body` tính lại từ vùng đã lưu;
+  `tools.evaluate_body_blobs` đối chiếu ứng viên với tâm vùng được duyệt.
 
 ## Demo dành cho người kiểm tra
 

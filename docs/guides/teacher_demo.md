@@ -67,6 +67,9 @@ nhưng muốn phân đoạn lại ở 1,5 mm phải bỏ chọn **Chạy nhanh**
 
 `indeterminate` nghĩa là cần xem tab **Lưu ý kết quả**, không đồng nghĩa chương
 trình bị lỗi. Bảng hiện **thể tích toàn đốt sống**, chưa phải diện tích thân đốt.
+Để đo diện tích, chọn đốt ở Baseline/Consensus và bấm **Đo thân đốt · blob / diện tích**;
+chọn mặt phẳng, vẽ/duyệt vùng thân đốt rồi chạy phép đo theo
+[hướng dẫn đo hình dạng và diện tích](body_morphometry.md).
 Monte Carlo cho biết kết quả thay đổi thế nào khi thêm nhiễu; chưa dùng để
 kết luận tổn thương hay phân loại AO. Khi gặp lỗi, xem tab **Tiến trình** và log.
 
