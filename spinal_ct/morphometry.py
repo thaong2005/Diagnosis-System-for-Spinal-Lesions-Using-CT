@@ -12,7 +12,7 @@ import numpy as np
 
 from spinal_ct.body_region import BodyPlane, binary_mask, sample_plane
 from spinal_ct.blob_analysis import analyze_blob, normalize_region
-from spinal_ct.area_monte_carlo import estimate_area
+from spinal_ct.area_monte_carlo import estimate_area, validate_sampling
 from spinal_ct.localization import LEVELS
 from spinal_ct.review import ct_fingerprint
 
@@ -56,6 +56,7 @@ class BodySession:
     landmarks: list = field(default_factory=list)
     age_group: str = 'unspecified'
     candidates: dict | None = None
+    sampling_config: dict = field(default_factory=lambda: dict(samples=100_000, seed=42))
     _approved_signature: str | None = None
     result: dict | None = None
 
@@ -82,6 +83,12 @@ class BodySession:
     def invalidate(self):
         self._approved_signature = None
         self.result = None
+
+    def set_candidates(self, detection):
+        # LoG is ancillary to area/height measurements on the unchanged body mask.
+        self.candidates = detection
+        if self.result is not None:
+            self.result['blob_detection'] = detection
 
     def set_mask(self, mask, *, clear_landmarks=True):
         value = binary_mask(mask)
@@ -124,6 +131,7 @@ class BodySession:
     def measure(self, *, samples=100_000, seed=42):
         if not self.reviewed:
             raise ValueError('Confirm the current body region and plane before measuring.')
+        configuration = validate_sampling(samples, seed)
         features = analyze_blob(self.mask, self.plane.spacing_xy_mm)
         warnings = list(features['warnings'])
         heights = measure_heights(self.landmarks, self.plane)
@@ -151,6 +159,7 @@ class BodySession:
                                                          samples=samples, seed=seed, features=features),
                            blob_detection=self.candidates,
                            interpretation='Shape measurements on a user-defined body region; no diagnostic or AO classification.')
+        self.sampling_config = configuration
         return self.result
 
 
@@ -161,6 +170,7 @@ def save_session(session, output, *, samples=100_000, seed=42):
         raise ValueError('Output already exists; choose a new directory.')
     if not session.mask.any():
         raise ValueError('Draw a region before saving.')
+    configuration = validate_sampling(samples, seed)
     report = session.measure(samples=samples, seed=seed) if session.reviewed else None
     document = dict(schema_version=1, task='vertebral_body_region',
                     input_fingerprint=session.input_fingerprint, level=session.level,
@@ -169,6 +179,7 @@ def save_session(session, output, *, samples=100_000, seed=42):
                     mask_sha256=mask_digest(session.mask),
                     region_signature=session._signature(), reviewed=session.reviewed,
                     blob_detection_config=(session.candidates or {}).get('config'),
+                    area_sampling=configuration,
                     body_definition='User outline of the entire body cross-section, including its enclosed interior.',
                     created_utc=datetime.now(timezone.utc).isoformat())
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -190,7 +201,6 @@ def save_session(session, output, *, samples=100_000, seed=42):
                             'anterior_posterior_ratio', 'middle_posterior_ratio')},
                         mc_area_mm2=report['monte_carlo_area']['area_mm2'],
                         mc_samples=samples, mc_seed=seed, warnings=';'.join(report['warnings']))
-            flat.pop('definition', None)
             with (root/'features.csv').open('w', newline='', encoding='utf-8-sig') as stream:
                 writer = csv.DictWriter(stream, fieldnames=list(flat))
                 writer.writeheader()
@@ -227,9 +237,18 @@ def load_session(folder, source, *, fingerprint=None):
         raise ValueError('Region geometry, landmarks or provenance changed since saving.')
     if document.get('reviewed') is True:
         session.approve()
+    configuration = document.get('area_sampling')
+    if configuration is None and (folder/'measurements.json').is_file():
+        # Older schema-1 regions stored sampling settings only in the report.
+        previous = json.loads((folder/'measurements.json').read_text(encoding='utf-8'))
+        if previous.get('region_signature') == session._signature():
+            mc = previous.get('monte_carlo_area', {})
+            configuration = dict(samples=mc.get('samples'), seed=mc.get('seed'))
+    if configuration is not None:
+        session.sampling_config = validate_sampling(**configuration)
     if document.get('blob_detection_config'):
         from spinal_ct.blob_detection import detect_blobs
-        session.candidates = detect_blobs(session.ct, session.plane.spacing_xy_mm, session.valid,
-                                          **document['blob_detection_config'])
+        session.set_candidates(detect_blobs(session.ct, session.plane.spacing_xy_mm, session.valid,
+                                             **document['blob_detection_config']))
     # Measurements are recomputed from the current data, not trusted from a saved report.
     return session

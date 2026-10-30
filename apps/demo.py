@@ -161,9 +161,16 @@ class DemoWindow(QMainWindow):
         controls.addWidget(self.resolution_note)
         self.fast.toggled.connect(self.update_resolution_note)
         self.update_resolution_note()
-        self.mc = QCheckBox('Bổ sung Monte Carlo')
+        self.mc_toggle = QPushButton('+ Thử nghiệm nhiễu HU')
+        self.mc_toggle.setCheckable(True)
+        controls.addWidget(self.mc_toggle)
+        self.mc_panel = QWidget()
+        mc_layout = QVBoxLayout(self.mc_panel)
+        mc_layout.setContentsMargins(0, 0, 0, 0)
+        self.mc = QCheckBox('Bổ sung Monte Carlo nhiễu HU')
         self.mc.toggled.connect(self._sync)
-        controls.addWidget(self.mc)
+        self.mc.toggled.connect(lambda enabled: self.mc_toggle.setChecked(True) if enabled else None)
+        mc_layout.addWidget(self.mc)
         form = QFormLayout()
         self.samples = QSpinBox()
         self.samples.setRange(2, 64)
@@ -177,7 +184,11 @@ class DemoWindow(QMainWindow):
         form.addRow('Số mẫu', self.samples)
         form.addRow('Nhiễu sigma (HU)', self.noise)
         form.addRow('Seed', self.seed)
-        controls.addLayout(form)
+        mc_layout.addLayout(form)
+        controls.addWidget(self.mc_panel)
+        self.mc_panel.setVisible(False)
+        self.mc_toggle.toggled.connect(self.mc_panel.setVisible)
+        self.mc_toggle.toggled.connect(self.update_mc_toggle)
         self.backend_label = QLabel('Đang kiểm tra backend…')
         self.backend_label.setWordWrap(True)
         self.backend_label.setObjectName('muted')
@@ -354,8 +365,15 @@ class DemoWindow(QMainWindow):
             widget.setEnabled(not busy)
         for widget in (self.samples, self.noise, self.seed):
             widget.setEnabled(not busy and self.mc.isChecked())
+        self.mc_toggle.setEnabled(not busy)
+        self.update_mc_toggle()
         self.progress.setRange(0, 0 if busy else 1)
         self.progress.setValue(0 if busy else 1)
+
+    def update_mc_toggle(self, *_):
+        state = ' · đang bật' if self.mc.isChecked() else ''
+        prefix = '- ' if self.mc_toggle.isChecked() else '+ '
+        self.mc_toggle.setText(prefix+'Thử nghiệm nhiễu HU'+state)
 
     def _stage(self, message):
         self.active_stage = message

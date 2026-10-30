@@ -27,31 +27,26 @@ Luồng thực thi:
 
 ```text
 DICOM/NIfTI → CT HU + geometry
-                  ├─ phân đoạn ảnh gốc → masks/, prediction.json, levels_mpr.png
+                  ├─ phân đoạn ảnh gốc → vertebrae.nii.gz, prediction.json, levels_mpr.png
                   └─ N mẫu nhiễu → N lần phân đoạn → mc_samples/
                                                     ↓
                                   mask đồng thuận + bản đồ bất đồng
                                   + thống kê từng đốt trong prediction.json
 ```
 
-## Chạy trong cloud hiện tại
+## Chạy trên Windows
 
 Từ thư mục gốc dự án, sau khi đặt dữ liệu đã ẩn danh vào `data/raw/case_demo`:
 
-```bash
-.venv/bin/python -m tools.localize_vertebrae \
-  --input data/raw/case_demo \
-  --output data/processed/case_demo/localization_mc \
-  --backend /workspace/.venvs/spine-model/bin/TotalSegmentator \
-  --device cpu --fast \
-  --mc-samples 5 --mc-noise-hu 20 --mc-seed 42
+```powershell
+.\.venv\Scripts\python.exe -m tools.localize_vertebrae --input data/raw/case_demo --output data/processed/case_demo/localization_mc --backend .\.venv-model\Scripts\TotalSegmentator.exe --device cpu --fast --mc-samples 5 --mc-noise-hu 20 --mc-seed 42
 ```
 
 Nếu có nhiều series, thêm `--series-uid` để chọn CT phù hợp. Có thể dùng
 `--input data/processed/case_demo/ct.nii.gz` nếu đó là volume HU với geometry
 đúng. Thư mục output phải mới; không ghi đè kết quả đã có.
 Cài backend trên máy khác theo [hướng dẫn định vị](vertebral_localization.md).
-Trên Windows đổi đường dẫn executable theo môi trường Python của máy đó.
+Trong demo, mở nhóm **Thử nghiệm nhiễu HU** rồi bật Monte Carlo để cấu hình.
 
 | Tham số | Ý nghĩa |
 |---|---|
@@ -59,7 +54,7 @@ Trên Windows đổi đường dẫn executable theo môi trường Python của
 | `--mc-samples N` | 2–64 lần phân đoạn mẫu nhiễu, ngoài 1 lần ảnh gốc |
 | `--mc-noise-hu 20` | Sigma Gaussian theo HU; 20 là giá trị thử nghiệm, chưa được xác nhận cho dữ liệu dự án |
 | `--mc-seed 42` | Seed không âm, tái lập nhiễu đầu vào; không bảo đảm backend/GPU hoàn toàn deterministic |
-| `--backend-log /tmp/run_mc.log` | Tệp log mới, ghi log baseline và từng mẫu để chẩn đoán lỗi |
+| `--backend-log data/run_mc.log` | Tệp log mới, ghi log baseline và từng mẫu để chẩn đoán lỗi |
 
 Ví dụ N=5 cần **6 lần suy luận**, nên thời gian thường tăng gần tương ứng.
 Chạy tuần tự để giới hạn RAM. Các label map mẫu được lưu để kiểm tra; tổng hợp
@@ -136,8 +131,8 @@ Mọi ảnh/mask vẫn là dữ liệu người bệnh; giữ dưới `data/` v�
 
 ## Kiểm thử và đánh giá
 
-```bash
-.venv/bin/python -m unittest discover -s tests -v
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
 Các test fixture kiểm tra pipeline, không chứng minh chất lượng mô hình trên

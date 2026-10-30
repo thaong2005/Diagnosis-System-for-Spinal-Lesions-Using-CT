@@ -4,12 +4,17 @@ from spinal_ct.body_region import binary_mask, spacing_xy
 from spinal_ct.blob_analysis import analyze_blob
 
 
-def estimate_area(mask, spacing, *, samples=100_000, seed=42, features=None):
-    mask = binary_mask(mask)
-    sx, sy = spacing_xy(spacing)
+def validate_sampling(samples, seed):
     if (not isinstance(samples, (int, np.integer)) or not 100 <= samples <= 10_000_000
             or not isinstance(seed, (int, np.integer)) or not 0 <= seed <= 2**63-1):
         raise ValueError('MC requires 100–10,000,000 points and a nonnegative integer seed.')
+    return dict(samples=int(samples), seed=int(seed))
+
+
+def estimate_area(mask, spacing, *, samples=100_000, seed=42, features=None):
+    mask = binary_mask(mask)
+    sx, sy = spacing_xy(spacing)
+    validate_sampling(samples, seed)
     features = features or analyze_blob(mask, spacing)
     box = features['oriented_box']
     axes = np.asarray(box['axes_xy'])

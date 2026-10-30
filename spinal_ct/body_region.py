@@ -115,6 +115,25 @@ def sample_plane(source, plane, labels=None, label_id=None):
     return ct, valid, hint
 
 
+def plane_parameters(source, labels, label_id, plane):
+    """Recover the editor settings only when they reproduce the saved plane."""
+    u, v = np.asarray(plane.u_lps), np.asarray(plane.v_lps)
+    yaw = np.arctan2(-u[0], u[1])
+    tilt = np.arctan2(v[0]*np.cos(yaw)+v[1]*np.sin(yaw), v[2])
+    base = propose_plane(source, labels, label_id, yaw_deg=float(np.rad2deg(yaw)),
+                         tilt_deg=float(np.rad2deg(tilt)))
+    normal = np.cross(u, v)
+    delta = np.asarray(plane.origin_lps_mm)-base.origin_lps_mm
+    offset = float(delta @ normal)
+    if (tuple(plane.size_xy) != base.size_xy
+            or not np.allclose(plane.spacing_xy_mm, base.spacing_xy_mm, atol=1e-6)
+            or not np.allclose(u, base.u_lps, atol=1e-6)
+            or not np.allclose(v, base.v_lps, atol=1e-6)
+            or not np.allclose(delta, offset*normal, atol=1e-5)):
+        raise ValueError('Saved custom plane cannot be reproduced by the editor controls.')
+    return dict(offset_mm=offset, yaw_deg=float(np.rad2deg(yaw)), tilt_deg=float(np.rad2deg(tilt)))
+
+
 def polygon_mask(vertices_xy_mm, shape, spacing):
     """Rasterize the user's body outline at pixel centres; retain raw vertices."""
     vertices = np.asarray(vertices_xy_mm, float)

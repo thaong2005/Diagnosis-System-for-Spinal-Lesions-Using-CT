@@ -13,8 +13,9 @@ Dữ liệu CT được lưu trên máy, không có sẵn trong repo GitHub.
    Bấm **Chạy định vị** và chờ thông báo hoàn tất trong tab **Tiến trình**.
 4. Kéo thanh lát cắt hoặc chọn một đốt trong bảng để xem kết quả trên ba mặt phẳng.
 
-Nếu muốn kiểm tra Monte Carlo, bật **Bổ sung Monte Carlo**, giữ tham số mặc định
-rồi chạy lại. Chế độ này chạy thêm 2 lượt có nhiễu nên mất thời gian hơn.
+Nếu muốn kiểm tra Monte Carlo nhiễu HU, mở **Thử nghiệm nhiễu HU**, bật
+**Bổ sung Monte Carlo nhiễu HU**, giữ tham số mặc định rồi chạy lại.
+Chế độ này chạy thêm 2 lượt có nhiễu nên mất thời gian hơn.
 Để dừng, bấm **Dừng sau lượt xử lý hiện tại** và chờ lượt đang chạy kết thúc.
 Mô hình 1,5 mm kèm Monte Carlo chạy lâu hơn và cần nhiều RAM hơn chế độ nhanh.
 

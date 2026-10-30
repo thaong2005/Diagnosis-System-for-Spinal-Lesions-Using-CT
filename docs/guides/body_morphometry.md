@@ -8,7 +8,7 @@ Công cụ dùng CT và kết quả định vị đã lưu. Các phép đo thự
 2. Chọn **Baseline** hoặc **Consensus**, chọn một đốt trong bảng rồi bấm **Đo thân đốt · blob / diện tích**. Nếu chưa chọn hàng, công cụ dùng hàng đầu tiên theo thứ tự giải phẫu.
 3. Kiểm tra mặt phẳng sagittal ban đầu từ tâm mask toàn đốt. Điều chỉnh dịch chuyển, xoay hoặc nghiêng rồi bấm **Tạo / áp dụng mặt phẳng**. Đổi các thông số này sẽ xóa vùng đo đang sửa; lưu trước nếu cần giữ lại.
 4. Vẽ đường bao thân đốt, gồm phần bên trong đường bao, loại cấu trúc phía sau. Khép đa giác bằng nhấp đúp hoặc chọn lại điểm đầu. Có thể thêm/bớt bằng đa giác, dùng cọ trái/phải và hoàn tác. Đường nét đứt xanh là toàn đốt để tham khảo.
-5. Có thể bấm **Tìm ứng viên blob trong ROI** và chọn B1/B2... làm tâm tham khảo khi vẽ. Vòng tròn chỉ biểu diễn thang đo LoG. Điều chỉnh sigma theo mm và ngưỡng đáp ứng nếu cần; ghi nhận cả trường hợp không tìm được ứng viên.
+5. Có thể mở **Thử nghiệm LoG** ở cuối cột điều khiển, bấm **Tìm ứng viên blob trong ROI** và chọn B1/B2... làm tâm tham khảo khi vẽ. Vòng tròn chỉ biểu diễn thang đo LoG. Điều chỉnh sigma theo mm và ngưỡng đáp ứng nếu cần; ghi nhận cả trường hợp không tìm được ứng viên.
 6. Để đo chiều cao, bấm **Đặt lại 6 mốc chiều cao**, nhấp lần lượt: trước–trên, trước–dưới, giữa–trên, giữa–dưới, sau–trên, sau–dưới. Chiều cao là khoảng cách Euclid mỗi cặp điểm trong mm. Có thể bỏ cả sáu mốc; khi đó các chỉ số chiều cao để trống.
 7. Chọn nhóm tuổi nếu biết, kiểm tra mặt phẳng/mask/mốc rồi tích xác nhận. Bấm **Đo hình dạng và Monte Carlo diện tích**.
 8. Bấm **Lưu vùng / xuất kết quả** và chọn thư mục cha. Công cụ tạo thư mục mới có mã riêng. Có thể lưu mask chưa xác nhận dưới dạng nháp, sau đó mở lại để tiếp tục chỉnh.
@@ -23,7 +23,9 @@ Công cụ dùng CT và kết quả định vị đã lưu. Các phép đo thự
 - Ảnh 128 × 128 được căn theo tâm và trục moment, co giãn đồng đều, thêm nền -1024 HU ngoài mask thân đốt. JSON lưu ma trận chuyển từ pixel chuẩn hóa về mm trên mặt phẳng. Các đặc trưng được đo trước khi thu nhỏ.
 - MC diện tích lấy điểm độc lập, đều trong hộp bao; điểm thuộc mask khi rơi vào một ô pixel được đánh dấu. Báo K/N, diện tích, seed, sai lệch so với đếm pixel, sai số chuẩn và khoảng Wilson 95% cho sai số lấy mẫu. Có các mốc hội tụ 100/1.000/10.000/N nếu đủ điểm. Tăng N không bảo đảm mọi lượt đều gần giá trị tham chiếu hơn.
 
-Các cảnh báo gồm mask nhỏ, chạm biên mặt phẳng/trường CT, nhiều thành phần, hướng ellipse chưa ổn định, thiếu mốc hoặc thiếu nhóm tuổi. Sửa mask/mốc/nhóm tuổi sẽ hủy xác nhận và phép đo cũ. Đổi seed hoặc số điểm chỉ hủy kết quả MC để tính lại. Mở lại vùng phải khớp fingerprint CT và chữ ký vùng; không dùng lại bảng đo cũ.
+Các cảnh báo gồm mask nhỏ, chạm biên mặt phẳng/trường CT, nhiều thành phần, hướng ellipse chưa ổn định, thiếu mốc hoặc thiếu nhóm tuổi. Sửa mask/mốc/nhóm tuổi sẽ hủy xác nhận và phép đo cũ. Đổi seed hoặc số điểm xóa bảng đo để tính lại. Đổi thông số LoG bỏ các ứng viên cũ và báo cần chạy lại; chạy LoG giữ bảng đo trên mask. Sigma nhỏ nhất được giới hạn theo spacing mặt phẳng.
+
+Mở lại vùng phải khớp fingerprint CT và chữ ký vùng. Số điểm, seed và cấu hình LoG được khôi phục; các ô dịch/xoay khớp mặt phẳng tạo bởi công cụ. Mặt phẳng tùy chỉnh không biểu diễn được bằng các ô này có nhãn riêng, vẫn giữ geometry đã lưu. Các bản schema 1 cũ lấy N/seed từ báo cáo cùng chữ ký vùng. Seed nhập số nguyên không âm đến 2^63−1. Bấm Đo để tính lại bảng từ dữ liệu hiện tại.
 
 ## Kết quả lưu
 

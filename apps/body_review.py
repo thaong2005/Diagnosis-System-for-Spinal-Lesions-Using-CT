@@ -4,19 +4,20 @@ from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, QRegularExpression
+from PySide6.QtGui import QFont, QRegularExpressionValidator
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
-    QFormLayout, QHBoxLayout, QHeaderView, QLabel, QMessageBox, QPushButton, QScrollArea,
+    QFormLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
     QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from matplotlib.widgets import PolygonSelector
 
-from spinal_ct.body_region import propose_plane, sample_plane, polygon_mask
+from spinal_ct.body_region import propose_plane, sample_plane, polygon_mask, plane_parameters
 from spinal_ct.blob_detection import detect_blobs
 from spinal_ct.morphometry import BodySession, load_session, save_session, LANDMARK_NAMES
 from spinal_ct.morphometry_render import draw_body, draw_normalized
+from spinal_ct.area_monte_carlo import validate_sampling
 from apps.ui_fonts import ui_font
 
 LANDMARK_LABELS = ('Trước – trên', 'Trước – dưới', 'Giữa – trên', 'Giữa – dưới', 'Sau – trên', 'Sau – dưới')
@@ -38,6 +39,7 @@ class BodyReviewDialog(QDialog):
         self.history = []
         self.mode = 'view'
         self.brushing = False
+        self.blob_extras = dict(scales=8, max_candidates=30, window_hu=[-200., 1500.])
         self.setWindowTitle(f'Đo thân đốt · {level} · {source_kind}')
         self.resize(1380, 900)
         self.setMinimumSize(1050, 650)
@@ -50,6 +52,9 @@ class BodyReviewDialog(QDialog):
                        'Đường nét đứt xanh chỉ là mask toàn đốt để tham khảo.')
         intro.setWordWrap(True)
         controls.addWidget(intro)
+        self.plane_note = QLabel('1. Chọn mặt phẳng đi qua thân đốt')
+        self.plane_note.setWordWrap(True)
+        controls.addWidget(self.plane_note)
         form = QFormLayout()
         self.offset = self._double(-80, 80, 0, ' mm')
         self.yaw = self._double(-45, 45, 0, '°')
@@ -86,7 +91,10 @@ class BodyReviewDialog(QDialog):
         self.clear_landmarks = QPushButton('Bỏ các mốc chiều cao')
         self.clear_landmarks.clicked.connect(self.remove_landmarks)
         controls.addWidget(self.clear_landmarks)
-        controls.addWidget(QLabel('LoG thử nghiệm · sigma theo mm'))
+        self.experiment_panel = QWidget()
+        experiment_controls = QVBoxLayout(self.experiment_panel)
+        experiment_controls.setContentsMargins(0, 0, 0, 0)
+        experiment_controls.addWidget(QLabel('LoG thử nghiệm · sigma theo mm'))
         log_form = QFormLayout()
         self.log_min = self._double(.2, 40, 2, ' mm')
         self.log_max = self._double(.2, 60, 12, ' mm')
@@ -96,17 +104,23 @@ class BodyReviewDialog(QDialog):
         log_form.addRow('Sigma nhỏ nhất', self.log_min)
         log_form.addRow('Sigma lớn nhất', self.log_max)
         log_form.addRow('Ngưỡng đáp ứng', self.log_threshold)
-        controls.addLayout(log_form)
+        experiment_controls.addLayout(log_form)
         self.log_button = QPushButton('Tìm ứng viên blob trong ROI')
         self.log_button.clicked.connect(self.find_blobs)
-        controls.addWidget(self.log_button)
+        experiment_controls.addWidget(self.log_button)
         self.blob_choices = QComboBox()
         self.blob_choices.currentIndexChanged.connect(self.candidate_changed)
-        controls.addWidget(self.blob_choices)
+        experiment_controls.addWidget(self.blob_choices)
         self.show_blobs = QCheckBox('Hiện ứng viên LoG')
-        self.show_blobs.setChecked(True)
+        self.show_blobs.setChecked(False)
         self.show_blobs.toggled.connect(self.redraw)
-        controls.addWidget(self.show_blobs)
+        experiment_controls.addWidget(self.show_blobs)
+        self.log_status = QLabel('Chưa chạy LoG trên mặt phẳng này.')
+        self.log_status.setWordWrap(True)
+        experiment_controls.addWidget(self.log_status)
+        for widget in (self.log_min, self.log_max, self.log_threshold):
+            widget.valueChanged.connect(self.log_parameters_changed)
+        controls.addWidget(QLabel('2. Kiểm tra vùng và các mốc'))
         self.age = QComboBox()
         for title, value in (('Chưa xác định nhóm tuổi', 'unspecified'), ('Người lớn', 'adult'), ('Trẻ em', 'pediatric')):
             self.age.addItem(title, value)
@@ -121,14 +135,13 @@ class BodyReviewDialog(QDialog):
         self.samples.setRange(100, 10_000_000)
         self.samples.setValue(100_000)
         self.samples.setSingleStep(10_000)
-        self.seed = QSpinBox()
-        self.seed.setRange(0, 2147483647)
-        self.seed.setValue(42)
+        self.seed = QLineEdit('42')
+        self.seed.setValidator(QRegularExpressionValidator(QRegularExpression('[0-9]{1,19}'), self.seed))
         mc_form.addRow('MC diện tích · số điểm', self.samples)
         mc_form.addRow('Seed', self.seed)
         controls.addLayout(mc_form)
-        for widget in (self.samples, self.seed):
-            widget.valueChanged.connect(self.mc_changed)
+        self.samples.valueChanged.connect(self.mc_changed)
+        self.seed.textChanged.connect(self.mc_changed)
         self.measure_button = QPushButton('Đo hình dạng và Monte Carlo diện tích')
         self.measure_button.clicked.connect(self.measure)
         controls.addWidget(self.measure_button)
@@ -141,6 +154,14 @@ class BodyReviewDialog(QDialog):
         self.open_button = QPushButton('Mở vùng thân đốt đã lưu')
         self.open_button.clicked.connect(self.open_saved)
         controls.addWidget(self.open_button)
+        self.experiment_toggle = QPushButton('+ Thử nghiệm LoG')
+        self.experiment_toggle.setCheckable(True)
+        self.experiment_toggle.toggled.connect(self.experiment_panel.setVisible)
+        self.experiment_toggle.toggled.connect(lambda checked: self.experiment_toggle.setText(
+            '- Thử nghiệm LoG' if checked else '+ Thử nghiệm LoG'))
+        controls.addWidget(self.experiment_toggle)
+        controls.addWidget(self.experiment_panel)
+        self.experiment_panel.setVisible(False)
         controls.addStretch()
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -201,13 +222,45 @@ class BodyReviewDialog(QDialog):
         for widget in (self.clear_button, self.landmark_button, self.clear_landmarks, self.save_button):
             widget.setEnabled(nonempty)
         self.undo_button.setEnabled(active and bool(self.history))
-        self.measure_button.setEnabled(active and self.session.reviewed)
+        try:
+            self.current_sampling()
+            valid_sampling = True
+        except ValueError:
+            valid_sampling = False
+        self.measure_button.setEnabled(active and self.session.reviewed and valid_sampling)
+        self.save_button.setEnabled(nonempty and valid_sampling)
+        has_blobs = active and self.session.candidates is not None
+        self.blob_choices.setEnabled(has_blobs and self.blob_choices.count() > 0)
+        self.show_blobs.setEnabled(has_blobs)
+
+    def current_sampling(self):
+        return validate_sampling(self.samples.value(), int(self.seed.text()))
+
+    def log_config(self):
+        return dict(self.blob_extras, min_sigma_mm=self.log_min.value(), max_sigma_mm=self.log_max.value(),
+                    threshold=self.log_threshold.value())
+
+    def refresh_blob_choices(self):
+        self.blob_choices.blockSignals(True)
+        self.blob_choices.clear()
+        for i, candidate in enumerate((self.session.candidates or {}).get('candidates', []), 1):
+            x, y = candidate['centre_xy_mm']
+            self.blob_choices.addItem(f'B{i}: ({x:.1f}, {y:.1f}) mm · sigma {candidate["sigma_mm"]:.1f}')
+        self.blob_choices.blockSignals(False)
+
+    def log_parameters_changed(self, *_):
+        if self.session:
+            self.session.set_candidates(None)
+            self.refresh_blob_choices()
+            self.log_status.setText('Thông số đã đổi. Bấm Tìm ứng viên để chạy lại LoG.')
+            self.redraw()
 
     def plane_dirty(self, *_):
         self.stop_editing()
         self.session = None
         self.history.clear()
         self.blob_choices.clear()
+        self.log_status.setText('Chưa chạy LoG trên mặt phẳng mới.')
         self.redraw()
         self.status.setText('Mặt phẳng đã thay đổi. Bấm áp dụng, sau đó chọn lại vùng đo.')
 
@@ -224,6 +277,13 @@ class BodyReviewDialog(QDialog):
             self.session = BodySession(self.fingerprint, self.level, self.source_kind, plane, ct, valid, hint,
                                        age_group=self.age.currentData())
             self.blob_choices.clear()
+            minimum_sigma = float(np.ceil(max(plane.spacing_xy_mm)*100)/100)
+            for widget in (self.log_min, self.log_max):
+                widget.blockSignals(True)
+                widget.setMinimum(minimum_sigma)
+                widget.blockSignals(False)
+            self.log_status.setText('Chưa chạy LoG trên mặt phẳng này.')
+            self.plane_note.setText('1. Mặt phẳng sagittal từ ROI · có thể điều chỉnh')
             self.status.setText('Mặt phẳng ban đầu từ ROI toàn đốt. Kiểm tra vị trí trung tâm thân đốt, rồi vẽ đường bao. '
                                 'Khép đa giác bằng nhấp đúp hoặc chọn lại điểm đầu.')
         except (ValueError, RuntimeError) as error:
@@ -370,7 +430,7 @@ class BodyReviewDialog(QDialog):
     def measure(self):
         try:
             self.stop_editing()
-            report = self.session.measure(samples=self.samples.value(), seed=self.seed.value())
+            report = self.session.measure(**self.current_sampling())
             warnings = [WARNINGS.get(w, w) for w in report['warnings']]
             self.status.setText('Đã đo. '+ ('; '.join(warnings) if warnings else 'Kết quả cần đối chiếu với vùng tham chiếu.'))
             self.redraw()
@@ -382,17 +442,13 @@ class BodyReviewDialog(QDialog):
             return
         self.stop_editing()
         try:
-            self.session.candidates = detect_blobs(self.session.ct, self.session.plane.spacing_xy_mm,
-                self.session.valid, min_sigma_mm=self.log_min.value(), max_sigma_mm=self.log_max.value(),
-                threshold=self.log_threshold.value())
-            self.session.result = None
-            self.blob_choices.blockSignals(True)
-            self.blob_choices.clear()
-            for i, candidate in enumerate(self.session.candidates['candidates'], 1):
-                x, y = candidate['centre_xy_mm']
-                self.blob_choices.addItem(f'B{i}: ({x:.1f}, {y:.1f}) mm · sigma {candidate["sigma_mm"]:.1f}')
-            self.blob_choices.blockSignals(False)
+            self.session.set_candidates(detect_blobs(self.session.ct, self.session.plane.spacing_xy_mm,
+                                                     self.session.valid, **self.log_config()))
+            self.refresh_blob_choices()
+            self.show_blobs.setChecked(True)
             self.candidate_changed()
+            self.log_status.setText(f'Đã chạy LoG: {self.blob_choices.count()} ứng viên; sigma '
+                                    f'{self.log_min.value():g}–{self.log_max.value():g} mm, ngưỡng {self.log_threshold.value():g}.')
             self.status.setText(f'Tìm thấy {self.blob_choices.count()} ứng viên. Chọn tâm tham khảo rồi vẽ vùng thân đốt; '
                                 'vòng tròn LoG biểu diễn thang đo.')
         except (ValueError, RuntimeError) as error:
@@ -414,7 +470,7 @@ class BodyReviewDialog(QDialog):
             return
         output = Path(selected)/f'body_{self.level}_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:6]}'
         try:
-            save_session(self.session, output, samples=self.samples.value(), seed=self.seed.value())
+            save_session(self.session, output, **self.current_sampling())
             self.status.setText(f'Đã lưu {"kết quả đo" if self.session.reviewed else "vùng nháp"}: {output}')
             self.redraw()
         except (ValueError, OSError, RuntimeError) as error:
@@ -434,20 +490,45 @@ class BodyReviewDialog(QDialog):
             raise ValueError('Vùng đã lưu thuộc đốt hoặc nguồn mask khác. Hãy chọn đúng đốt và Baseline/Consensus trong demo.')
         from spinal_ct.localization import LEVELS
         _, _, session.hint = sample_plane(self.source, session.plane, self.labels, LEVELS.index(self.level)+1)
+        try:
+            parameters = plane_parameters(self.source, self.labels, LEVELS.index(self.level)+1, session.plane)
+        except ValueError:
+            parameters = None
         self.stop_editing()
         self.session = session
         self.history.clear()
-        self.blob_choices.blockSignals(True)
-        self.blob_choices.clear()
-        for i, candidate in enumerate((session.candidates or {}).get('candidates', []), 1):
-            x, y = candidate['centre_xy_mm']
-            self.blob_choices.addItem(f'B{i}: ({x:.1f}, {y:.1f}) mm · sigma {candidate["sigma_mm"]:.1f}')
-        self.blob_choices.blockSignals(False)
+        self.refresh_blob_choices()
+        for widget, key in ((self.offset, 'offset_mm'), (self.yaw, 'yaw_deg'), (self.tilt, 'tilt_deg')):
+            widget.blockSignals(True)
+            widget.setValue(parameters[key] if parameters else 0.)
+            widget.blockSignals(False)
+        self.plane_note.setText('1. Mặt phẳng đã tải; các thông số được khôi phục' if parameters else
+                               '1. Mặt phẳng tùy chỉnh đã tải; các ô bên dưới chỉ dùng để tạo mới')
+        config = (session.candidates or {}).get('config')
+        for widget in (self.log_min, self.log_max):
+            widget.blockSignals(True)
+            widget.setMinimum(float(np.ceil(max(session.plane.spacing_xy_mm)*100)/100))
+            widget.blockSignals(False)
+        displayed = config or dict(scales=8, max_candidates=30, window_hu=[-200., 1500.],
+                                   min_sigma_mm=2., max_sigma_mm=12., threshold=.03)
+        self.blob_extras = {key: displayed[key] for key in ('scales', 'max_candidates', 'window_hu')}
+        for widget, key in ((self.log_min, 'min_sigma_mm'), (self.log_max, 'max_sigma_mm'), (self.log_threshold, 'threshold')):
+            widget.blockSignals(True)
+            widget.setMaximum(max(widget.maximum(), displayed[key]))
+            widget.setValue(displayed[key])
+            widget.blockSignals(False)
+        self.log_status.setText('Đã khôi phục thông số và ứng viên LoG đã lưu.' if config else 'Vùng đã lưu chưa có kết quả LoG.')
+        self.samples.blockSignals(True)
+        self.samples.setValue(session.sampling_config['samples'])
+        self.samples.blockSignals(False)
+        self.seed.blockSignals(True)
+        self.seed.setText(str(session.sampling_config['seed']))
+        self.seed.blockSignals(False)
         self.age.blockSignals(True)
         self.age.setCurrentIndex(self.age.findData(session.age_group))
         self.age.blockSignals(False)
         self.status.setText('Đã mở vùng, kiểm tra khớp CT. Phép đo sẽ được tính lại khi bấm Đo. '
-                            'Thông số dịch/xoay bên trái chỉ dùng khi tạo mặt phẳng mới.')
+                            'Số điểm và seed được khôi phục theo bản lưu.')
         self.redraw()
 
     def redraw(self, *_):

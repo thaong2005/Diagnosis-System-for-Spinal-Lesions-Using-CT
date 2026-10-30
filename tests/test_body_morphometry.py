@@ -266,6 +266,31 @@ class SessionTests(unittest.TestCase):
             loaded = load_session(root, source)
             self.assertEqual(loaded.candidates, session.candidates)
 
+    def test_legacy_sampling_restored_from_matching_measurement_report(self):
+        source, _, session = session_fixture()
+        session.approve()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)/'legacy'
+            save_session(session, root, samples=700, seed=1234)
+            document = json.loads((root/'region.json').read_text())
+            document.pop('area_sampling')
+            (root/'region.json').write_text(json.dumps(document))
+            loaded = load_session(root, source)
+            self.assertEqual(loaded.sampling_config, dict(samples=700, seed=1234))
+            self.assertIsNone(loaded.result)
+
+    def test_draft_preserves_sampling_and_rejects_invalid_configuration(self):
+        source, _, session = session_fixture()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)/'draft'
+            save_session(session, root, samples=1500, seed=99)
+            loaded = load_session(root, source)
+            self.assertFalse(loaded.reviewed)
+            self.assertEqual(loaded.sampling_config, dict(samples=1500, seed=99))
+            with self.assertRaises(ValueError):
+                save_session(session, Path(tmp)/'invalid', samples=1)
+            self.assertFalse((Path(tmp)/'invalid').exists())
+
     def test_blob_evaluation_cli_and_duplicate_regions(self):
         from tools.evaluate_body_blobs import main as evaluate
         import sys
