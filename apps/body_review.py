@@ -1,10 +1,13 @@
 """Manual body-region review, experimental LoG and area measurements."""
 from datetime import datetime
+import copy
+import json
+import time
 from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
-from PySide6.QtCore import Qt, QRegularExpression
+from PySide6.QtCore import Qt, QRegularExpression, QTimer
 from PySide6.QtGui import QFont, QRegularExpressionValidator
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
     QFormLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
@@ -16,9 +19,10 @@ from matplotlib.widgets import PolygonSelector
 from spinal_ct.body_region import propose_plane, sample_plane, polygon_mask, plane_parameters
 from spinal_ct.blob_detection import detect_blobs
 from spinal_ct.morphometry import BodySession, load_session, save_session, LANDMARK_NAMES
-from spinal_ct.morphometry_render import draw_body, draw_normalized
+from spinal_ct.morphometry_render import draw_body, draw_normalized, draw_convergence
 from spinal_ct.area_monte_carlo import validate_sampling
 from apps.ui_fonts import ui_font
+from apps.tasks import Task
 
 LANDMARK_LABELS = ('Trước – trên', 'Trước – dưới', 'Giữa – trên', 'Giữa – dưới', 'Sau – trên', 'Sau – dưới')
 WARNINGS = dict(small_region='Vùng đo quá nhỏ', touches_plane_boundary='Vùng đo chạm biên mặt phẳng',
@@ -37,6 +41,15 @@ class BodyReviewDialog(QDialog):
         self.session = None
         self.selector = None
         self.history = []
+        self.worker = None
+        self.pending_plane = False
+        self.saved_state = None
+        self.last_saved_path = None
+        self.last_saved_reviewed = False
+        self.timings = []
+        self._closing = False
+        self._busy_started = None
+        self._busy_message = ''
         self.mode = 'view'
         self.brushing = False
         self.blob_extras = dict(scales=8, max_candidates=30, window_hu=[-200., 1500.])
@@ -47,14 +60,26 @@ class BodyReviewDialog(QDialog):
         split = QSplitter(Qt.Horizontal)
         outer.addWidget(split)
         panel = QWidget()
+        self.controls_panel = panel
         controls = QVBoxLayout(panel)
         intro = QLabel('Vẽ đường bao thân đốt, gồm phần bên trong; loại cấu trúc phía sau. '
                        'Đường nét đứt xanh chỉ là mask toàn đốt để tham khảo.')
         intro.setWordWrap(True)
         controls.addWidget(intro)
+        self.state_label = QLabel('Chưa kiểm tra')
+        self.state_label.setWordWrap(True)
+        controls.addWidget(self.state_label)
+        self.tool_label = QLabel('Công cụ: Xem')
+        controls.addWidget(self.tool_label)
         self.plane_note = QLabel('1. Chọn mặt phẳng đi qua thân đốt')
         self.plane_note.setWordWrap(True)
         controls.addWidget(self.plane_note)
+        self.plane_toggle = QPushButton('+ Điều chỉnh mặt phẳng')
+        self.plane_toggle.setCheckable(True)
+        controls.addWidget(self.plane_toggle)
+        self.plane_panel = QWidget()
+        plane_layout = QVBoxLayout(self.plane_panel)
+        plane_layout.setContentsMargins(0, 0, 0, 0)
         form = QFormLayout()
         self.offset = self._double(-80, 80, 0, ' mm')
         self.yaw = self._double(-45, 45, 0, '°')
@@ -62,16 +87,23 @@ class BodyReviewDialog(QDialog):
         form.addRow('Dịch mặt phẳng', self.offset)
         form.addRow('Xoay quanh trục đứng', self.yaw)
         form.addRow('Nghiêng mặt phẳng', self.tilt)
-        controls.addLayout(form)
+        plane_layout.addLayout(form)
         self.apply_plane = QPushButton('Tạo / áp dụng mặt phẳng')
         self.apply_plane.clicked.connect(self.rebuild_plane)
-        controls.addWidget(self.apply_plane)
+        plane_layout.addWidget(self.apply_plane)
+        self.reset_plane = QPushButton('Giữ mặt phẳng hiện tại')
+        self.reset_plane.clicked.connect(self.restore_plane_controls)
+        plane_layout.addWidget(self.reset_plane)
+        controls.addWidget(self.plane_panel)
+        self.plane_panel.hide()
+        self.plane_toggle.toggled.connect(self.plane_panel.setVisible)
+        controls.addWidget(QLabel('2. Vẽ / chỉnh vùng thân đốt'))
         for widget in (self.offset, self.yaw, self.tilt):
             widget.valueChanged.connect(self.plane_dirty)
-        self.add_button = QPushButton('Vẽ / thêm đường bao thân đốt')
+        self.add_button = QPushButton('Vẽ / thêm vùng')
         self.add_button.clicked.connect(lambda: self.start_polygon(False))
         controls.addWidget(self.add_button)
-        self.remove_button = QPushButton('Vẽ vùng cần loại khỏi mask')
+        self.remove_button = QPushButton('Xóa một phần vùng')
         self.remove_button.clicked.connect(lambda: self.start_polygon(True))
         controls.addWidget(self.remove_button)
         self.brush_button = QPushButton('Cọ thêm (chuột trái) / xóa (chuột phải)')
@@ -79,18 +111,34 @@ class BodyReviewDialog(QDialog):
         controls.addWidget(self.brush_button)
         self.radius = self._double(.5, 10, 2, ' mm')
         controls.addWidget(self.radius)
-        self.undo_button = QPushButton('Hoàn tác lần sửa vùng / mốc gần nhất')
+        self.undo_button = QPushButton('Hoàn tác · Ctrl+Z')
         self.undo_button.clicked.connect(self.undo)
+        self.undo_button.setShortcut('Ctrl+Z')
         controls.addWidget(self.undo_button)
         self.clear_button = QPushButton('Xóa vùng và mốc để vẽ lại')
         self.clear_button.clicked.connect(self.clear_region)
         controls.addWidget(self.clear_button)
+        self.landmark_toggle = QPushButton('+ Đo chiều cao · 6 mốc tùy chọn')
+        self.landmark_toggle.setCheckable(True)
+        controls.addWidget(self.landmark_toggle)
+        self.landmark_panel = QWidget()
+        landmark_layout = QVBoxLayout(self.landmark_panel)
+        landmark_layout.setContentsMargins(0, 0, 0, 0)
         self.landmark_button = QPushButton('Đặt lại 6 mốc chiều cao')
         self.landmark_button.clicked.connect(self.start_landmarks)
-        controls.addWidget(self.landmark_button)
+        landmark_layout.addWidget(self.landmark_button)
         self.clear_landmarks = QPushButton('Bỏ các mốc chiều cao')
         self.clear_landmarks.clicked.connect(self.remove_landmarks)
-        controls.addWidget(self.clear_landmarks)
+        landmark_layout.addWidget(self.clear_landmarks)
+        self.landmark_choice = QComboBox()
+        self.landmark_choice.addItems(LANDMARK_LABELS)
+        landmark_layout.addWidget(self.landmark_choice)
+        self.edit_landmark = QPushButton('Sửa mốc đã chọn')
+        self.edit_landmark.clicked.connect(self.start_edit_landmark)
+        landmark_layout.addWidget(self.edit_landmark)
+        controls.addWidget(self.landmark_panel)
+        self.landmark_panel.hide()
+        self.landmark_toggle.toggled.connect(self.landmark_panel.setVisible)
         self.experiment_panel = QWidget()
         experiment_controls = QVBoxLayout(self.experiment_panel)
         experiment_controls.setContentsMargins(0, 0, 0, 0)
@@ -120,7 +168,7 @@ class BodyReviewDialog(QDialog):
         experiment_controls.addWidget(self.log_status)
         for widget in (self.log_min, self.log_max, self.log_threshold):
             widget.valueChanged.connect(self.log_parameters_changed)
-        controls.addWidget(QLabel('2. Kiểm tra vùng và các mốc'))
+        controls.addWidget(QLabel('3. Xác nhận, đo và lưu'))
         self.age = QComboBox()
         for title, value in (('Chưa xác định nhóm tuổi', 'unspecified'), ('Người lớn', 'adult'), ('Trẻ em', 'pediatric')):
             self.age.addItem(title, value)
@@ -130,7 +178,11 @@ class BodyReviewDialog(QDialog):
         self.confirm.setToolTip('Kiểm tra bằng mắt trước khi xác nhận. Thay đổi vùng/mốc sẽ hủy xác nhận và phép đo cũ.')
         self.confirm.toggled.connect(self.approve)
         controls.addWidget(self.confirm)
-        mc_form = QFormLayout()
+        self.sampling_toggle = QPushButton('+ Cấu hình MC diện tích')
+        self.sampling_toggle.setCheckable(True)
+        controls.addWidget(self.sampling_toggle)
+        self.sampling_panel = QWidget()
+        mc_form = QFormLayout(self.sampling_panel)
         self.samples = QSpinBox()
         self.samples.setRange(100, 10_000_000)
         self.samples.setValue(100_000)
@@ -139,18 +191,24 @@ class BodyReviewDialog(QDialog):
         self.seed.setValidator(QRegularExpressionValidator(QRegularExpression('[0-9]{1,19}'), self.seed))
         mc_form.addRow('MC diện tích · số điểm', self.samples)
         mc_form.addRow('Seed', self.seed)
-        controls.addLayout(mc_form)
+        controls.addWidget(self.sampling_panel)
+        self.sampling_panel.hide()
+        self.sampling_toggle.toggled.connect(self.sampling_panel.setVisible)
         self.samples.valueChanged.connect(self.mc_changed)
         self.seed.textChanged.connect(self.mc_changed)
-        self.measure_button = QPushButton('Đo hình dạng và Monte Carlo diện tích')
+        self.measure_button = QPushButton('Đo thân đốt')
+        self.measure_button.setObjectName('primary')
         self.measure_button.clicked.connect(self.measure)
         controls.addWidget(self.measure_button)
         self.show_points = QCheckBox('Hiện tối đa 1.000 điểm MC')
         self.show_points.toggled.connect(self.redraw)
         controls.addWidget(self.show_points)
-        self.save_button = QPushButton('Lưu vùng / xuất kết quả vào thư mục mới')
+        self.save_button = QPushButton('Lưu vùng nháp / kết quả')
         self.save_button.clicked.connect(self.save)
         controls.addWidget(self.save_button)
+        self.save_as_button = QPushButton('Lưu vào thư mục khác…')
+        self.save_as_button.clicked.connect(self.save_as)
+        controls.addWidget(self.save_as_button)
         self.open_button = QPushButton('Mở vùng thân đốt đã lưu')
         self.open_button.clicked.connect(self.open_saved)
         controls.addWidget(self.open_button)
@@ -189,6 +247,21 @@ class BodyReviewDialog(QDialog):
         self.canvas.mpl_connect('motion_notify_event', self.motion)
         self.canvas.mpl_connect('button_release_event', self.release)
         self.rebuild_plane()
+        self.saved_state = self.state_token()
+        self.sync()
+        self.setStyleSheet('''
+            QDialog,QWidget {background:#eef3f6;color:#233c4b;}
+            QPushButton {background:white;border:1px solid #c5d5df;border-radius:5px;padding:6px;}
+            QPushButton:hover {background:#e0f2f2;}
+            QPushButton:disabled {color:#93a4ac;background:#e7edef;}
+            QPushButton#primary {background:#136979;color:white;font-weight:600;}
+            QPushButton#primary:disabled {background:#92adb2;}
+            QComboBox,QSpinBox,QDoubleSpinBox,QLineEdit {background:white;padding:4px;}
+            QTableWidget {background:white;}
+        ''')
+        self.busy_timer = QTimer(self)
+        self.busy_timer.timeout.connect(self.busy_tick)
+        self.busy_timer.start(250)
 
     @staticmethod
     def _double(low, high, value, suffix=''):
@@ -209,12 +282,13 @@ class BodyReviewDialog(QDialog):
             self.selector = None
         self.mode = 'view'
         self.brushing = False
+        self.tool_label.setText('Công cụ: Xem')
 
     def sync(self):
-        active = self.session is not None
+        active = self.session is not None and not self.pending_plane and self.worker is None
         nonempty = active and bool(self.session.mask.any())
         self.confirm.blockSignals(True)
-        self.confirm.setChecked(active and self.session.reviewed)
+        self.confirm.setChecked(self.session is not None and self.session.reviewed)
         self.confirm.blockSignals(False)
         self.confirm.setEnabled(nonempty)
         for widget in (self.add_button, self.remove_button, self.brush_button, self.log_button):
@@ -228,10 +302,18 @@ class BodyReviewDialog(QDialog):
         except ValueError:
             valid_sampling = False
         self.measure_button.setEnabled(active and self.session.reviewed and valid_sampling)
-        self.save_button.setEnabled(nonempty and valid_sampling)
+        can_save = self.worker is None and self.session is not None and bool(self.session.mask.any()) and valid_sampling
+        self.save_button.setEnabled(can_save)
+        self.save_as_button.setEnabled(can_save)
         has_blobs = active and self.session.candidates is not None
         self.blob_choices.setEnabled(has_blobs and self.blob_choices.count() > 0)
         self.show_blobs.setEnabled(has_blobs)
+        self.edit_landmark.setEnabled(active and len(self.session.landmarks) == 6)
+        self.reset_plane.setEnabled(self.pending_plane and self.worker is None)
+        state = self.workflow_state()
+        self.state_label.setText(state + (' · Chưa lưu thay đổi' if self.is_dirty() else ''))
+        color = '#956000' if self.is_dirty() or 'cảnh báo' in state else '#136979'
+        self.state_label.setStyleSheet(f'font-weight:600;color:{color};padding:6px')
 
     def current_sampling(self):
         return validate_sampling(self.samples.value(), int(self.seed.text()))
@@ -257,25 +339,41 @@ class BodyReviewDialog(QDialog):
 
     def plane_dirty(self, *_):
         self.stop_editing()
-        self.session = None
-        self.history.clear()
-        self.blob_choices.clear()
-        self.log_status.setText('Chưa chạy LoG trên mặt phẳng mới.')
-        self.redraw()
-        self.status.setText('Mặt phẳng đã thay đổi. Bấm áp dụng, sau đó chọn lại vùng đo.')
+        self.pending_plane = True
+        self.sync()
+        self.status.setText('Chưa áp dụng mặt phẳng mới. Vùng hiện tại được giữ; áp dụng hoặc chọn Giữ mặt phẳng hiện tại.')
 
-    def rebuild_plane(self):
-        self.stop_editing()
-        self.session = None
-        self.history.clear()
+    def restore_plane_controls(self):
+        for widget, value in zip((self.offset, self.yaw, self.tilt), self.applied_controls):
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+        self.pending_plane = False
+        self.sync()
+        self.status.setText('Đã giữ mặt phẳng và vùng đang chỉnh.')
+
+    def rebuild_plane(self, *_):
+        if self.worker is not None:
+            return
+        if self.session and self.session.mask.any():
+            if not self.confirm_replace(self._rebuild_plane, force=True):
+                return
+        self._rebuild_plane()
+
+    def _rebuild_plane(self):
         try:
             from spinal_ct.localization import LEVELS
             label_id = LEVELS.index(self.level)+1
             plane = propose_plane(self.source, self.labels, label_id, offset_mm=self.offset.value(),
                                   yaw_deg=self.yaw.value(), tilt_deg=self.tilt.value())
             ct, valid, hint = sample_plane(self.source, plane, self.labels, label_id)
-            self.session = BodySession(self.fingerprint, self.level, self.source_kind, plane, ct, valid, hint,
-                                       age_group=self.age.currentData())
+            session = BodySession(self.fingerprint, self.level, self.source_kind, plane, ct, valid, hint,
+                                  age_group=self.age.currentData())
+            self.stop_editing()
+            self.session = session
+            self.pending_plane = False
+            self.applied_controls = (self.offset.value(), self.yaw.value(), self.tilt.value())
+            self.history.clear()
             self.blob_choices.clear()
             minimum_sigma = float(np.ceil(max(plane.spacing_xy_mm)*100)/100)
             for widget in (self.log_min, self.log_max):
@@ -284,8 +382,7 @@ class BodyReviewDialog(QDialog):
                 widget.blockSignals(False)
             self.log_status.setText('Chưa chạy LoG trên mặt phẳng này.')
             self.plane_note.setText('1. Mặt phẳng sagittal từ ROI · có thể điều chỉnh')
-            self.status.setText('Mặt phẳng ban đầu từ ROI toàn đốt. Kiểm tra vị trí trung tâm thân đốt, rồi vẽ đường bao. '
-                                'Khép đa giác bằng nhấp đúp hoặc chọn lại điểm đầu.')
+            self.status.setText('Kiểm tra mặt phẳng, rồi vẽ đường bao thân đốt. Nhấp đúp hoặc chọn lại điểm đầu để khép vùng.')
         except (ValueError, RuntimeError) as error:
             self.error(error)
         self.redraw()
@@ -316,6 +413,7 @@ class BodyReviewDialog(QDialog):
             return
         self.stop_editing()
         self.mode = 'polygon'
+        self.tool_label.setText('Công cụ: '+('Xóa vùng' if subtract else 'Vẽ / thêm vùng'))
         self.status.setText('Chọn các điểm đường bao; nhấp đúp / chọn lại điểm đầu để khép vùng. Esc để vẽ lại.')
         self.selector = PolygonSelector(self.body_ax, lambda vertices: self.apply_polygon(vertices, subtract),
                                         useblit=True, props=dict(color='#ff7bcc', linewidth=1.5))
@@ -338,6 +436,7 @@ class BodyReviewDialog(QDialog):
         if self.session:
             self.stop_editing()
             self.mode = 'brush'
+            self.tool_label.setText('Công cụ: Cọ thêm / xóa')
             self.status.setText('Cọ: giữ chuột trái để thêm, chuột phải để xóa. Bán kính theo mm.')
 
     def start_landmarks(self):
@@ -346,6 +445,7 @@ class BodyReviewDialog(QDialog):
             self.remember()
             self.session.set_landmarks([])
             self.mode = 'landmark'
+            self.tool_label.setText('Công cụ: Đặt mốc')
             self.redraw()
             self.status.setText('Mốc 1/6: '+LANDMARK_LABELS[0])
 
@@ -357,7 +457,7 @@ class BodyReviewDialog(QDialog):
             self.redraw()
 
     def _on_image(self, event):
-        if not self.session or event.inaxes != self.body_ax or event.xdata is None or event.ydata is None:
+        if self.worker is not None or self.pending_plane or not self.session or event.inaxes != self.body_ax or event.xdata is None or event.ydata is None:
             return False
         sx, sy = self.session.plane.spacing_xy_mm
         h, w = self.session.mask.shape
@@ -366,7 +466,15 @@ class BodyReviewDialog(QDialog):
     def click(self, event):
         if not self._on_image(event):
             return
-        if self.mode == 'landmark' and event.button == 1:
+        if self.mode == 'edit_landmark' and event.button == 1:
+            self.remember()
+            points = list(self.session.landmarks)
+            points[self.landmark_choice.currentIndex()] = [event.xdata, event.ydata]
+            self.session.set_landmarks(points)
+            self.stop_editing()
+            self.redraw()
+            self.status.setText('Đã sửa mốc. Kiểm tra và xác nhận lại vùng đo.')
+        elif self.mode == 'landmark' and event.button == 1:
             try:
                 self.session.set_landmarks(self.session.landmarks + [[event.xdata, event.ydata]])
                 count = len(self.session.landmarks)
@@ -427,56 +535,118 @@ class BodyReviewDialog(QDialog):
             self.redraw()
             self.status.setText('Đã đổi số điểm / seed. Bấm Đo để tính lại Monte Carlo diện tích.')
 
-    def measure(self):
-        try:
+    def start_edit_landmark(self):
+        if self.worker is None and self.session and len(self.session.landmarks) == 6:
             self.stop_editing()
-            report = self.session.measure(**self.current_sampling())
-            warnings = [WARNINGS.get(w, w) for w in report['warnings']]
-            self.status.setText('Đã đo. '+ ('; '.join(warnings) if warnings else 'Kết quả cần đối chiếu với vùng tham chiếu.'))
-            self.redraw()
+            self.mode = 'edit_landmark'
+            self.tool_label.setText('Công cụ: Sửa mốc')
+            self.status.setText('Nhấp vị trí mới cho mốc: '+self.landmark_choice.currentText())
+
+    def busy_tick(self):
+        if self.worker is not None:
+            self.status.setText(f'{self._busy_message} · {time.perf_counter()-self._busy_started:.1f} giây')
+
+    def run_task(self, function, callback, message):
+        if self.worker is not None:
+            return
+        self.stop_editing()
+        self._busy_message = message
+        self._busy_started = time.perf_counter()
+        self.worker = Task(function, self)
+        self._task_callback = callback
+        self.controls_panel.setEnabled(False)
+        self.sync()
+        self.worker.finished.connect(self.task_done)
+        self.busy_tick()
+        self.worker.start()
+
+    def task_done(self):
+        task, callback = self.worker, self._task_callback
+        self.worker = None
+        self.controls_panel.setEnabled(True)
+        self.timings.append(dict(stage=self._busy_message, seconds=round(task.elapsed, 4)))
+        if task.error:
+            self.error(task.error)
+        else:
+            try:
+                callback(task.value)
+                self.status.setText(self.status.text()+f' · {task.elapsed:.2f} giây')
+            except Exception as error:
+                self.error(error)
+        task.deleteLater()
+        self.sync()
+
+    def measure(self):
+        if self.worker is not None or self.pending_plane or not self.session:
+            return
+        try:
+            config = self.current_sampling()
+            snapshot = copy.deepcopy(self.session)
+            def compute():
+                snapshot.measure(**config)
+                return snapshot
+            def accepted(session):
+                self.session = session
+                warnings = [WARNINGS.get(w, w) for w in session.result['warnings']]
+                self.status.setText('Đã đo. '+ ('; '.join(warnings) if warnings else 'Có thể lưu kết quả.'))
+                self.redraw()
+            self.run_task(compute, accepted, 'Đang đo hình dạng và diện tích')
         except (ValueError, RuntimeError) as error:
             self.error(error)
 
     def find_blobs(self):
-        if not self.session:
+        if self.worker is not None or self.pending_plane or not self.session:
             return
-        self.stop_editing()
-        try:
-            self.session.set_candidates(detect_blobs(self.session.ct, self.session.plane.spacing_xy_mm,
-                                                     self.session.valid, **self.log_config()))
+        snapshot, config = self.session, self.log_config()
+        def accepted(detection):
+            self.session.set_candidates(detection)
             self.refresh_blob_choices()
             self.show_blobs.setChecked(True)
-            self.candidate_changed()
-            self.log_status.setText(f'Đã chạy LoG: {self.blob_choices.count()} ứng viên; sigma '
-                                    f'{self.log_min.value():g}–{self.log_max.value():g} mm, ngưỡng {self.log_threshold.value():g}.')
-            self.status.setText(f'Tìm thấy {self.blob_choices.count()} ứng viên. Chọn tâm tham khảo rồi vẽ vùng thân đốt; '
-                                'vòng tròn LoG biểu diễn thang đo.')
-        except (ValueError, RuntimeError) as error:
-            self.error(error)
+            self.redraw()
+            self.log_status.setText(f'Đã chạy LoG: {self.blob_choices.count()} ứng viên.')
+            self.status.setText('Chọn tâm tham khảo nếu cần; vòng tròn LoG biểu diễn thang đo.')
+        self.run_task(lambda: detect_blobs(snapshot.ct, snapshot.plane.spacing_xy_mm, snapshot.valid, **config),
+                      accepted, 'Đang tìm ứng viên LoG')
 
     def candidate_changed(self, *_):
         self.redraw()
 
-    def save(self):
-        if not self.session:
+    def save(self, checked=False, *, target_dir=None, after=None):
+        if self.worker is not None or not self.session:
             return
         try:
-            self.output_root.mkdir(parents=True, exist_ok=True)
-        except OSError as error:
-            self.error(error)
-            return
-        selected = QFileDialog.getExistingDirectory(self, 'Chọn thư mục cha để lưu một kết quả mới', str(self.output_root))
-        if not selected:
-            return
-        output = Path(selected)/f'body_{self.level}_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:6]}'
-        try:
-            save_session(self.session, output, **self.current_sampling())
-            self.status.setText(f'Đã lưu {"kết quả đo" if self.session.reviewed else "vùng nháp"}: {output}')
-            self.redraw()
+            config = self.current_sampling()
+            parent = Path(target_dir) if target_dir else Path(self.output_root)
+            parent.mkdir(parents=True, exist_ok=True)
+            output = parent/f'{self.level}_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:6]}'
+            snapshot = copy.deepcopy(self.session)
+            def compute():
+                save_session(snapshot, output, **config)
+                return snapshot
+            def accepted(session):
+                self.session = session
+                self.last_saved_path = output
+                self.last_saved_reviewed = session.reviewed
+                self.saved_state = self.state_token()
+                self.status.setText(f'Đã lưu {"kết quả đo" if session.reviewed else "vùng nháp"}: {output.name}')
+                self.redraw()
+                if after:
+                    after()
+            self.run_task(compute, accepted, 'Đang lưu vùng và xuất kết quả')
         except (ValueError, OSError, RuntimeError) as error:
             self.error(error)
 
+    def save_as(self):
+        selected = QFileDialog.getExistingDirectory(self, 'Chọn thư mục lưu kết quả', str(self.output_root))
+        if selected:
+            self.save(target_dir=Path(selected))
+
     def open_saved(self):
+        if not self.confirm_replace(self._choose_saved):
+            return
+        self._choose_saved()
+
+    def _choose_saved(self):
         selected = QFileDialog.getExistingDirectory(self, 'Chọn thư mục chứa region.json', str(self.output_root))
         if selected:
             try:
@@ -496,12 +666,14 @@ class BodyReviewDialog(QDialog):
             parameters = None
         self.stop_editing()
         self.session = session
+        self.pending_plane = False
         self.history.clear()
         self.refresh_blob_choices()
         for widget, key in ((self.offset, 'offset_mm'), (self.yaw, 'yaw_deg'), (self.tilt, 'tilt_deg')):
             widget.blockSignals(True)
             widget.setValue(parameters[key] if parameters else 0.)
             widget.blockSignals(False)
+        self.applied_controls = (self.offset.value(), self.yaw.value(), self.tilt.value())
         self.plane_note.setText('1. Mặt phẳng đã tải; các thông số được khôi phục' if parameters else
                                '1. Mặt phẳng tùy chỉnh đã tải; các ô bên dưới chỉ dùng để tạo mới')
         config = (session.candidates or {}).get('config')
@@ -527,6 +699,9 @@ class BodyReviewDialog(QDialog):
         self.age.blockSignals(True)
         self.age.setCurrentIndex(self.age.findData(session.age_group))
         self.age.blockSignals(False)
+        self.last_saved_path = Path(folder)
+        self.last_saved_reviewed = session.reviewed
+        self.saved_state = self.state_token()
         self.status.setText('Đã mở vùng, kiểm tra khớp CT. Phép đo sẽ được tính lại khi bấm Đo. '
                             'Số điểm và seed được khôi phục theo bản lưu.')
         self.redraw()
@@ -537,7 +712,8 @@ class BodyReviewDialog(QDialog):
             self.sync()
             return
         self.figure.clear()
-        self.body_ax, normalized_ax = self.figure.subplots(1, 2)
+        axes = self.figure.subplots(1, 3)
+        self.body_ax, normalized_ax, convergence_ax = axes
         self.table.setRowCount(0)
         if self.session:
             draw_body(self.body_ax, self.session, show_points=self.show_points.isChecked(), show_blobs=self.show_blobs.isChecked())
@@ -547,6 +723,12 @@ class BodyReviewDialog(QDialog):
             if self.show_blobs.isChecked() and 0 <= index < len(candidates):
                 self.body_ax.plot(*candidates[index]['centre_xy_mm'], '+', color='#fc64f0', markersize=15, markeredgewidth=2)
             report = self.session.result if self.session.reviewed else None
+            if report and 'monte_carlo_area' in report and 'convergence' in report['monte_carlo_area']:
+                draw_convergence(convergence_ax, report)
+            else:
+                convergence_ax.text(.5, .5, 'Xác nhận và đo\nđể xem hội tụ MC', ha='center', va='center',
+                                     transform=convergence_ax.transAxes, color='#94aebc', fontsize=10)
+                convergence_ax.set_axis_off()
             if report:
                 f, mc = report['features'], report['monte_carlo_area']
                 values = [('Diện tích đếm pixel (mm²)', f['area_mm2']), ('Cao/rộng theo mặt phẳng', f['height_width_ratio']),
@@ -559,17 +741,63 @@ class BodyReviewDialog(QDialog):
                 low, high = mc['sampling_interval95_mm2']
                 values += [('MC diện tích (mm²)', mc['area_mm2']), ('Sai lệch MC so với đếm pixel (mm²)', mc['error_vs_pixel_area_mm2']),
                            ('Khoảng lấy mẫu 95% MC (mm²)', f'{low:.2f} – {high:.2f}'), ('Số điểm / seed', f'{mc["samples"]} / {mc["seed"]}')]
+                if 'elbow' in mc:
+                    elbow = mc['elbow']
+                    values.append(('MC điểm cùi chỏ (mm²)', f"{elbow['area_mm2']:.4f} (N={elbow['samples']:,})"))
                 self.table.setRowCount(len(values))
                 for row, (name, value) in enumerate(values):
                     self.table.setItem(row, 0, QTableWidgetItem(name))
                     self.table.setItem(row, 1, QTableWidgetItem(f'{value:,.4f}' if isinstance(value, (float, int)) else value))
         else:
-            for ax in (self.body_ax, normalized_ax):
+            for ax in axes:
                 ax.set_axis_off()
             self.body_ax.text(.5, .5, 'Áp dụng mặt phẳng để chọn vùng mới', ha='center', va='center', transform=self.body_ax.transAxes)
         self.canvas.draw_idle()
         self.sync()
 
-    def closeEvent(self, event):
+    def state_token(self):
+        if not self.session:
+            return None
+        return (self.session._signature(), self.session.reviewed, self.samples.value(), self.seed.text(),
+                json.dumps(self.log_config(), sort_keys=True))
+
+    def is_dirty(self):
+        return self.state_token() != self.saved_state
+
+    def workflow_state(self):
+        if self.last_saved_path and not self.is_dirty():
+            return 'Đã lưu · '+('Đã xác nhận' if self.session.reviewed else 'Vùng nháp')
+        if self.session and self.session.reviewed:
+            if self.session.result and self.session.result['warnings']:
+                return 'Đã xác nhận · Có cảnh báo'
+            return 'Đã xác nhận'
+        return 'Chưa kiểm tra'
+
+    def confirm_replace(self, continuation, *, force=False):
+        if self.worker is not None:
+            self.status.setText('Đang xử lý. Hãy chờ tác vụ hoàn tất.')
+            return False
+        if not force and not self.is_dirty():
+            return True
+        choice = QMessageBox.question(self, 'Giữ vùng đang chỉnh',
+            'Lưu vùng hiện tại trước khi tiếp tục? Bạn có thể lưu nháp khi chưa xác nhận.',
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Cancel)
+        if choice == QMessageBox.Save:
+            self.save(after=continuation)
+            return False
+        return choice == QMessageBox.Discard
+
+    def _finish_close(self):
         self.stop_editing()
-        super().closeEvent(event)
+        self._closing = True
+        super().reject()
+
+    def reject(self):
+        if self._closing:
+            super().reject()
+        elif self.confirm_replace(self._finish_close):
+            self._finish_close()
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.reject()

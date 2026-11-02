@@ -3,13 +3,17 @@ import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from pathlib import Path
 import tempfile
+import time
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import numpy as np
 import SimpleITK as sitk
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtCore import QTimer
+from PySide6.QtTest import QTest
 from apps.body_review import BodyReviewDialog
 from apps.demo import DemoWindow
 from spinal_ct.morphometry import save_session
@@ -21,6 +25,19 @@ class BodyReviewUITests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        prompt = patch('apps.body_review.QMessageBox.question', return_value=QMessageBox.Discard)
+        prompt.start()
+        self.addCleanup(prompt.stop)
+
+    def wait_idle(self, dialog):
+        deadline = time.monotonic()+20
+        while dialog.worker is not None and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(.005)
+        self.app.processEvents()
+        self.assertIsNone(dialog.worker)
 
     def dialog(self):
         source, labels = fixture()
@@ -39,6 +56,7 @@ class BodyReviewUITests(unittest.TestCase):
             self.assertTrue(dialog.measure_button.isEnabled())
             dialog.samples.setValue(1000)
             dialog.measure()
+            self.wait_idle(dialog)
             self.assertGreater(dialog.table.rowCount(), 0)
             dialog.apply_polygon([[15, 15], [18, 15], [18, 18], [15, 18]], subtract=True)
             self.assertFalse(dialog.confirm.isChecked())
@@ -55,12 +73,14 @@ class BodyReviewUITests(unittest.TestCase):
         dialog.confirm.setChecked(True)
         dialog.samples.setValue(100)
         dialog.measure()
+        self.wait_idle(dialog)
         dialog.seed.setText('123')
         self.assertIsNone(dialog.session.result)
         self.assertEqual(dialog.table.rowCount(), 0)
         self.assertTrue(dialog.session.reviewed)
         dialog.offset.setValue(1)
-        self.assertIsNone(dialog.session)
+        self.assertTrue(dialog.session.mask.any())
+        self.assertTrue(dialog.pending_plane)
         self.assertFalse(dialog.measure_button.isEnabled())
         dialog.rebuild_plane()
         self.assertFalse(dialog.session.mask.any())
@@ -104,9 +124,11 @@ class BodyReviewUITests(unittest.TestCase):
         dialog.confirm.setChecked(True)
         dialog.samples.setValue(100)
         dialog.measure()
+        self.wait_idle(dialog)
         previous = dialog.session.result['monte_carlo_area'].copy()
         rows = dialog.table.rowCount()
         dialog.find_blobs()
+        self.wait_idle(dialog)
         self.assertEqual(dialog.session.result['monte_carlo_area'], previous)
         self.assertEqual(dialog.table.rowCount(), rows)
         self.assertIsNotNone(dialog.session.result['blob_detection'])
@@ -119,6 +141,7 @@ class BodyReviewUITests(unittest.TestCase):
         self.assertTrue(dialog.session.reviewed)
         self.assertIn('Thông số đã đổi', dialog.log_status.text())
         dialog.find_blobs()
+        self.wait_idle(dialog)
         self.assertEqual(dialog.session.result['blob_detection']['config']['threshold'], .07)
         dialog.close()
 
@@ -133,6 +156,7 @@ class BodyReviewUITests(unittest.TestCase):
         dialog.log_max.setValue(15)
         dialog.log_threshold.setValue(.07)
         dialog.find_blobs()
+        self.wait_idle(dialog)
         dialog.confirm.setChecked(True)
         large_seed = 2**63-1
         with tempfile.TemporaryDirectory() as tmp:
@@ -152,6 +176,7 @@ class BodyReviewUITests(unittest.TestCase):
             self.assertEqual(dialog.current_sampling(), dict(samples=700, seed=large_seed))
             self.assertTrue(dialog.session.reviewed)
             dialog.measure()
+            self.wait_idle(dialog)
             self.assertEqual(dialog.session.result['monte_carlo_area']['seed'], large_seed)
         dialog.close()
 
@@ -179,6 +204,79 @@ class BodyReviewUITests(unittest.TestCase):
             self.assertFalse(window.mc_panel.isHidden())
             self.assertIn('đang bật', window.mc_toggle.text())
             window.close()
+
+    def test_worker_keeps_event_loop_alive_and_blocks_edits(self):
+        dialog = self.dialog()
+        self.draw(dialog)
+        dialog.confirm.setChecked(True)
+        released = threading.Event()
+        from spinal_ct.morphometry import BodySession
+        original = BodySession.measure
+        def delayed(session, **config):
+            released.wait(5)
+            return original(session, **config)
+        ticks = []
+        timer = QTimer()
+        timer.timeout.connect(lambda: ticks.append(1))
+        timer.start(5)
+        with patch.object(BodySession, 'measure', delayed):
+            dialog.measure()
+            mask = dialog.session.mask.copy()
+            self.assertFalse(dialog.controls_panel.isEnabled())
+            dialog.close()
+            self.assertFalse(dialog._closing)
+            for _ in range(12): QTest.qWait(50)
+            self.assertGreater(len(ticks), 2)
+            np.testing.assert_array_equal(mask, dialog.session.mask)
+            released.set()
+            self.wait_idle(dialog)
+        timer.stop()
+        self.assertIsNotNone(dialog.session.result)
+        self.assertTrue(dialog.controls_panel.isEnabled())
+        dialog.close()
+
+    def test_cancel_plane_change_and_close_preserves_unsaved_region(self):
+        dialog = self.dialog()
+        self.draw(dialog)
+        original = dialog.session.mask.copy()
+        dialog.offset.setValue(3)
+        with patch('apps.body_review.QMessageBox.question', return_value=QMessageBox.Cancel):
+            dialog.rebuild_plane()
+            dialog.reject()
+            self.assertFalse(dialog._closing)
+        np.testing.assert_array_equal(original, dialog.session.mask)
+        dialog.restore_plane_controls()
+        self.assertFalse(dialog.pending_plane)
+        self.assertEqual(dialog.offset.value(), 0)
+        self.assertTrue(dialog.add_button.isEnabled())
+        dialog.close()
+
+    def test_save_draft_before_plane_change_and_failure_preserves_region(self):
+        dialog = self.dialog()
+        self.draw(dialog)
+        original = dialog.session.mask.copy()
+        with tempfile.TemporaryDirectory() as tmp:
+            dialog.output_root = Path(tmp)
+            dialog.offset.setValue(2)
+            with patch('apps.body_review.QMessageBox.question', return_value=QMessageBox.Save), \
+                    patch('apps.body_review.QFileDialog.getExistingDirectory', return_value=tmp), \
+                    patch('apps.body_review.save_session', side_effect=OSError('disk full')), \
+                    patch('apps.body_review.QMessageBox.warning'):
+                dialog.rebuild_plane()
+                self.wait_idle(dialog)
+            np.testing.assert_array_equal(dialog.session.mask, original)
+            self.assertTrue(dialog.pending_plane)
+            with patch('apps.body_review.QMessageBox.question', return_value=QMessageBox.Save), \
+                    patch('apps.body_review.QFileDialog.getExistingDirectory', return_value=tmp):
+                dialog.rebuild_plane()
+                self.wait_idle(dialog)
+            self.assertTrue((dialog.last_saved_path/'region.json').is_file())
+            self.assertFalse(dialog.session.mask.any())
+            dialog.load_region(dialog.last_saved_path)
+            np.testing.assert_array_equal(dialog.session.mask, original)
+            self.assertFalse(dialog.is_dirty())
+            self.assertIn('Vùng nháp', dialog.workflow_state())
+        dialog.close()
 
     def test_demo_opens_body_editor_for_selected_source_and_level(self):
         source, labels = fixture()
