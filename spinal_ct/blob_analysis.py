@@ -39,6 +39,9 @@ def analyze_blob(mask, spacing):
     projected = points @ axes
     half_cell = np.abs(axes).T @ np.array([sx, sy])/2
     lower, upper = projected.min(0)-half_cell, projected.max(0)+half_cell
+    mid = (lower + upper) / 2
+    side = max(upper[0] - lower[0], upper[1] - lower[1])
+    lower, upper = mid - side / 2, mid + side / 2
     corners = np.array([[lower[0], lower[1]], [upper[0], lower[1]],
                         [upper[0], upper[1]], [lower[0], upper[1]]]) @ axes.T
     # Pixel-edge points define a cell-union hull, rather than a centre-only hull.
@@ -74,15 +77,16 @@ def analyze_blob(mask, spacing):
                     orientation_reliable=reliable,
                     definition='Ellipse with the same second moments as the union of occupied pixel cells.'),
                 oriented_box=dict(axes_xy=axes.tolist(), min_uv_mm=lower.tolist(), max_uv_mm=upper.tolist(),
-                                  corners_xy_mm=corners.tolist(), area_mm2=float(np.prod(upper-lower)),
-                                  definition='Pixel-cell bounds along moment axes; not a minimum-area box.'),
-                fill_ratio=float(area/np.prod(upper-lower)), solidity=float(area/hull_area),
+                                  corners_xy_mm=corners.tolist(), area_mm2=float(side*side),
+                                  side_length_mm=float(side),
+                                  definition='Square pixel-cell bounds along moment axes; not a minimum-area box.'),
+                fill_ratio=float(area/(side*side)), solidity=float(area/hull_area),
                 height_width_ratio=float((np.ptp(rows)+1)*sy/((np.ptp(cols)+1)*sx)),
                 height_width_definition='Superior/posterior extent in the confirmed plane, before ellipse alignment.',
                 warnings=warnings)
 
 
-def normalize_region(ct, mask, spacing, features=None, size=128, padding=4):
+def normalize_region(ct, mask, spacing, features=None, size=256, padding=4):
     mask = binary_mask(mask)
     if ct.shape != mask.shape or not np.isfinite(ct).all():
         raise ValueError('CT plane must be finite and match the body mask.')

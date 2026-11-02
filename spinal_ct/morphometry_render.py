@@ -57,21 +57,51 @@ def draw_normalized(ax, session):
     normalized = normalize_region(session.ct, session.mask, session.plane.spacing_xy_mm)
     ax.imshow(normalized['ct'], origin='lower', cmap='gray', vmin=-500, vmax=1500)
     ax.contour(normalized['mask'], levels=[.5], colors=['#3bf4b0'], linewidths=1)
-    ax.set(title='128 × 128 · giữ tỷ lệ', xlabel='Pixel', ylabel='Pixel')
+    ax.set(title='256 × 256 · giữ tỷ lệ', xlabel='Pixel', ylabel='Pixel')
     ax.set_aspect('equal')
 
 
+def draw_convergence(ax, report):
+    if not report or 'monte_carlo_area' not in report:
+        ax.text(.5, .5, 'Chưa có kết quả đo MC', ha='center', va='center', transform=ax.transAxes)
+        ax.set_axis_off()
+        return
+    curve = report['monte_carlo_area'].get('convergence', [])
+    if not curve:
+        ax.text(.5, .5, 'Chưa có dữ liệu hội tụ MC', ha='center', va='center', transform=ax.transAxes)
+        ax.set_axis_off()
+        return
+    samples = [p['samples'] for p in curve]
+    areas = [p['area_mm2'] for p in curve]
+    ax.semilogx(samples, areas, 'o-', color='#1f77b4', markersize=3.5, linewidth=1.2, label='MC')
+    ax.axhline(report['features']['area_mm2'], color='black', linestyle='--', label='Đếm pixel')
+    elbow = report['monte_carlo_area'].get('elbow')
+    if elbow:
+        el_x, el_y = elbow['samples'], elbow['area_mm2']
+        ax.plot(el_x, el_y, 'o', color='#ff7f0e', markersize=8, markeredgecolor='red', markeredgewidth=1.5,
+                label=f"Cùi chỏ ({el_y:.1f} mm²)")
+        y_min, y_max = min(areas), max(areas)
+        offset_y = -32 if (el_y - y_min) / (y_max - y_min + 1e-12) > 0.7 else 28
+        va = 'top' if offset_y < 0 else 'bottom'
+        ax.annotate(f"{el_y:.1f} mm²\n(N={el_x:,})",
+                    xy=(el_x, el_y), xytext=(0, offset_y), textcoords='offset points',
+                    ha='center', va=va,
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='#ffffcc', edgecolor='#ff7f0e', alpha=0.9),
+                    arrowprops=dict(arrowstyle='->', color='red', lw=1.5),
+                    fontsize=8, fontweight='bold', color='#b30000')
+    ax.set(title='Hội tụ diện tích trên mask', xlabel='Số điểm', ylabel='Diện tích (mm²)')
+    ax.legend(loc='lower right' if elbow and elbow['samples'] < 5000 else 'best', fontsize=8)
+    ax.tick_params(labelsize=8)
+    ax.grid(True, linestyle=':', alpha=0.5)
+
+
 def export_preview(session, report, path):
-    figure = Figure(figsize=(14, 5), layout='constrained')
+    figure = Figure(figsize=(15, 5), layout='constrained')
     FigureCanvasAgg(figure)
     axes = figure.subplots(1, 3)
     draw_body(axes[0], session, show_points=True, show_blobs=False)
     draw_normalized(axes[1], session)
-    curve = report['monte_carlo_area']['convergence']
-    axes[2].semilogx([p['samples'] for p in curve], [p['area_mm2'] for p in curve], 'o-', label='MC')
-    axes[2].axhline(report['features']['area_mm2'], color='black', linestyle='--', label='Đếm pixel')
-    axes[2].set(title='Hội tụ diện tích trên mask', xlabel='Số điểm', ylabel='Diện tích (mm²)')
-    axes[2].legend()
+    draw_convergence(axes[2], report)
     figure.savefig(path, dpi=130)
     if (session.candidates or {}).get('candidates'):
         from pathlib import Path

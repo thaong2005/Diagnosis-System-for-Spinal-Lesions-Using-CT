@@ -44,7 +44,8 @@ class BlobGeometryTests(unittest.TestCase):
         result = analyze_blob(mask, (.5, 2.))
         self.assertEqual(result['area_mm2'], 800)
         self.assertEqual(result['height_width_ratio'], 2)
-        self.assertEqual(result['fill_ratio'], 1)
+        self.assertEqual(result['fill_ratio'], 0.5)
+        self.assertEqual(result['oriented_box']['side_length_mm'], 40)
         self.assertEqual(result['solidity'], 1)
         self.assertAlmostEqual(result['ellipse']['major_length_mm'], 4*40/np.sqrt(12))
         self.assertAlmostEqual(result['ellipse']['minor_length_mm'], 4*20/np.sqrt(12))
@@ -76,11 +77,14 @@ class BlobGeometryTests(unittest.TestCase):
         np.testing.assert_array_equal(mask, before)
 
     def test_single_cell_and_full_frame(self):
-        for mask in (np.ones((1, 1), bool), np.ones((5, 9), bool)):
-            result = analyze_blob(mask, (2, 3))
-            self.assertEqual(result['area_mm2'], mask.size*6)
+        for mask, expected_ratio in ((np.ones((1, 1), bool), 6/9),
+                                     (np.ones((5, 9), bool), 270/324),
+                                     (np.ones((6, 6), bool), 1.0)):
+            spacing = (2, 2) if mask.shape == (6, 6) else (2, 3)
+            result = analyze_blob(mask, spacing)
+            self.assertEqual(result['area_mm2'], mask.size*spacing[0]*spacing[1])
             self.assertAlmostEqual(result['solidity'], 1)
-            self.assertAlmostEqual(result['fill_ratio'], 1)
+            self.assertAlmostEqual(result['fill_ratio'], expected_ratio)
 
     def test_square_orientation_flag(self):
         result = analyze_blob(np.ones((10, 10), bool), (1, 1))
@@ -108,14 +112,14 @@ class BlobGeometryTests(unittest.TestCase):
         scales = np.linalg.svd(transform[:2, :2], compute_uv=False)
         self.assertAlmostEqual(scales[0], scales[1])
         f = analyze_blob(mask, spacing)
-        np.testing.assert_allclose(transform @ [63.5, 63.5, 1], [*f['centroid_xy_mm'], 1])
+        np.testing.assert_allclose(transform @ [127.5, 127.5, 1], [*f['centroid_xy_mm'], 1])
         inverse = np.linalg.inv(transform)
         corners = np.array(f['oriented_box']['corners_xy_mm'])
         out = np.column_stack((corners, np.ones(4))) @ inverse.T
-        self.assertTrue((out[:, :2] > 2).all() and (out[:, :2] < 125).all())
+        self.assertTrue((out[:, :2] > 2).all() and (out[:, :2] < 253).all())
         normalized = analyze_blob(result['mask'], (1, 1))
         self.assertAlmostEqual(normalized['ellipse']['axis_ratio'], f['ellipse']['axis_ratio'], delta=.05)
-        self.assertEqual(result['mask'].shape, (128, 128))
+        self.assertEqual(result['mask'].shape, (256, 256))
         self.assertTrue((result['ct'][~result['mask']] == -1024).all())
 
     def test_monte_carlo_reference_reproducibility_and_multiple_seeds(self):
@@ -124,6 +128,9 @@ class BlobGeometryTests(unittest.TestCase):
         a = estimate_area(mask, (.8, 1.3), samples=20_000, seed=9)
         self.assertEqual(a, estimate_area(mask, (.8, 1.3), samples=20_000, seed=9))
         self.assertEqual(a['convergence'][-1]['samples'], 20_000)
+        self.assertIn('elbow', a)
+        self.assertIn('samples', a['elbow'])
+        self.assertIn('area_mm2', a['elbow'])
         errors = []
         for seed in range(8):
             result = estimate_area(mask, (.8, 1.3), samples=30_000, seed=seed)
@@ -132,10 +139,10 @@ class BlobGeometryTests(unittest.TestCase):
         self.assertLess(abs(np.mean(errors)), 10)
 
     def test_mc_all_hits_interval_and_invalid_params(self):
-        mask = np.ones((20, 30), bool)
-        result = estimate_area(mask, (1, 2), samples=100)
-        self.assertEqual(result['area_mm2'], 1200)
-        self.assertLess(result['sampling_interval95_mm2'][0], 1200)
+        mask = np.ones((20, 20), bool)
+        result = estimate_area(mask, (2, 2), samples=100)
+        self.assertEqual(result['area_mm2'], 1600)
+        self.assertLess(result['sampling_interval95_mm2'][0], 1600)
         for kwargs in (dict(samples=2), dict(samples=100.5), dict(seed=-1), dict(seed=2.5)):
             with self.assertRaises(ValueError):
                 estimate_area(mask, (1, 1), **kwargs)

@@ -200,6 +200,8 @@ def save_session(session, output, *, samples=100_000, seed=42):
                             'anterior_mm', 'middle_mm', 'posterior_mm',
                             'anterior_posterior_ratio', 'middle_posterior_ratio')},
                         mc_area_mm2=report['monte_carlo_area']['area_mm2'],
+                        mc_elbow_area_mm2=(report['monte_carlo_area'].get('elbow') or {}).get('area_mm2'),
+                        mc_elbow_samples=(report['monte_carlo_area'].get('elbow') or {}).get('samples'),
                         mc_samples=samples, mc_seed=seed, warnings=';'.join(report['warnings']))
             with (root/'features.csv').open('w', newline='', encoding='utf-8-sig') as stream:
                 writer = csv.DictWriter(stream, fieldnames=list(flat))
