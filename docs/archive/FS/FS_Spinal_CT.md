@@ -23,7 +23,7 @@ Một bộ ảnh CT cột sống của một bệnh nhân
 
 Ưu tiên DICOM vì DICOM chứa thứ tự lát cắt, spacing, origin, direction và giá trị cường độ cần để dựng hình học đúng. Không được yêu cầu người dùng cung cấp trước vị trí đốt gãy, ROI, mã phân loại hoặc file nhãn.
 
-File [data ngày 27.09.2026.csv](../../../data/raw/A4/data%20ngay%2027.09.2026.csv) chỉ là **ground truth dùng trong phát triển**. File này dùng để liên kết ca, tạo annotation, huấn luyện và đánh giá. Nó không được đưa vào đường suy luận production.
+File data ngày 27.09.2026.csv (`data/raw/A4/data ngay 27.09.2026.csv`, dữ liệu cục bộ) chỉ là **ground truth dùng trong phát triển**. File này dùng để liên kết ca, tạo annotation, huấn luyện và đánh giá. Nó không được đưa vào đường suy luận production.
 
 ## 2. Chức năng mục tiêu
 

@@ -142,6 +142,47 @@ class DemoUITests(unittest.TestCase):
             warning.assert_called_once()
             window.close()
 
+    def test_discovered_result_reopens_without_inference_and_navigation_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(DemoWindow, 'verify_environment'):
+            root = Path(tmp)
+            image = sitk.GetImageFromArray(np.zeros((30, 20, 20), np.float32))
+            source = root/'ct.nii.gz'
+            sitk.WriteImage(image, str(source))
+            folder = root/'data/demo_runs/saved'
+            folder.mkdir(parents=True)
+            labels = sitk.Image(image.GetSize(), sitk.sitkUInt8)
+            sitk.WriteImage(labels, str(folder/'vertebrae.nii.gz'))
+            predictions = [dict(level=level, volume_mm3=10., centroid_lps_mm=[10., 10., z])
+                           for level, z in [('L1', 20.), ('L2', 15.), ('L3', 10.)]]
+            report = dict(task='vertebral_localization', status='ok', warnings=[], predictions=predictions,
+                          input_fingerprint=ct_fingerprint(image), model=dict(backend='TotalSegmentator',
+                          version='2.18.0', resolution='3mm', device='cpu', robust_crop=False))
+            (folder/'prediction.json').write_text(json.dumps(report))
+            with patch('apps.demo.ROOT', root):
+                window = DemoWindow()
+                window.load_path(source)
+                self.wait_idle(window)
+                self.assertEqual(window.saved_combo.count(), 1)
+                self.assertIn('Khác / thiếu cấu hình', window.saved_combo.currentText())
+                window.resolution.setCurrentIndex(1)
+                self.assertIn('Khớp cấu hình', window.saved_combo.currentText())
+                self.assertTrue(window.reuse_button.isEnabled())
+                window.reuse_result()
+                self.wait_idle(window)
+                self.assertTrue(window.review['verified'])
+                self.assertIsNone(window.process)
+                self.assertEqual(window.table.currentRow(), 0)
+                self.assertFalse(window.previous_button.isEnabled())
+                window.next_button.click()
+                self.assertEqual(window.table.currentRow(), 1)
+                self.assertEqual(window.sliders[0].value(), 15)
+                window.move_level(100)
+                self.assertEqual(window.table.currentRow(), 2)
+                self.assertFalse(window.next_button.isEnabled())
+                window.move_level(-100)
+                self.assertEqual(window.table.currentRow(), 0)
+                window.close()
+
     def test_detail_and_fast_run_options_reach_cli(self):
         with tempfile.TemporaryDirectory() as temporary, \
                 patch.object(DemoWindow, 'verify_environment'), \
@@ -165,4 +206,21 @@ class DemoUITests(unittest.TestCase):
             self.assertNotIn('--robust-crop', arguments)
             window.process = None
             window.study = None
+            window.close()
+
+
+    def test_open_body_measurements_folder_without_predictions_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(DemoWindow, 'verify_environment'), \
+                patch('apps.demo.ROOT', Path(temporary)), \
+                patch('apps.demo.QDesktopServices.openUrl') as mock_open:
+            window = DemoWindow()
+            self.assertEqual(window.current_predictions, [])
+            self.assertIn('#123e50', window.patient_label.styleSheet())
+            window.study = dict(path=Path(temporary)/'ct.nii.gz', uid=None,
+                                patient=dict(display_name='Test Patient', slug='test_patient'))
+            window._sync()
+            self.assertTrue(window.body_folder_button.isEnabled())
+            window.open_body_measurements_folder()
+            mock_open.assert_called_once()
             window.close()

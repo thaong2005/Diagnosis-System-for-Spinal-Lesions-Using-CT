@@ -1,4 +1,4 @@
-> Kế hoạch lịch sử của nhánh nền tảng; không đại diện cho tiến độ hiện tại. Xem [README](../../../../README.md).
+> Kế hoạch lịch sử của nhánh nền tảng; không đại diện cho tiến độ hiện tại. Xem [README](../../../README.md).
 
 # Kế hoạch triển khai mô hình phát hiện vị trí tổn thương
 

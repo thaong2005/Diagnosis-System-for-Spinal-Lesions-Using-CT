@@ -7,38 +7,21 @@ trả xác suất đã hiệu chỉnh, nên `confidence` trong JSON là `null`.
 
 ## Cài đặt
 
-Môi trường ứng dụng: Python 3.13 và `requirements.txt` như hiện tại.
-Cài backend vào môi trường riêng để không đổi các phiên bản của ứng dụng:
-
-```bash
-python3.13 -m venv .venv-model
-.venv-model/bin/python -m pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cpu
-.venv-model/bin/python -m pip install -r requirements-localization.txt
-.venv-model/bin/python -m pip check
-.venv-model/bin/TotalSegmentator --version
-```
-
-Windows dùng `.venv-model\Scripts\python.exe` và
-`.venv-model\Scripts\TotalSegmentator.exe`. Với GPU, cài cặp torch/torchvision
-phù hợp CUDA theo hướng dẫn chính thức PyTorch rồi dùng `--device gpu`.
-Không trộn torchvision CUDA với torch CPU.
-
-Trong môi trường cloud của dự án, backend đã được cài riêng tại
-`/workspace/.venvs/spine-model/bin/TotalSegmentator`.
+Môi trường ứng dụng dùng Python 3.13 và `requirements.txt`. Cài backend trong
+`.venv-model` theo [hướng dẫn Windows](windows_integration.md#2-cài-đặt-bằng-powershell-tại-thư-mục-gốc-dự-án).
+Executable là `.venv-model\Scripts\TotalSegmentator.exe`; xác nhận phiên bản
+`2.18.0` bằng `--version`. Với GPU, cần cặp torch/torchvision phù hợp CUDA rồi
+dùng `--device gpu`.
 Lần chạy đầu cần truy cập GitHub release assets để tải trọng số. Trọng số giữ
 trong `.tmp/totalsegmentator` (đã được Git ignore); có thể đổi bằng
 `--model-cache`. Cấu hình tạm của backend tắt gửi thống kê sử dụng.
 
 ## Chạy
 
-Từ thư mục gốc kho mã, với môi trường ứng dụng đã kích hoạt:
+Từ thư mục gốc kho mã, không cần activate môi trường:
 
-```bash
-python -m tools.localize_vertebrae \
-  --input data/raw/anonymous_case \
-  --output data/processed/anonymous_case/localization \
-  --backend /workspace/.venvs/spine-model/bin/TotalSegmentator \
-  --device cpu --fast
+```powershell
+.\.venv\Scripts\python.exe -m tools.localize_vertebrae --input data/raw/anonymous_case --output data/processed/anonymous_case/localization --backend .\.venv-model\Scripts\TotalSegmentator.exe --device cpu --fast
 ```
 
 Đầu vào là thư mục DICOM (quét đệ quy) hoặc NIfTI 3D có cường độ HU và geometry

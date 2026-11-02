@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 import SimpleITK as sitk
 
-from spinal_ct.ct_io import load_ct
+from spinal_ct.ct_io import load_ct, slugify, extract_patient_identifier
 
 
 class PreparedCTTests(unittest.TestCase):
@@ -64,6 +64,24 @@ class PreparedCTTests(unittest.TestCase):
         self.write()
         with self.assertRaisesRegex(ValueError,'series-uid'):
             load_ct(self.path,'unused')
+
+    def test_slugify_handles_accents_and_special_chars(self):
+        self.assertEqual(slugify('Đường Kim Hoa'), 'duong_kim_hoa')
+        self.assertEqual(slugify('NGUYỄN VĂN A^BS'), 'nguyen_van_a_bs')
+        self.assertEqual(slugify('---test!!patient...'), 'test_patient')
+        self.assertEqual(slugify('', fallback='fallback_id'), 'fallback_id')
+
+    def test_patient_identifier_directory_fallbacks(self):
+        # Walking up skipping technical names, syngo hashes, batch codes
+        nested = Path('/data/raw/A3/duong kim hoa/csc/MBBN3ULK/en-GB/image.dcm')
+        info = extract_patient_identifier(nested, fingerprint='abcdef123456')
+        self.assertEqual(info['slug'], 'duong_kim_hoa')
+        self.assertEqual(info['display_name'], 'Duong Kim Hoa')
+
+        # Fallback to fingerprint
+        only_tech = Path('/data/raw/temp/dicom/exam')
+        fallback = extract_patient_identifier(only_tech, fingerprint='123456789abc')
+        self.assertEqual(fallback['slug'], 'benh_nhan_12345678')
 
 
 if __name__ == '__main__':

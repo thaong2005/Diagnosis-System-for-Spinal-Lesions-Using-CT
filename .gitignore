@@ -25,3 +25,7 @@ dist/
 # Cấu hình riêng của máy phát triển và ảnh CT minh họa chưa ẩn danh
 .vscode/
 /Expected_output/
+
+# Workspace theo phiên làm việc: bản nháp, ảnh, log và báo cáo cục bộ.
+# Chỉ đưa báo cáo đã chọn lọc vào docs/reports/.
+/20??-??-??/

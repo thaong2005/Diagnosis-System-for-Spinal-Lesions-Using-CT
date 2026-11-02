@@ -6,7 +6,7 @@ Mã định vị và Monte Carlo đã tích hợp vào repository. Baseline và 
 đã chạy trên Windows CPU với `case_053` ngày 24/10/2026. Kết quả có cảnh báo
 T8/T9 chạm biên; việc chạy thành công không xác nhận độ chính xác phân đoạn.
 Demo đã hỗ trợ chạy mô hình, xem overlay và xuất báo cáo. Xem
-[hướng dẫn demo](teacher_demo.md) và [tiến độ hiện tại](../../README.md#tiến-độ-dự-án).
+[hướng dẫn sử dụng](User_guild.md) và [phạm vi hiện tại](../../README.md#phạm-vi-hiện-tại).
 
 ## 1. Mã đã tích hợp
 
@@ -88,7 +88,7 @@ có nhiều series. Không dùng tên thư mục phân loại A1/A3/... làm đ�
 Mở `levels_mpr.png`, `monte_carlo/consensus_mpr.png` và `prediction.json` trong
 thư mục output. Mask 3D có thể xem bằng trình xem NIfTI như 3D Slicer.
 Giao diện `apps.demo` đã có nút chạy và overlay dự đoán trên ba mặt phẳng.
-Mở bằng `start_demo.bat`; xem [hướng dẫn demo](teacher_demo.md).
+Mở bằng `start_demo.bat`; xem [hướng dẫn sử dụng](User_guild.md).
 
 **Annotation và prediction là hai loại dữ liệu khác nhau:**
 

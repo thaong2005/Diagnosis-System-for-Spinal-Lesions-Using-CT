@@ -66,7 +66,7 @@ Không import module CSV/label vào đường gọi `predict`.
 
 ## 3. Development-only assets
 
-File [data ngày 27.09.2026.csv](../../../data/raw/A4/data%20ngay%2027.09.2026.csv) là ground truth phát triển, gồm 54 dòng có mức đốt và mã phân loại. Không coi nó là input thực tế.
+File data ngày 27.09.2026.csv (`data/raw/A4/data ngay 27.09.2026.csv`, dữ liệu cục bộ) là ground truth phát triển, gồm 54 dòng có mức đốt và mã phân loại. Không coi nó là input thực tế.
 
 CSV được dùng để:
 

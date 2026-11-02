@@ -1,67 +1,72 @@
-# Cấu trúc và quyết định tổ chức dự án
+# Tổ chức dự án
 
-Cập nhật: 25/10/2026.
+Cập nhật: 02/11/2026.
 
-## Các phương án
+## Luồng và mã đang dùng
 
-| Phương án | Ưu điểm | Chi phí / thời điểm phù hợp |
-|---|---|---|
-| Giữ script tại gốc | Ít thay đổi lệnh chạy | Khó phân biệt giao diện, chuyển dữ liệu và mô hình; dễ lặp bộ đọc CT |
-| `apps/` + `tools/` + `spinal_ct/` | Phân trách nhiệm rõ, chạy bằng `python -m`, ít cấu hình | Phù hợp quy mô nghiên cứu hiện tại; đây là cấu trúc đang áp dụng |
-| `src/spinal_ct/` + đóng gói `pyproject.toml` | Cài package và kiểm tra import độc lập | Hợp lý khi phân phối, CI hoặc nhiều máy; cần quy trình cài editable và entry point |
+Giữ ba phần `apps/`, `spinal_ct/`, `tools/`, dùng `python -m` từ gốc dự án.
+`start_demo.bat` là điểm mở ứng dụng chính. Chưa cần đổi toàn bộ đường dẫn
+sang `src/` hoặc chia repository thành nhiều dịch vụ.
 
-Chưa tách thành nhiều dịch vụ hay repository: hiện chỉ có một pipeline cục bộ
-và một backend. Việc tách đó sẽ tăng cấu hình mà chưa có lợi ích rõ.
-
-## Ranh giới chức năng
-
-- `ct_io.py`: đọc CT và kiểm tra HU/geometry cho viewer, chuẩn bị CT và inference.
-- `localization.py`: chuyển mask thành ROI/báo cáo và dựng preview.
-- `monte_carlo.py`: nhiễu HU và tổng hợp mẫu; chưa phải thuật toán ước lượng diện tích.
-- `overlays.py`: dùng chung cách vẽ contour và tên đốt cho demo/ảnh QC; chỉ gắn
-  tên khi mask có trên lát đang xem, giữ nguyên dữ liệu phân đoạn và phép đo.
-- `apps/`: nhận đường dẫn từ CLI, chạy giao diện; không tự ghi volume khi mở viewer.
-- `tools/`: điều phối tác vụ; inference không nhận nhãn tham chiếu.
-- Annotation có quy ước ROI riêng, không tự gộp với mask toàn đốt sống.
-
-## Demo dành cho người kiểm tra
-
-`start_demo.bat` mở `apps/demo.py`. Cửa sổ PySide6 chạy đọc dữ liệu ở QThread
-và gọi CLI suy luận bằng QProcess, để giao diện tiếp tục phản hồi. CLI phát
-sự kiện từng giai đoạn; ứng dụng hiển thị thời gian thực thay vì đoán phần trăm.
-Tham khảo API chính thức: [QProcess](https://doc.qt.io/qtforpython-6/PySide6/QtCore/QProcess.html).
-
-`spinal_ct/review.py` kiểm tra geometry và dấu vân tay HU trước khi ghép CT với
-kết quả mới, resample riêng lưới hiển thị nếu ảnh xiên và xuất báo cáo HTML.
-Mask gốc và phép đo không thay đổi. Kết quả cũ thiếu dấu vân tay chỉ có thể
-kiểm tra geometry và cần người dùng xác nhận ca. Các lần chạy demo nằm trong
-`data/demo_runs/`; dừng sau lượt suy luận hiện tại không công bố output dở dang.
-
-## Thay đổi và phần đã loại bỏ
-
-| Đường dẫn cũ | Thay thế / lý do |
+| Thành phần | Trách nhiệm |
 |---|---|
-| `view_ct.py` | Bỏ bộ đọc DICOM và chuyển HU trùng; tách thành `tools.prepare_ct` và `apps.view_mpr` |
-| `view_ct_enhanced.py` | `apps/view_sagittal.py`; dùng bộ đọc chung, bỏ hard-code ca |
-| `annotate_ct.py` | `apps/annotate_ct.py`; nhận `--case`, `--output` |
-| `inspect_dicom.py` | `tools/inspect_dicom.py`; nhận `--input`, dùng chung đọc header với audit |
-| `doc/` | Hướng dẫn trong `docs/guides/`; snapshot cũ trong `docs/archive/2026-10-19/` |
-| `doc/note.txt` | Hai dòng ý tưởng đã được bao quát trong README và tài liệu nghiên cứu |
-| `doc/Report/` | Thư mục rỗng |
-| Gói ZIP, `spinal_ct_mc_integration/`, hướng dẫn ở gốc | Đã xóa ở bước trước sau khi xác nhận trùng từng tệp |
+| `apps/demo.py` | Chọn CT, nhận diện bệnh nhân, chạy backend, xem kết quả và mở cửa sổ đo |
+| `apps/body_review.py` | Chọn mặt phẳng, chỉnh mask/mốc, xác nhận, đo, lưu audit trail |
+| `apps/tasks.py` | Lớp Worker chạy nền trên QThread cho các tác vụ đo và lưu |
+| `spinal_ct/ct_io.py` | HU, geometry, chuẩn hóa danh tính bệnh nhân (slugify, extract_patient_identifier) |
+| `spinal_ct/result_catalog.py` | Tìm kiếm kết quả định vị và đo thân đốt đệ quy, khử trùng lặp |
+| `spinal_ct/localization.py` | Ánh xạ nhãn mô hình, ROI/thể tích và preview |
+| `spinal_ct/review.py`, `overlays.py` | Kiểm tra CT–kết quả, lưới hiển thị và overlay |
+| `body_region.py`, `blob_analysis.py` | Mặt phẳng LPS, vùng thân đốt, hộp bao vuông và đặc trưng theo mm |
+| `blob_detection.py` | LoG thử nghiệm; kết quả phụ trợ cho người kiểm tra |
+| `area_monte_carlo.py` | Lấy mẫu điểm trên mask để ước lượng diện tích và tìm điểm cùi chỏ |
+| `monte_carlo.py` | Thêm nhiễu HU và tổng hợp phân đoạn; mục đích khác MC diện tích |
+| `morphometry.py`, `morphometry_render.py` | Trạng thái vùng, schema, lưu/mở, vẽ biểu đồ hội tụ và báo cáo |
+| `annotations.py`, `labels.py` | Annotation/nhãn phát triển; không làm đầu vào suy luận |
 
-Không giữ wrapper cho script gốc: dùng các lệnh `python -m` trong README.
+Worker dùng chung ở `apps/tasks.py`; đo, LoG và lưu vùng dùng tác vụ nền với điều khiển chỉnh sửa tạm khóa. Kết quả được nhận lại trên luồng Qt chính. `spinal_ct/result_catalog.py` tìm kết quả/vùng theo fingerprint; mở kết quả vẫn xác thực geometry và toàn vẹn.
 
-## Những phần trông giống nhau nhưng vẫn cần
+Đọc CT ở QThread và suy luận bằng QProcess để demo tiếp tục phản hồi. Mask và
+phép đo gốc không đổi khi resample riêng lưới hiển thị. Kết quả định vị mới lưu
+label map/schema 2; vùng thân đốt là schema riêng, cần người dùng xác nhận.
 
-- `view_mpr` xem ba mặt phẳng; `view_sagittal` có điều chỉnh HU, nội suy và xuất ảnh.
-- `inspect_dicom` kiểm tra geometry/pixel từng series; `audit_dataset` tổng hợp
-  dataset và đối chiếu nhãn. Hai công cụ phục vụ hai tác vụ khác nhau.
-- `.venv` và `.venv-model` tách dependency ứng dụng khỏi backend.
-- Baseline, mẫu MC, consensus và disagreement là các đầu ra khác nhau.
-- Tài liệu FS, audit và checkpoint cũ có bằng chứng nghiên cứu riêng nên được
-  lưu trong `archive/`, kèm nhãn lịch sử; không xóa chỉ dựa vào ngày sửa.
-- `Expected_output/` chứa ảnh tham chiếu cục bộ; chưa có bằng chứng trùng nên giữ.
+Thay ô mặt phẳng giữ vùng cũ đến khi áp dụng; hỗ trợ lưu/bỏ/hủy và quay về các thông số đã áp dụng.
+Thay mask/mốc/nhóm tuổi hủy xác nhận và bảng đo. Đổi tham số MC chỉ hủy bảng
+đo để tính lại. LoG có trạng thái riêng: đổi thông số bỏ ứng viên cũ, chạy lại
+không xóa phép đo trên mask. Mở vùng khôi phục mặt phẳng, nhóm tuổi, cấu hình
+LoG và N/seed; phép đo được tính lại khi người dùng yêu cầu.
 
-Dữ liệu, cache trọng số, môi trường Python và cấu hình cá nhân được giữ lại.
-`__pycache__` có thể tái tạo và đã được `.gitignore` loại trừ.
+## Dữ liệu và tệp sinh ra
+
+- `data/raw/`, `data/processed/`: dữ liệu và kết quả chuẩn bị cục bộ.
+- `data/output/<slug>/`: cấu trúc lưu trữ chuẩn hóa theo từng bệnh nhân:
+  - `dinh_vi_cot_song/`: mỗi lượt định vị một thư mục `run_<resolution>_<timestamp>_<uuid>`.
+  - `do_than_dot/`: mỗi lượt đo thân đốt một thư mục `<level>_<timestamp>_<uuid>` lưu lịch sử (Audit Trail).
+- `data/demo_runs/`, `data/body_measurements/`: các thư mục kết quả cũ (được hỗ trợ đọc tương thích ngược).
+- `.venv`, `.venv-model`, `.tmp`: môi trường và cache cục bộ, được Git bỏ qua.
+- Thư mục `YYYY-MM-DD/`: workspace của từng phiên, gồm `work` và `outputs`,
+  được Git bỏ qua. Giữ workspace đang dùng để các chat/đường dẫn tiếp tục hoạt động.
+- `Expected_output/`: ảnh tham chiếu cục bộ; giữ lại đến khi đối chiếu nguồn.
+
+Không commit CT, ảnh ca bệnh, cấu hình cá nhân hoặc kết quả chứa dữ liệu bệnh
+nhân. Chỉ đưa báo cáo văn bản đã chọn lọc vào `docs/reports/`.
+
+## Tài liệu và công cụ lịch sử
+
+`README.md` chứa cách bắt đầu và phạm vi hiện tại.
+Hướng dẫn sử dụng toàn diện ở [`docs/guides/User_guild.md`](guides/User_guild.md).
+Hướng dẫn vận hành chuyên sâu ở `docs/guides/`, bằng chứng kỹ thuật ở `docs/reports/`.
+Tài liệu cũ được giữ ở `docs/archive/FS/` và `docs/archive/lesion_detection/`,
+có [mục lục archive](archive/README.md); không dùng các checkpoint cũ để suy ra tiến độ hiện tại.
+
+Các viewer độc lập và annotation 3D vẫn có chức năng riêng; xem
+[công cụ phát triển](guides/development_tools.md). Chưa gộp/xóa khi chưa thay
+thế đủ chức năng xuất ảnh và chuẩn bị nhãn.
+
+## Quy trình dọn và Git
+
+Lưu thay đổi tính năng thành một commit riêng, rồi commit phần tinh gọn.
+Kiểm tra danh sách staged, chạy test và xem lại message trước khi commit.
+Tệp trung gian lịch sử chỉ được dọn sau khi đóng gói và đối chiếu hash;
+bản sao và manifest ở workspace cục bộ. Không xóa dữ liệu hoặc trọng số
+chỉ vì có nhiều kết quả cùng ca.

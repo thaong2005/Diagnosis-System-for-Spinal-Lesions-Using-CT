@@ -12,19 +12,21 @@ from uuid import uuid4
 
 import numpy as np
 import SimpleITK as sitk
-from PySide6.QtCore import QProcess, QProcessEnvironment, QThread, QTimer, Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase
+from PySide6.QtCore import QProcess, QProcessEnvironment, QTimer, Qt, QUrl
+from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
-    QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel,
-    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSlider,
+    QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
+    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSlider,
     QScrollArea, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from matplotlib import get_data_path
 
-from spinal_ct.ct_io import list_ct_series, load_ct, select_sample_series
+from spinal_ct.ct_io import list_ct_series, load_ct, select_sample_series, extract_patient_identifier, slugify
 from spinal_ct.review import ct_fingerprint, display_image, load_review, report_html
 from spinal_ct.overlays import draw_vertebral_overlay, vertebral_palette
+from apps.ui_fonts import ui_font
+from apps.tasks import Task
+from spinal_ct.result_catalog import discover_results, compatible_result, discover_regions
 
 ROOT = Path(__file__).resolve().parents[1]
 # Keep patient-specific paths in the ignored local configuration.
@@ -36,39 +38,27 @@ except ModuleNotFoundError as exc:
     SAMPLE_DIR = ROOT / 'data/raw/sample_patient'
 
 
-def ui_font() -> str:
-    # Offscreen Qt and some Windows hosts do not populate the system font DB.
-    # Matplotlib ships DejaVu Sans, including the Vietnamese glyphs we need.
-    candidates = [Path('C:/Windows/Fonts/segoeui.ttf'),
-                  Path(get_data_path())/'fonts/ttf/DejaVuSans.ttf']
-    for path in candidates:
-        if path.is_file():
-            font_id = QFontDatabase.addApplicationFont(str(path))
-            families = QFontDatabase.applicationFontFamilies(font_id)
-            if families:
-                return families[0]
-    return QApplication.font().family()
-
-
-class Task(QThread):
-    def __init__(self, function, parent=None):
-        super().__init__(parent)
-        self.function = function
-        self.value = None
-        self.error = None
-
-    def run(self):
-        try:
-            self.value = self.function()
-        except Exception as error:
-            self.error = str(error)
-
-
 def read_study(path, uid):
     source = load_ct(path, uid)
     reference = display_image(source)
+    fingerprint = ct_fingerprint(source)
+    patient = extract_patient_identifier(path, series_uid=uid, fingerprint=fingerprint)
+    search_roots = [
+        ROOT/'data/output'/patient['slug']/'dinh_vi_cot_song',
+        ROOT/'data/output',
+        ROOT/'data/demo_runs',
+        ROOT/'data/processed'
+    ]
+    saved, unreadable = discover_results(search_roots, fingerprint)
+    region_roots = [
+        ROOT/'data/output'/patient['slug']/'do_than_dot',
+        ROOT/'data/output',
+        ROOT/'data/body_measurements'
+    ]
+    saved_regions = discover_regions(region_roots, fingerprint)
     return dict(source=source, reference=reference, data=sitk.GetArrayFromImage(reference),
-                fingerprint=ct_fingerprint(source), path=path, uid=uid)
+                fingerprint=fingerprint, path=path, uid=uid, saved_results=saved, unreadable_results=unreadable,
+                saved_regions=saved_regions, patient=patient)
 
 
 def check_backend():
@@ -106,6 +96,11 @@ class DemoWindow(QMainWindow):
         self.cancel_path = None
         self.stdout_buffer = ''
         self.started = None
+        self.saved_results = []
+        self.current_predictions = []
+        self.region_states = {}
+        self.region_paths = {}
+        self.timings = []
         self.active_stage = 'Chọn CT hoặc mở ca mẫu để bắt đầu.'
         self._build()
         self.timer = QTimer(self)
@@ -142,18 +137,33 @@ class DemoWindow(QMainWindow):
         controls.addWidget(QLabel('01  DỮ LIỆU CT'))
         self.file_button = QPushButton('Chọn file CT (.nii / .nii.gz / .npy)')
         self.file_button.clicked.connect(self.choose_file)
+        self.file_button.setText('Mở CT…')
+        self.file_button.clicked.disconnect()
+        menu = QMenu(self.file_button)
+        menu.addAction('File NIfTI / NPY…', self.choose_file)
+        menu.addAction('Thư mục DICOM…', self.choose_dicom)
+        self.file_button.setMenu(menu)
         controls.addWidget(self.file_button)
         self.dicom_button = QPushButton('Chọn thư mục DICOM')
         self.dicom_button.clicked.connect(self.choose_dicom)
-        controls.addWidget(self.dicom_button)
+        self.dicom_button.hide()
         self.sample_button = QPushButton(f'Mở ca mẫu · {SAMPLE_DIR.name.title()}')
         self.sample_button.setToolTip(str(SAMPLE_DIR))
         self.sample_button.clicked.connect(self.open_sample)
         controls.addWidget(self.sample_button)
-        self.source_label = QLabel('Chưa chọn dữ liệu')
-        self.source_label.setWordWrap(True)
-        self.source_label.setObjectName('muted')
-        controls.addWidget(self.source_label)
+        self.patient_row = QHBoxLayout()
+        self.patient_label = QLabel('Bệnh nhân: Chưa chọn')
+        self.patient_label.setStyleSheet('font-weight: bold; color: #123e50;')
+        self.patient_label.setWordWrap(True)
+        self.patient_row.addWidget(self.patient_label, 1)
+        self.rename_patient_button = QPushButton('Đổi tên…')
+        self.rename_patient_button.setFixedWidth(70)
+        self.rename_patient_button.clicked.connect(self.rename_patient)
+        self.rename_patient_button.setEnabled(False)
+        self.patient_row.addWidget(self.rename_patient_button)
+        controls.addLayout(self.patient_row)
+        self.source_label = QLabel()
+        self.source_label.hide()
         self.series_combo = QComboBox()
         controls.addWidget(self.series_combo)
         self.load_button = QPushButton('Đọc series đã chọn')
@@ -168,16 +178,28 @@ class DemoWindow(QMainWindow):
         self.fast.setChecked(False)
         self.fast.setToolTip('Bỏ chọn để dùng mô hình 1,5 mm và định vị vùng cắt kỹ hơn. '
                              'Chạy chậm hơn và cần nhiều RAM hơn, nhất là khi bật Monte Carlo.')
-        controls.addWidget(self.fast)
+        self.fast.hide()
+        self.resolution = QComboBox()
+        self.resolution.addItems(['Chi tiết · 1,5 mm', 'Nhanh · 3 mm'])
+        self.resolution.currentIndexChanged.connect(lambda i: self.fast.setChecked(i == 1))
+        self.fast.toggled.connect(lambda enabled: self.resolution.setCurrentIndex(int(enabled)))
+        controls.addWidget(self.resolution)
         self.resolution_note = QLabel()
         self.resolution_note.setWordWrap(True)
         self.resolution_note.setObjectName('muted')
         controls.addWidget(self.resolution_note)
         self.fast.toggled.connect(self.update_resolution_note)
         self.update_resolution_note()
-        self.mc = QCheckBox('Bổ sung Monte Carlo')
+        self.mc_toggle = QPushButton('+ Thử nghiệm nhiễu HU')
+        self.mc_toggle.setCheckable(True)
+        controls.addWidget(self.mc_toggle)
+        self.mc_panel = QWidget()
+        mc_layout = QVBoxLayout(self.mc_panel)
+        mc_layout.setContentsMargins(0, 0, 0, 0)
+        self.mc = QCheckBox('Bổ sung Monte Carlo nhiễu HU')
         self.mc.toggled.connect(self._sync)
-        controls.addWidget(self.mc)
+        self.mc.toggled.connect(lambda enabled: self.mc_toggle.setChecked(True) if enabled else None)
+        mc_layout.addWidget(self.mc)
         form = QFormLayout()
         self.samples = QSpinBox()
         self.samples.setRange(2, 64)
@@ -191,14 +213,25 @@ class DemoWindow(QMainWindow):
         form.addRow('Số mẫu', self.samples)
         form.addRow('Nhiễu sigma (HU)', self.noise)
         form.addRow('Seed', self.seed)
-        controls.addLayout(form)
+        mc_layout.addLayout(form)
+        controls.addWidget(self.mc_panel)
+        self.mc_panel.setVisible(False)
+        self.mc_toggle.toggled.connect(self.mc_panel.setVisible)
+        self.mc_toggle.toggled.connect(self.update_mc_toggle)
         self.backend_label = QLabel('Đang kiểm tra backend…')
         self.backend_label.setWordWrap(True)
         self.backend_label.setObjectName('muted')
+        self.environment_toggle = QPushButton('+ Chi tiết môi trường')
+        self.environment_toggle.setCheckable(True)
+        controls.addWidget(self.environment_toggle)
         controls.addWidget(self.backend_label)
+        self.backend_label.hide()
+        self.environment_toggle.toggled.connect(self.backend_label.setVisible)
         self.check_button = QPushButton('Kiểm tra môi trường')
         self.check_button.clicked.connect(self.verify_environment)
         controls.addWidget(self.check_button)
+        self.check_button.hide()
+        self.environment_toggle.toggled.connect(self.check_button.setVisible)
         self.run_button = QPushButton('Chạy định vị')
         self.run_button.setObjectName('primary')
         self.run_button.clicked.connect(self.start_run)
@@ -208,17 +241,28 @@ class DemoWindow(QMainWindow):
         controls.addWidget(self.stop_button)
         controls.addSpacing(12)
         controls.addWidget(QLabel('03  KẾT QUẢ'))
-        self.open_button = QPushButton('Mở thư mục kết quả đã lưu')
+        self.saved_combo = QComboBox()
+        self.saved_combo.setToolTip('Các kết quả có cùng dấu vân tay CT. Cấu hình khác được ghi rõ.')
+        controls.addWidget(self.saved_combo)
+        self.reuse_button = QPushButton('Tải lại lần chạy đã chọn')
+        self.reuse_button.clicked.connect(self.reuse_result)
+        controls.addWidget(self.reuse_button)
+        self.open_button = QPushButton('Duyệt kết quả khác từ máy…')
         self.open_button.clicked.connect(self.choose_results)
         controls.addWidget(self.open_button)
         self.export_button = QPushButton('Xuất báo cáo HTML')
         self.export_button.clicked.connect(self.export_report)
         controls.addWidget(self.export_button)
-        self.folder_button = QPushButton('Mở vị trí kết quả')
+        self.body_button = QPushButton('Đo thân đốt')
+        self.body_button.clicked.connect(self.open_body_review)
+        self.folder_button = QPushButton('Mở thư mục kết quả (Explorer)')
         self.folder_button.clicked.connect(self.open_result_folder)
         controls.addWidget(self.folder_button)
+        self.body_folder_button = QPushButton('Mở thư mục đo thân đốt')
+        self.body_folder_button.clicked.connect(self.open_body_measurements_folder)
+        controls.addWidget(self.body_folder_button)
         controls.addStretch()
-        note = QLabel('Mask toàn đốt sống · thể tích mm³\nChưa tính diện tích / phân loại AO.\nKết quả cần được kiểm tra.')
+        note = QLabel('Mask toàn đốt sống · thể tích mm³\nĐo thân đốt trên vùng được duyệt riêng.\nKết quả cần được kiểm tra.')
         note.setObjectName('muted')
         note.setWordWrap(True)
         controls.addWidget(note)
@@ -230,9 +274,10 @@ class DemoWindow(QMainWindow):
         sidebar.setMaximumWidth(410)
         split.addWidget(sidebar)
 
-        right = QWidget()
-        area = QVBoxLayout(right)
-        area.setContentsMargins(0, 12, 0, 0)
+        vsplit = QSplitter(Qt.Vertical)
+        top_widget = QWidget()
+        top_layout = QVBoxLayout(top_widget)
+        top_layout.setContentsMargins(0, 8, 0, 0)
         toolbar = QHBoxLayout()
         self.mode = QComboBox()
         self.mode.addItem('Chỉ CT')
@@ -266,11 +311,11 @@ class DemoWindow(QMainWindow):
         toolbar.addWidget(self.window_level)
         toolbar.addWidget(QLabel('WW'))
         toolbar.addWidget(self.window_width)
-        area.addLayout(toolbar)
+        top_layout.addLayout(toolbar)
         self.figure = Figure(facecolor='#111d29')
         self.canvas = FigureCanvasQTAgg(self.figure)
-        self.canvas.setMinimumHeight(310)
-        area.addWidget(self.canvas, 3)
+        self.canvas.setMinimumHeight(240)
+        top_layout.addWidget(self.canvas, 1)
         self.canvas.mpl_connect('button_press_event', self.click_plane)
         self.canvas.mpl_connect('resize_event', self.redraw)
         sliders = QHBoxLayout()
@@ -287,17 +332,38 @@ class DemoWindow(QMainWindow):
             sliders.addLayout(column)
             self.sliders.append(slider)
             self.slice_labels.append(label)
-        area.addLayout(sliders)
+        top_layout.addLayout(sliders)
         self.result_label = QLabel('Chọn CT để xem. Nhấp trên ảnh để đồng bộ vị trí ba mặt phẳng.')
         self.result_label.setWordWrap(True)
-        area.addWidget(self.result_label)
+        top_layout.addWidget(self.result_label)
+        navigation = QHBoxLayout()
+        self.previous_button = QPushButton('← Đốt trước')
+        self.next_button = QPushButton('Đốt tiếp theo →')
+        self.previous_button.clicked.connect(lambda: self.move_level(-1))
+        self.next_button.clicked.connect(lambda: self.move_level(1))
+        self.level_label = QLabel('Chọn đốt để kiểm tra')
+        navigation.addWidget(self.previous_button)
+        navigation.addWidget(self.level_label, 1)
+        navigation.addWidget(self.body_button)
+        self.body_button.setObjectName('primary')
+        navigation.addWidget(self.next_button)
+        top_layout.addLayout(navigation)
+
         tabs = QTabWidget()
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(['Đốt sống', 'Thể tích (mm³)', 'MC phát hiện', 'Cảnh báo'])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        tabs.setMinimumHeight(130)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(['Đốt sống', 'Thể tích (mm³)', 'MC phát hiện', 'Cảnh báo', 'Vùng đo thân đốt'])
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.itemSelectionChanged.connect(self.select_level)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setDefaultSectionSize(26)
         tabs.addTab(self.table, 'Các đốt sống')
         self.warnings = QPlainTextEdit()
         self.warnings.setReadOnly(True)
@@ -306,8 +372,16 @@ class DemoWindow(QMainWindow):
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(400)
         tabs.addTab(self.log, 'Tiến trình')
-        area.addWidget(tabs, 1)
-        split.addWidget(right)
+
+        vsplit.addWidget(top_widget)
+        vsplit.addWidget(tabs)
+        vsplit.setCollapsible(0, False)
+        vsplit.setCollapsible(1, False)
+        vsplit.setStretchFactor(0, 3)
+        vsplit.setStretchFactor(1, 2)
+        vsplit.setSizes([480, 260])
+
+        split.addWidget(vsplit)
         split.setSizes([325, 1135])
         self.progress = QProgressBar()
         self.progress.setMaximumHeight(5)
@@ -333,7 +407,14 @@ class DemoWindow(QMainWindow):
             QProgressBar {border:0;background:#dfe9ee;} QProgressBar::chunk {background:#168a91;}
             QSlider::groove:horizontal {background:#cbdbe3;height:4px;}
             QSlider::handle:horizontal {background:#136979;width:12px;margin:-5px 0;border-radius:5px;}
+            QSplitter::handle:vertical {background:#c8d8e2;height:6px;margin:1px 0;border-radius:3px;}
+            QSplitter::handle:vertical:hover {background:#136979;}
+            QTableWidget {alternate-background-color:#f5f8fa;}
+            QTableWidget::item {padding:2px 4px;}
         '''.replace('Segoe UI', self.font_family))
+        for control in (self.fast, self.mc, self.samples, self.noise, self.seed):
+            signal = control.toggled if isinstance(control, QCheckBox) else control.valueChanged
+            signal.connect(self.refresh_saved_results)
         self.axes = []
         self.redraw()
 
@@ -352,17 +433,41 @@ class DemoWindow(QMainWindow):
         self.sample_button.setEnabled(not busy and SAMPLE_DIR.is_dir())
         self.load_button.setEnabled(not busy and self.series_combo.count() > 0)
         self.series_combo.setEnabled(not busy)
+        self.series_combo.setVisible(self.series_combo.count() > 0)
+        self.load_button.setVisible(self.series_combo.count() > 0)
         self.run_button.setEnabled(not busy and self.study is not None and self.backend_ready)
         self.open_button.setEnabled(not busy and self.study is not None)
         self.export_button.setEnabled(not busy and self.review is not None)
+        self.rename_patient_button.setEnabled(not busy and self.study is not None)
+        self.body_folder_button.setEnabled(not busy and self.study is not None)
+        self.body_button.setEnabled(not busy and self.review is not None
+                                    and self.mode.currentText() in ('Baseline', 'Consensus') and self.table.rowCount() > 0)
+        self.mode.setEnabled(not busy)
+        self.table.setEnabled(not busy)
         self.folder_button.setEnabled(self.review is not None)
+        self.stop_button.setVisible(self.process is not None)
         self.stop_button.setEnabled(self.process is not None and not (self.cancel_path and self.cancel_path.exists()))
         for widget in (self.fast, self.mc):
             widget.setEnabled(not busy)
         for widget in (self.samples, self.noise, self.seed):
             widget.setEnabled(not busy and self.mc.isChecked())
+        self.resolution.setEnabled(not busy)
+        self.saved_combo.setVisible(bool(self.saved_results))
+        self.reuse_button.setVisible(bool(self.saved_results))
+        self.saved_combo.setEnabled(not busy and self.saved_combo.count() > 0)
+        self.reuse_button.setEnabled(not busy and self.study is not None and self.saved_combo.count() > 0)
+        row = self.table.currentRow()
+        self.previous_button.setEnabled(not busy and row > 0)
+        self.next_button.setEnabled(not busy and self.table.rowCount() > 0 and row < self.table.rowCount()-1)
+        self.mc_toggle.setEnabled(not busy)
+        self.update_mc_toggle()
         self.progress.setRange(0, 0 if busy else 1)
         self.progress.setValue(0 if busy else 1)
+
+    def update_mc_toggle(self, *_):
+        state = ' · đang bật' if self.mc.isChecked() else ''
+        prefix = '- ' if self.mc_toggle.isChecked() else '+ '
+        self.mc_toggle.setText(prefix+'Thử nghiệm nhiễu HU'+state)
 
     def _stage(self, message):
         self.active_stage = message
@@ -387,6 +492,8 @@ class DemoWindow(QMainWindow):
     def _task_done(self):
         task = self.thread
         callback = self._callback
+        self.timings.append(dict(stage=self.active_stage, seconds=round(task.elapsed, 4)))
+        self.log.appendPlainText(f'Thời gian tác vụ: {task.elapsed:.2f} giây')
         self.thread = None
         self._sync()
         if task.error:
@@ -441,20 +548,92 @@ class DemoWindow(QMainWindow):
         # Clear old data before selection/loading, including ambiguous new samples.
         self.study = None
         self.review = None
+        self.current_predictions = []
+        self.saved_results = []
+        self.saved_combo.clear()
+        self.region_states.clear()
+        self.region_paths.clear()
+        self.level_label.setText('Chọn đốt để kiểm tra')
         self.mode.clear()
         self.mode.addItem('Chỉ CT')
         self.table.setRowCount(0)
         self.warnings.clear()
+        self.patient_label.setText('Bệnh nhân: Chưa chọn')
+        self.rename_patient_button.setEnabled(False)
         self.source_label.setText('Đang đọc ca mới…')
         self.geometry_label.setText('Đang kiểm tra HU và geometry…')
         self.result_label.setText('Chưa có kết quả cho ca mới.')
         self.redraw()
         self._sync()
 
+    def rename_patient(self):
+        if not self.study:
+            return
+        patient = self.study.get('patient') or {}
+        current_name = patient.get('display_name', '')
+        new_name, ok = QInputDialog.getText(self, 'Đổi tên bệnh nhân',
+                                            'Nhập tên hoặc mã định danh bệnh nhân mới:',
+                                            QLineEdit.Normal, current_name)
+        if ok and new_name.strip():
+            clean_name = new_name.strip()
+            old_slug = patient.get('slug', '')
+            new_slug = slugify(clean_name, fallback=old_slug or 'benh_nhan')
+            patient['display_name'] = clean_name
+            patient['slug'] = new_slug
+            self.study['patient'] = patient
+            old_dir = ROOT/'data/output'/old_slug
+            new_dir = ROOT/'data/output'/new_slug
+            if old_slug and old_dir.exists() and old_slug != new_slug:
+                try:
+                    old_dir.rename(new_dir)
+                except Exception as exc:
+                    self.log.appendPlainText(f'Không đổi được tên thư mục cũ: {exc}')
+            self.patient_label.setText(f'Bệnh nhân: {clean_name} ({new_slug})')
+            self._stage(f'Đã đổi tên bệnh nhân thành: {clean_name}')
+            if 'fingerprint' in self.study:
+                saved, _ = discover_results([
+                    ROOT/'data/output'/new_slug/'dinh_vi_cot_song',
+                    ROOT/'data/output', ROOT/'data/demo_runs', ROOT/'data/processed'
+                ], self.study['fingerprint'])
+                self.saved_results = saved
+                self.refresh_saved_results()
+
+    def open_body_measurements_folder(self):
+        slug = (self.study.get('patient') or {}).get('slug') if self.study else None
+        target = None
+        row = max(0, self.table.currentRow())
+        current_preds = getattr(self, 'current_predictions', [])
+        if 0 <= row < len(current_preds):
+            level = current_preds[row]['level']
+            kind = self.mode.currentText()
+            saved = self.region_paths.get((kind, level))
+            if saved and Path(saved).exists():
+                target = Path(saved)
+        if not target or not target.exists():
+            if slug:
+                candidate = ROOT/'data/output'/slug/'do_than_dot'
+                if candidate.exists():
+                    target = candidate
+            if not target:
+                target = ROOT/'data/output' if (ROOT/'data/output').exists() else ROOT/'data/body_measurements'
+        target.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+
     def load_path(self, path, uid=None, results=None):
         self._clear_study()
         def accepted(study):
             self.study = study
+            patient = study.get('patient') or {}
+            display = patient.get('display_name', 'Chưa rõ')
+            slug = patient.get('slug', '')
+            self.patient_label.setText(f"Bệnh nhân: {display} ({slug})")
+            self.rename_patient_button.setEnabled(True)
+            self.saved_results = study.get('saved_results', [])
+            self.region_paths = study.get('saved_regions', {})
+            self.region_states = {key: 'Có bản lưu · Chưa mở kiểm tra' for key in self.region_paths}
+            self.refresh_saved_results()
+            if study.get('unreadable_results'):
+                self.log.appendPlainText('Một số báo cáo cũ không đọc được; có thể mở thư mục kết quả riêng.')
             self.source_label.setText(str(path))
             shape = study['source'].GetSize()
             spacing = study['source'].GetSpacing()
@@ -467,7 +646,8 @@ class DemoWindow(QMainWindow):
                 slider.setValue(count//2)
                 slider.blockSignals(False)
             self.redraw()
-            self._stage('CT đã sẵn sàng. Chạy định vị hoặc mở kết quả đã lưu.')
+            self._stage('CT đã sẵn sàng. Có kết quả cũ: bấm Mở kết quả đã có.' if self.saved_results else
+                        'CT đã sẵn sàng. Bấm Chạy định vị để nhận diện đốt sống.')
             if results and (results/'prediction.json').is_file():
                 self.load_results(results)
         self._task(lambda: read_study(path, uid), accepted, 'Đọc CT và chuẩn bị ba mặt phẳng…')
@@ -494,12 +674,33 @@ class DemoWindow(QMainWindow):
                    'Đang đọc danh sách series của ca mẫu…')
 
     def choose_results(self):
-        folder = QFileDialog.getExistingDirectory(self, 'Thư mục chứa prediction.json', str(ROOT/'data/processed'))
+        slug = (self.study.get('patient') or {}).get('slug') if self.study else None
+        default_dir = ROOT/'data/output'/slug/'dinh_vi_cot_song' if slug and (ROOT/'data/output'/slug/'dinh_vi_cot_song').exists() \
+            else (ROOT/'data/output' if (ROOT/'data/output').exists() else ROOT/'data/demo_runs')
+        default_dir.mkdir(parents=True, exist_ok=True)
+        folder = QFileDialog.getExistingDirectory(self, 'Thư mục chứa prediction.json', str(default_dir))
         if folder:
-            self.load_results(Path(folder))
+            p = Path(folder)
+            if not (p/'prediction.json').is_file():
+                if (p/'region.json').is_file() or (p/'measurements.json').is_file():
+                    QMessageBox.warning(self, 'Thư mục không phù hợp',
+                                        'Thư mục này chứa vùng đo thân đốt (do_than_dot / body_measurements), không phải kết quả định vị cột sống.\n\n'
+                                        'Để xem vùng đo này:\n'
+                                        '1. Chọn kết quả định vị ở ô bên trên rồi bấm "Tải lại lần chạy đã chọn".\n'
+                                        '2. Chọn đốt sống (ví dụ L3) trong bảng rồi bấm "Đo thân đốt".')
+                else:
+                    QMessageBox.warning(self, 'Thiếu prediction.json',
+                                        f'Không tìm thấy prediction.json trong thư mục:\n{folder}\n\n'
+                                        'Vui lòng chọn thư mục chứa kết quả định vị (trong data/output hoặc data/demo_runs).')
+                return
+            self.load_results(p)
 
     def load_results(self, folder):
+        folder = Path(folder)
         if not self.study:
+            return
+        if not (folder/'prediction.json').is_file():
+            self._stage(f'Thư mục không chứa prediction.json: {folder.name}')
             return
         study = self.study
         self.review = None
@@ -510,11 +711,14 @@ class DemoWindow(QMainWindow):
         self.mode.addItem('Chỉ CT')
         def accepted(review):
             self.review = review
+            self.saved_results = [item for item in self.saved_results if item['folder'] != folder]
+            self.saved_results.insert(0, dict(folder=folder, report=review['report']))
+            self.refresh_saved_results()
             self.mode.addItems(list(review['masks']))
             self.mode.setCurrentText('Consensus' if 'Consensus' in review['masks'] else 'Baseline')
             self.warnings.setPlainText('\n\n'.join(review['warnings']) or 'Không có cảnh báo tự động; vẫn cần review.')
             verified = 'CT đã xác nhận khớp' if review['verified'] else 'Kết quả cũ: cần xác nhận đúng ca'
-            self.result_label.setText(f"{review['report']['status']} · {verified} · {folder.name}")
+            self.result_label.setText(f"{'Có cảnh báo' if review['warnings'] else 'Chưa kiểm tra'} · {verified} · {folder.name}")
             resolution = review['report'].get('model', {}).get('resolution')
             if resolution:
                 self.result_label.setText(self.result_label.text()+f' · Mô hình: {resolution}')
@@ -522,6 +726,37 @@ class DemoWindow(QMainWindow):
             self.mode_changed()
         self._task(lambda: load_review(folder, study['source'], study['reference'], study['fingerprint']),
                    accepted, 'Kiểm tra kết quả và căn chỉnh mask…')
+
+    def refresh_saved_results(self, *_):
+        selected = self.saved_combo.currentData()
+        self.saved_combo.clear()
+        config = dict(fast=self.fast.isChecked(), samples=self.samples.value() if self.mc.isChecked() else 0,
+                      noise=self.noise.value(), seed=self.seed.value())
+        ordered = sorted(self.saved_results, key=lambda item: not compatible_result(item['report'], **config))
+        for item in ordered:
+            report = item['report']
+            model = report.get('model') or {}
+            match = compatible_result(report, **config)
+            text = ('Khớp cấu hình' if match else 'Khác / thiếu cấu hình')
+            text += f" · {model.get('resolution', '?')} · MC {(report.get('monte_carlo') or {}).get('samples', 0)} · {item['folder'].name}"
+            self.saved_combo.addItem(text, item['folder'])
+            self.saved_combo.setItemData(self.saved_combo.count()-1, text, Qt.ToolTipRole)
+        index = self.saved_combo.findData(selected)
+        if index >= 0:
+            self.saved_combo.setCurrentIndex(index)
+        self._sync()
+
+    def reuse_result(self):
+        folder = self.saved_combo.currentData()
+        if folder is not None and not self._busy():
+            self.load_results(folder)
+
+    def move_level(self, delta):
+        if self._busy() or not self.table.rowCount():
+            return
+        row = self.table.currentRow()
+        target = 0 if row < 0 else row + delta
+        self.table.selectRow(max(0, min(self.table.rowCount()-1, target)))
 
     def start_run(self):
         if not self.study or self._busy():
@@ -532,8 +767,11 @@ class DemoWindow(QMainWindow):
         self.table.setRowCount(0)
         self.warnings.clear()
         self.result_label.setText('Đang chạy · chưa có kết quả cho lần xử lý mới.')
-        run_id = datetime.now().strftime('run_%Y%m%d_%H%M%S_')+uuid4().hex[:6]
-        parent = ROOT/'data/demo_runs'
+        patient = self.study.get('patient') or {}
+        slug = patient.get('slug') or 'benh_nhan'
+        res = '3mm' if self.fast.isChecked() else '1.5mm'
+        run_id = f'run_{res}_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:6]}'
+        parent = ROOT/'data/output'/slug/'dinh_vi_cot_song'
         try:
             parent.mkdir(parents=True, exist_ok=True)
         except OSError as error:
@@ -634,16 +872,55 @@ class DemoWindow(QMainWindow):
                 mc = stats.get(prediction['level'])
                 count = f"{mc['detected_samples']}/{report['monte_carlo']['samples']}" if mc else '—'
                 values = [prediction['level'], f"{prediction['volume_mm3']:,.1f}", count,
-                          'Chạm biên ảnh' if prediction.get('touches_boundary') else '—']
+                          'Chạm biên ảnh' if prediction.get('touches_boundary') else '—',
+                          self.region_states.get((self.mode.currentText(), prediction['level']), 'Chưa kiểm tra')]
                 for col, value in enumerate(values):
                     self.table.setItem(row, col, QTableWidgetItem(value))
         self.table.blockSignals(False)
+        if self.table.rowCount():
+            self.table.selectRow(0)
         self.redraw()
+        self._sync()
+
+    def open_body_review(self):
+        if not self.study or not self.review or self._busy() or self.mode.currentText() not in ('Baseline', 'Consensus'):
+            return
+        row = max(0, self.table.currentRow())
+        if row >= len(self.current_predictions):
+            return
+        from apps.body_review import BodyReviewDialog
+        study, review = self.study, self.review
+        level, kind = self.current_predictions[row]['level'], self.mode.currentText()
+        path = review['folder']/('monte_carlo/consensus.nii.gz' if kind == 'Consensus' else 'vertebrae.nii.gz')
+        slug = (study.get('patient') or {}).get('slug') or 'benh_nhan'
+        output_root = ROOT/'data/output'/slug/'do_than_dot'
+        output_root.mkdir(parents=True, exist_ok=True)
+        def accepted(labels):
+            if self.study is study and self.review is review:
+                dialog = BodyReviewDialog(study['source'], labels, study['fingerprint'], level, kind,
+                                          output_root, self)
+                saved_region = self.region_paths.get((kind, level))
+                if saved_region:
+                    try:
+                        dialog.load_region(saved_region)
+                    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
+                        dialog.error('Không mở được vùng cũ: '+str(error))
+                dialog.exec()
+                if isinstance(dialog.last_saved_path, Path):
+                    self.region_paths[(kind, level)] = dialog.last_saved_path
+                state = ('Đã lưu · '+('Đã xác nhận' if dialog.last_saved_reviewed else 'Vùng nháp')
+                         if isinstance(dialog.last_saved_path, Path) else 'Chưa kiểm tra')
+                if isinstance(state, str):
+                    self.region_states[(kind, level)] = state
+                    self.table.setItem(row, 4, QTableWidgetItem(state))
+        self._task(lambda: sitk.ReadImage(str(path)), accepted, f'Mở công cụ đo thân đốt {level}…')
 
     def select_level(self):
         row = self.table.currentRow()
         if row < 0 or not self.review:
             return
+        self.level_label.setText(f"{self.current_predictions[row]['level']} · {row+1}/{self.table.rowCount()}")
+        self._sync()
         centroid = self.current_predictions[row]['centroid_lps_mm']
         x, y, z = self.study['reference'].TransformPhysicalPointToContinuousIndex(centroid)
         self._set_indices(z, x, y)
@@ -746,18 +1023,29 @@ class DemoWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.review['folder'])))
 
     def show_help(self):
-        QMessageBox.information(self, 'Hướng dẫn nhanh',
-            '1. Chọn file CT hoặc thư mục DICOM; với DICOM, chọn series rồi bấm Đọc.\n'
-            '2. Chạy baseline trước; bật Monte Carlo nếu cần đánh giá độ nhạy với nhiễu.\n'
-            '   Mặc định 1,5 mm; bật Chạy nhanh để dùng 3 mm khi cần giảm thời gian/RAM.\n'
-            '3. Chọn Baseline / Consensus / Bất đồng; kéo thanh lát cắt hoặc nhấp trên ảnh.\n'
-            '   Tên đốt sống hiện trên Sagittal / Coronal khi lát cắt có mask tương ứng.\n'
-            '4. Chọn một đốt trong bảng để di chuyển đến tâm mask.\n'
-            '5. Xuất báo cáo HTML hoặc mở thư mục để lấy mask NIfTI và JSON.\n\n'
-            'Mở kết quả cũ: chọn đúng CT trước, sau đó chọn thư mục chứa prediction.json.\n'
-            'Kết quả chạy mới lưu trong data/demo_runs/.\n'
-            'Dừng sẽ chờ lượt suy luận hiện tại kết thúc.\n\n'
-            'Chi tiết: docs/guides/teacher_demo.md')
+        msg = QMessageBox(self)
+        msg.setWindowTitle('Hướng dẫn sử dụng · Quy trình 4 bước')
+        msg.setText(
+            '<h3>QUY TRÌNH SỬ DỤNG HỆ THỐNG SPINAL CT</h3>'
+            '<p><b>Bước 1: Chọn dữ liệu CT bệnh nhân</b><br>'
+            '• Bấm <i>Mở CT…</i> → chọn file NIfTI hoặc thư mục DICOM của bệnh nhân.<br>'
+            '• Hệ thống tự động nhận diện danh tính bệnh nhân và hiển thị <i>Bệnh nhân: [Tên]</i>. Có thể bấm <i>Đổi tên…</i> để chỉnh sửa.<br>'
+            '• Chọn Series lát cắt mỏng (khuyến nghị ≤ 1.5 mm) và bấm <i>Đọc series đã chọn</i>.</p>'
+            '<p><b>Bước 2: Định vị cột sống tự động bằng AI</b><br>'
+            '• Chọn <i>Chi tiết · 1,5 mm</i> (chính xác cao) hoặc <i>Nhanh · 3 mm</i>.<br>'
+            '• Bấm <b>Chạy định vị</b>. AI tự động phân đoạn các đốt sống từ C1 đến S1.<br>'
+            '• Kết quả tự động lưu vào: <code>data/output/[tên_bệnh_nhân]/dinh_vi_cot_song/</code>.</p>'
+            '<p><b>Bước 3: Đo thân đốt sống & Phân tích lún xẹp (Morphometry)</b><br>'
+            '• Click chọn đốt sống cần đo trong bảng (ví dụ: L1, L2, L3) hoặc bấm <i>Đốt tiếp theo →</i>.<br>'
+            '• Bấm <b>Đo thân đốt</b> (màu xanh đậm).<br>'
+            '• Khoanh vùng thân đốt (vẽ đa giác hoặc cọ) → Đặt 6 mốc chiều cao → Tích <i>Xác nhận vùng đo</i> → Bấm <b>Đo thân đốt</b>.<br>'
+            '• Xem trực tiếp 3 biểu đồ: Lát cắt CT, Vùng chuẩn hóa 256×256, và <b>Biểu đồ hội tụ Monte Carlo</b> kèm <b>Điểm cùi chỏ (Elbow point)</b>.<br>'
+            '• Bấm <b>Lưu vùng nháp / kết quả</b> (tự động lưu vào <code>data/output/[tên_bệnh_nhân]/do_than_dot/</code>).</p>'
+            '<p><b>Bước 4: Tra cứu & Quản lý dữ liệu</b><br>'
+            '• Bấm <i>Mở thư mục đo thân đốt</i> để mở nhanh file <code>preview.png</code> (ảnh 3 đồ thị) và <code>report.html</code> (báo cáo mở bằng trình duyệt).<br>'
+            '• Bấm <i>Mở thư mục kết quả (Explorer)</i> để mở thư mục định vị 3D.</p>'
+        )
+        msg.exec()
 
     def closeEvent(self, event):
         if self._busy():
