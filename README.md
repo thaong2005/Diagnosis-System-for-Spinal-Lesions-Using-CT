@@ -8,12 +8,12 @@ tổn thương hoặc phân loại AO; cần đối chiếu phép đo với nhã
 
 1. Cài môi trường theo [hướng dẫn Windows](docs/guides/windows_integration.md).
 2. Mở `start_demo.bat` hoặc chạy `.\.venv\Scripts\python.exe -m apps.demo`.
-3. Mở CT, chạy định vị hoặc mở thư mục kết quả đã lưu.
-4. Chọn Baseline/Consensus và một đốt, bấm **Đo thân đốt · blob / diện tích**.
+3. Mở CT; chọn kết quả cũ được tìm thấy hoặc chạy định vị mới.
+4. Chọn Baseline/Consensus và một đốt, bấm **Đo thân đốt**.
 5. Kiểm tra mặt phẳng, vẽ/chỉnh mask thân đốt, đặt mốc nếu cần, xác nhận và đo.
 6. Lưu vào thư mục kết quả mới; có thể mở lại vùng và xuất JSON/CSV/ảnh/HTML.
 
-[Demo từng bước](docs/guides/teacher_demo.md) ·
+[Hướng dẫn sử dụng đầy đủ](docs/guides/User_guild.md) ·
 [Đo thân đốt và MC diện tích](docs/guides/body_morphometry.md).
 
 LoG nằm trong nhóm **Thử nghiệm LoG** ở cuối cửa sổ đo. Monte Carlo nhiễu HU
@@ -36,8 +36,8 @@ Ca mẫu được cấu hình trong `sample_config.py`, tạo từ
 | MC nhiễu HU | Baseline, consensus, disagreement và thống kê độ nhạy phân đoạn |
 | Đánh giá chuyên gia và phân loại AO | Chưa hoàn thành |
 
-Yêu cầu phát triển được giữ trong [note.txt](note.txt). Hướng tiếp theo là chuẩn
-tham chiếu cho vùng/mốc, cải thiện ROI thân đốt và đánh giá LoG trên nhiều ca.
+và đánh giá LoG trên nhiều ca.
+[Đợt cải tiến UI và đo hiệu năng 31/10](docs/reports/2026-10-31-workflow.md).
 Kiểm thử phần mềm dùng dữ liệu tổng hợp; không thay thế đánh giá trên người.
 
 ## Cấu trúc

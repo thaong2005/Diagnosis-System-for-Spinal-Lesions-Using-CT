@@ -1,6 +1,6 @@
 # Tổ chức dự án
 
-Cập nhật: 30/10/2026.
+Cập nhật: 02/11/2026.
 
 ## Luồng và mã đang dùng
 
@@ -10,22 +10,27 @@ sang `src/` hoặc chia repository thành nhiều dịch vụ.
 
 | Thành phần | Trách nhiệm |
 |---|---|
-| `apps/demo.py` | Chọn CT, chạy backend, xem kết quả và mở cửa sổ đo |
-| `apps/body_review.py` | Chọn mặt phẳng, chỉnh mask/mốc, xác nhận, đo và lưu |
-| `spinal_ct/ct_io.py` | HU và geometry dùng chung |
+| `apps/demo.py` | Chọn CT, nhận diện bệnh nhân, chạy backend, xem kết quả và mở cửa sổ đo |
+| `apps/body_review.py` | Chọn mặt phẳng, chỉnh mask/mốc, xác nhận, đo, lưu audit trail |
+| `apps/tasks.py` | Lớp Worker chạy nền trên QThread cho các tác vụ đo và lưu |
+| `spinal_ct/ct_io.py` | HU, geometry, chuẩn hóa danh tính bệnh nhân (slugify, extract_patient_identifier) |
+| `spinal_ct/result_catalog.py` | Tìm kiếm kết quả định vị và đo thân đốt đệ quy, khử trùng lặp |
 | `spinal_ct/localization.py` | Ánh xạ nhãn mô hình, ROI/thể tích và preview |
 | `spinal_ct/review.py`, `overlays.py` | Kiểm tra CT–kết quả, lưới hiển thị và overlay |
-| `body_region.py`, `blob_analysis.py` | Mặt phẳng LPS, vùng thân đốt và đặc trưng theo mm |
+| `body_region.py`, `blob_analysis.py` | Mặt phẳng LPS, vùng thân đốt, hộp bao vuông và đặc trưng theo mm |
 | `blob_detection.py` | LoG thử nghiệm; kết quả phụ trợ cho người kiểm tra |
-| `area_monte_carlo.py` | Lấy mẫu điểm trên mask để ước lượng diện tích |
+| `area_monte_carlo.py` | Lấy mẫu điểm trên mask để ước lượng diện tích và tìm điểm cùi chỏ |
 | `monte_carlo.py` | Thêm nhiễu HU và tổng hợp phân đoạn; mục đích khác MC diện tích |
-| `morphometry.py`, `morphometry_render.py` | Trạng thái vùng, schema, lưu/mở và báo cáo |
+| `morphometry.py`, `morphometry_render.py` | Trạng thái vùng, schema, lưu/mở, vẽ biểu đồ hội tụ và báo cáo |
 | `annotations.py`, `labels.py` | Annotation/nhãn phát triển; không làm đầu vào suy luận |
+
+Worker dùng chung ở `apps/tasks.py`; đo, LoG và lưu vùng dùng tác vụ nền với điều khiển chỉnh sửa tạm khóa. Kết quả được nhận lại trên luồng Qt chính. `spinal_ct/result_catalog.py` tìm kết quả/vùng theo fingerprint; mở kết quả vẫn xác thực geometry và toàn vẹn.
 
 Đọc CT ở QThread và suy luận bằng QProcess để demo tiếp tục phản hồi. Mask và
 phép đo gốc không đổi khi resample riêng lưới hiển thị. Kết quả định vị mới lưu
 label map/schema 2; vùng thân đốt là schema riêng, cần người dùng xác nhận.
 
+Thay ô mặt phẳng giữ vùng cũ đến khi áp dụng; hỗ trợ lưu/bỏ/hủy và quay về các thông số đã áp dụng.
 Thay mask/mốc/nhóm tuổi hủy xác nhận và bảng đo. Đổi tham số MC chỉ hủy bảng
 đo để tính lại. LoG có trạng thái riêng: đổi thông số bỏ ứng viên cũ, chạy lại
 không xóa phép đo trên mask. Mở vùng khôi phục mặt phẳng, nhóm tuổi, cấu hình
@@ -34,8 +39,10 @@ LoG và N/seed; phép đo được tính lại khi người dùng yêu cầu.
 ## Dữ liệu và tệp sinh ra
 
 - `data/raw/`, `data/processed/`: dữ liệu và kết quả chuẩn bị cục bộ.
-- `data/demo_runs/`: mỗi lượt suy luận một thư mục mới, chỉ công bố khi hoàn tất.
-- `data/body_measurements/`: mask thân đốt, mốc, báo cáo và ảnh người dùng lưu.
+- `data/output/<slug>/`: cấu trúc lưu trữ chuẩn hóa theo từng bệnh nhân:
+  - `dinh_vi_cot_song/`: mỗi lượt định vị một thư mục `run_<resolution>_<timestamp>_<uuid>`.
+  - `do_than_dot/`: mỗi lượt đo thân đốt một thư mục `<level>_<timestamp>_<uuid>` lưu lịch sử (Audit Trail).
+- `data/demo_runs/`, `data/body_measurements/`: các thư mục kết quả cũ (được hỗ trợ đọc tương thích ngược).
 - `.venv`, `.venv-model`, `.tmp`: môi trường và cache cục bộ, được Git bỏ qua.
 - Thư mục `YYYY-MM-DD/`: workspace của từng phiên, gồm `work` và `outputs`,
   được Git bỏ qua. Giữ workspace đang dùng để các chat/đường dẫn tiếp tục hoạt động.
@@ -46,8 +53,9 @@ nhân. Chỉ đưa báo cáo văn bản đã chọn lọc vào `docs/reports/`.
 
 ## Tài liệu và công cụ lịch sử
 
-`README.md` chứa cách bắt đầu và phạm vi hiện tại; `note.txt` giữ yêu cầu.
-Hướng dẫn vận hành ở `docs/guides/`, bằng chứng kỹ thuật ở `docs/reports/`.
+`README.md` chứa cách bắt đầu và phạm vi hiện tại.
+Hướng dẫn sử dụng toàn diện ở [`docs/guides/User_guild.md`](guides/User_guild.md).
+Hướng dẫn vận hành chuyên sâu ở `docs/guides/`, bằng chứng kỹ thuật ở `docs/reports/`.
 Tài liệu cũ được giữ ở `docs/archive/FS/` và `docs/archive/lesion_detection/`,
 có [mục lục archive](archive/README.md); không dùng các checkpoint cũ để suy ra tiến độ hiện tại.
 

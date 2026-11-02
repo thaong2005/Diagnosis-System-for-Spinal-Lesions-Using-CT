@@ -1,8 +1,0 @@
-HƯỚNG PHÁT TRIỂN TIẾP THEO
-
-1. Xử lý từng đốt theo thứ tự giải phẫu; dùng TotalSegmentator giới hạn ROI và chọn mặt phẳng sagittal trung tâm theo quy tắc rõ ràng. Thử blob detection (LoG) trong ROI để đề xuất tâm/vùng ứng viên; cần bước xác định mask thân đốt riêng, cho phép kiểm tra/chỉnh thủ công.
-2. Ưu tiên blob analysis trên mask thân đốt đã kiểm tra: phân tích vùng liên thông, lấy tâm, diện tích, hướng và ellipse theo moment (không mặc định ellipse bao kín mask). Đo có xét spacing; không mặc định vùng lớn nhất là thân đốt hoặc lọc bỏ vùng biến dạng bằng tiêu chí tròn/lồi quá chặt.
-3. Chuẩn hóa: căn tâm, xoay, co giãn đồng đều và thêm nền thành 128 x 128; giữ tỷ lệ cao/rộng. Lưu phép đo gốc trước chuẩn hóa.
-4. Vector đặc trưng: diện tích mm², tỷ lệ cao/rộng, tỷ lệ lấp đầy R = S_thân_đốt / S_hộp_bao sau căn hướng, solidity và chiều cao trước/giữa/sau cùng các tỷ lệ. R riêng lẻ chưa phải độ biến dạng.
-5. Monte Carlo diện tích: lấy N điểm đều trong hộp bao, K điểm thuộc mask; R_MC = K/N, S_MC = S_hộp_bao × K/N. Lưu N, seed; đối chiếu với đếm pixel theo spacing và kiểm tra hội tụ. Tách khỏi Monte Carlo nhiễu HU hiện có.
-6. Hiển thị vùng đo, ellipse, hộp bao, ảnh chuẩn hóa và bảng đặc trưng; đánh dấu vùng đo lỗi/đốt chạm biên. Kiểm chứng phát hiện tâm, tách thân đốt và sai số diện tích trên vùng được duyệt thủ công; lưu mask trước/sau nếu xử lý hình thái. Xác định nhóm tuổi và mức đốt đánh giá, chưa suy diễn trực tiếp thành chẩn đoán/AO.
