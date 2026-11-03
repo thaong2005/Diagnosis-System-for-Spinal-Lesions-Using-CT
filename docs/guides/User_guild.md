@@ -101,11 +101,13 @@ Tính năng cho phép bác sĩ khoanh vùng thân đốt sống (vertebral body)
 flowchart TD
     A["1. Chọn đốt sống trên bảng<br>(Baseline / Consensus)"] --> B["Bấm nút: Đo thân đốt"]
     B --> C["2. Điều chỉnh mặt phẳng LPS<br>(Dịch chuyển, Xoay, Nghiêng)"]
-    C --> D["3. Vẽ / Chỉnh mask thân đốt<br>(Đa giác, cọ xóa, gợi ý LoG)"]
-    D --> E["4. Đặt 6 mốc chiều cao<br>(Trước, Giữa, Sau)"]
-    E --> F["5. Tích Xác nhận & Bấm Đo thân đốt"]
-    F --> G["6. Xem kết quả & Biểu đồ hội tụ MC<br>(Xác định điểm cùi chỏ)"]
-    G --> H["7. Bấm Lưu (1-Click Audit Trail)"]
+    C --> D1["Cách 1: Tự động tách vùng & đặt 6 mốc (1-Click AI)"]
+    C --> D2["Cách 2: Vẽ / Chỉnh thủ công<br>(Đa giác, cọ xóa, gợi ý LoG)"]
+    D1 --> E["Kiểm tra / Tinh chỉnh 6 mốc chiều cao"]
+    D2 --> E
+    E --> F["3. Tích Xác nhận & Bấm Đo thân đốt"]
+    F --> G["4. Xem kết quả & Biểu đồ hội tụ MC<br>(Điểm Cùi chỏ · Elbow point)"]
+    G --> H["5. Bấm Lưu (1-Click Audit Trail)"]
 ```
 
 ### Bước 1: Mở công cụ đo
@@ -125,10 +127,11 @@ Mặt phẳng ban đầu được tự động chọn qua tâm giải phẫu c�
 
 ### Bước 3: Khoanh vùng và chỉnh sửa mask thân đốt (2D Body Mask)
 Vùng thân đốt cần bao gồm toàn bộ bè xương xốp và vỏ xương phía trước, loại trừ phần đĩa đệm và cung sau/cuống sống:
+* **Tự động tách vùng và đặt 6 mốc (Khuyên dùng):** Bấm nút **`Tự động tách vùng và đặt 6 mốc`** ở mục 2. Thuật toán sẽ tự động phân lập phần thân đốt trước cuống cung, loại bỏ cung sau, lấp đầy các khoang xương xốp bên trong và tự động định vị 6 mốc chiều cao giải phẫu chỉ trong chưa đầy 0.1 giây.
 * **Vẽ / thêm vùng:** Bấm nút, nhấp các điểm liên tiếp quanh thân đốt, nhấp đúp hoặc bấm vào điểm đầu tiên để khép kín đa giác.
 * **Bớt vùng:** Vẽ đa giác bao quanh phần muốn cắt bỏ (ví dụ phần mấu gai, mỏm khớp lọt vào).
 * **Cọ vẽ / Cọ xóa:** Giữ chuột trái để tô thêm hoặc chuột phải để xóa tỉa từng chi tiết nhỏ.
-* **Hoàn tác:** Nhấn `Ctrl + Z` để quay lại thao tác trước.
+* **Hoàn tác:** Nhấn `Ctrl + Z` để quay lại thao tác trước (kể cả hoàn tác vùng vừa tự động tạo).
 * **Gợi ý từ LoG (Laplacian of Gaussian):** Mở nhóm `+ Thử nghiệm LoG`, bấm **`Tìm ứng viên blob trong ROI`**. Các vòng tròn màu tím sẽ đánh dấu tâm và kích thước bè xương gợi ý giúp định vị nhanh.
 
 ### Bước 4: Đặt 6 mốc đo chiều cao đốt sống (Tùy chọn)
@@ -152,14 +155,17 @@ Vùng thân đốt cần bao gồm toàn bộ bè xương xốp và vỏ xương
 Sau khi đo xong, bảng kết quả và 3 khung hình trực quan sẽ hiển thị đầy đủ:
 * **Khung 1 (Vùng đo thân đốt):** Hiển thị ảnh CT lát cắt, mask thân đốt (xanh lá), ellipse moment tương đương và hộp bao vuông xoay theo trục chính.
 * **Khung 2 (Chuẩn hóa 256 × 256):** Ảnh thân đốt đã được xoay thẳng trục, căn giữa và chuẩn hóa về kích thước $256 \times 256$ pixel giữ nguyên tỷ lệ thực.
-* **Khung 3 (Biểu đồ hội tụ MC & Điểm cùi chỏ):**
+* **Khung 3 (Biểu đồ hội tụ MC & Điểm Cùi chỏ):**
   * Đường xanh dương: Diện tích ước lượng Monte Carlo theo số điểm lấy mẫu ($100 \to 10.000.000$ điểm).
   * Đường nét đứt đen: Diện tích đếm pixel giải phẫu tham chiếu.
-  * Điểm màu cam (**Điểm cùi chỏ / Elbow Point**): Vị trí thuật toán phát hiện diện tích bắt đầu đạt trạng thái hội tụ ổn định, giúp bác sĩ biết số mẫu lấy mẫu tối ưu và diện tích tin cậy tương ứng.
-* **Các chỉ số hình thái học:**
-  * Diện tích đếm pixel ($mm^2$), Diện tích Monte Carlo ($mm^2$), Sai lệch so với đếm pixel ($mm^2$).
+  * Điểm màu cam (**Điểm Cùi chỏ (Elbow point)**): Vị trí thuật toán phát hiện diện tích bắt đầu đạt trạng thái hội tụ ổn định, giúp bác sĩ biết số mẫu lấy mẫu tối ưu và diện tích tin cậy tương ứng.
+* **Các chỉ số hình thái học & Cảnh báo lún/xẹp:**
+  * Diện tích đếm pixel ($mm^2$), Diện tích Monte Carlo ($mm^2$), Sai lệch so với đếm pixel ($mm^2$), Điểm Cùi chỏ (Elbow point) ($mm^2$).
   * Chiều dài cạnh hộp bao vuông ($mm$), Tỷ lệ lấp đầy (Fill ratio), Độ lồi/đặc (Solidity).
   * Chiều cao thành trước, thành giữa, thành sau ($mm$) và các tỷ lệ chiều cao (Trước/Sau, Giữa/Sau).
+  * **Hệ thống cảnh báo QC tự động:**
+    - Cảnh báo khi tỷ lệ $H_a / H_p < 0.80$ hoặc $> 1.30$ (`abnormal_ap_height_ratio`).
+    - Cảnh báo lún mâm đốt dạng lòng chảo khi tỷ lệ $H_m / H_p < 0.80$ (`low_middle_posterior_ratio`).
 
 ### Bước 7: Lưu trữ 1-Click & Bảo toàn lịch sử (Audit Trail)
 * **Nút `Lưu` (1-Click):** Tự động lưu bản ghi mới vào thư mục:

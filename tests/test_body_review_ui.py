@@ -301,6 +301,26 @@ class BodyReviewUITests(unittest.TestCase):
             self.assertFalse(window.body_button.isEnabled())
             window.close()
 
+    def test_auto_populate_worker_and_undo(self):
+        dialog = self.dialog()
+        self.assertTrue(dialog.auto_button.isEnabled())
+        dialog.auto_button.click()
+        self.wait_idle(dialog)
+
+        self.assertTrue(dialog.session.mask.any())
+        self.assertEqual(len(dialog.session.landmarks), 6)
+        self.assertIsNotNone(dialog.session.auto_provenance)
+        self.assertFalse(dialog.session.reviewed)
+        self.assertTrue(dialog.landmark_toggle.isChecked())
+        self.assertIn('Đã tự động tách vùng và đặt 6 mốc', dialog.status.text())
+
+        dialog.undo()
+        self.assertFalse(dialog.session.mask.any())
+        self.assertEqual(len(dialog.session.landmarks), 0)
+        self.assertIsNone(dialog.session.auto_provenance)
+        self.assertFalse(dialog.session.reviewed)
+        dialog.close()
+
 
 if __name__ == '__main__':
     unittest.main()

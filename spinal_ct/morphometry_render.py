@@ -79,7 +79,7 @@ def draw_convergence(ax, report):
     if elbow:
         el_x, el_y = elbow['samples'], elbow['area_mm2']
         ax.plot(el_x, el_y, 'o', color='#ff7f0e', markersize=8, markeredgecolor='red', markeredgewidth=1.5,
-                label=f"Cùi chỏ ({el_y:.1f} mm²)")
+                label=f"Điểm Cùi chỏ (Elbow point) ({el_y:.1f} mm²)")
         y_min, y_max = min(areas), max(areas)
         offset_y = -32 if (el_y - y_min) / (y_max - y_min + 1e-12) > 0.7 else 28
         va = 'top' if offset_y < 0 else 'bottom'
