@@ -29,7 +29,9 @@ WARNINGS = dict(small_region='Vùng đo quá nhỏ', touches_plane_boundary='Vù
                 multiple_components='Có nhiều vùng rời: cần kiểm tra',
                 ellipse_orientation_unstable='Hai trục gần bằng nhau: hướng ellipse chưa ổn định',
                 touches_ct_field_boundary='Vùng đo chạm giới hạn CT',
-                height_landmarks_missing='Chưa đặt 6 mốc chiều cao', age_group_unspecified='Chưa xác định nhóm tuổi')
+                height_landmarks_missing='Chưa đặt 6 mốc chiều cao', age_group_unspecified='Chưa xác định nhóm tuổi',
+                abnormal_ap_height_ratio='Tỷ lệ chiều cao trước/sau ngoài khoảng 0.80–1.30: cần kiểm tra',
+                low_middle_posterior_ratio='Tỷ lệ chiều cao giữa/sau thấp (< 0.80): cần kiểm tra lún mâm đốt')
 
 
 class BodyReviewDialog(QDialog):
@@ -98,6 +100,9 @@ class BodyReviewDialog(QDialog):
         self.plane_panel.hide()
         self.plane_toggle.toggled.connect(self.plane_panel.setVisible)
         controls.addWidget(QLabel('2. Vẽ / chỉnh vùng thân đốt'))
+        self.auto_button = QPushButton('Tự động tách vùng và đặt 6 mốc')
+        self.auto_button.clicked.connect(self.auto_populate_region)
+        controls.addWidget(self.auto_button)
         for widget in (self.offset, self.yaw, self.tilt):
             widget.valueChanged.connect(self.plane_dirty)
         self.add_button = QPushButton('Vẽ / thêm vùng')
@@ -293,6 +298,7 @@ class BodyReviewDialog(QDialog):
         self.confirm.setEnabled(nonempty)
         for widget in (self.add_button, self.remove_button, self.brush_button, self.log_button):
             widget.setEnabled(active)
+        self.auto_button.setEnabled(active and bool(self.session.hint.any()))
         for widget in (self.clear_button, self.landmark_button, self.clear_landmarks, self.save_button):
             widget.setEnabled(nonempty)
         self.undo_button.setEnabled(active and bool(self.history))
@@ -594,6 +600,21 @@ class BodyReviewDialog(QDialog):
         except (ValueError, RuntimeError) as error:
             self.error(error)
 
+    def auto_populate_region(self):
+        if self.worker is not None or self.pending_plane or not self.session:
+            return
+        snapshot = copy.deepcopy(self.session)
+        def compute():
+            snapshot.auto_populate(approve=False)
+            return snapshot
+        def accepted(session):
+            self.remember()
+            self.session = session
+            self.landmark_toggle.setChecked(True)
+            self.status.setText('Đã tự động tách vùng và đặt 6 mốc. Kiểm tra/sửa mốc rồi tích Xác nhận trước khi đo.')
+            self.redraw()
+        self.run_task(compute, accepted, 'Đang tự động tách vùng và đặt mốc')
+
     def find_blobs(self):
         if self.worker is not None or self.pending_plane or not self.session:
             return
@@ -743,7 +764,7 @@ class BodyReviewDialog(QDialog):
                            ('Khoảng lấy mẫu 95% MC (mm²)', f'{low:.2f} – {high:.2f}'), ('Số điểm / seed', f'{mc["samples"]} / {mc["seed"]}')]
                 if 'elbow' in mc:
                     elbow = mc['elbow']
-                    values.append(('MC điểm cùi chỏ (mm²)', f"{elbow['area_mm2']:.4f} (N={elbow['samples']:,})"))
+                    values.append(('Điểm Cùi chỏ (Elbow point) (mm²)', f"{elbow['area_mm2']:.4f} (N={elbow['samples']:,})"))
                 self.table.setRowCount(len(values))
                 for row, (name, value) in enumerate(values):
                     self.table.setItem(row, 0, QTableWidgetItem(name))
