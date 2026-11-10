@@ -167,7 +167,22 @@ Sau khi đo xong, bảng kết quả và 3 khung hình trực quan sẽ hiển t
     - Cảnh báo khi tỷ lệ $H_a / H_p < 0.80$ hoặc $> 1.30$ (`abnormal_ap_height_ratio`).
     - Cảnh báo lún mâm đốt dạng lòng chảo khi tỷ lệ $H_m / H_p < 0.80$ (`low_middle_posterior_ratio`).
 
-### Bước 7: Lưu trữ 1-Click & Bảo toàn lịch sử (Audit Trail)
+### Bước 7: Phân loại tổn thương cột sống AO Spine (Thẻ Khuyến nghị AI)
+Ngay trên thanh điều khiển bên phải của cửa sổ Đo thân đốt, thẻ **"Phân loại tổn thương AO Spine"** sẽ tự động hiển thị chẩn đoán phân tầng rủi ro:
+* **Badge chẩn đoán màu trực quan & Độ tin cậy (%):**
+  - **Màu đỏ (`#c0392b`):** Tổn thương mất vững cấp cứu (`Class C` - Trật/di lệch đốt sống, `Class A4` - Vỡ nổ toàn bộ 2 mâm đốt).
+  - **Màu cam (`#d35400`):** Tổn thương dây chằng hoặc vỡ nổ 1 mâm (`Class B2` - Toác dây chằng sau, `Class B3` - Quá ưỡn, `Class A3` - Vỡ nổ bán phần).
+  - **Màu vàng (`#f39c12`):** Gãy lún chêm nhẹ (`Class A1` - Wedge compression, `Class A2` - Split).
+  - **Màu xanh (`#27ae60`):** Thân đốt bình thường (`Normal`).
+* **Hạng tổn thương toàn cột sống (Rank & Severity Score):** Đốt có tổn thương nặng nhất sẽ được xếp hạng `#1` (đốt tổn thương chính cần can thiệp).
+* **4 Chỉ số hình thái học định lượng then chốt:**
+  - **Độ lồi tường sau ($\Delta_{post}$):** Khoảng cách mảnh xương lồi vào ống sống tính bằng mm (chuyển đỏ khi $> 2.0\text{ mm}$).
+  - **Tỷ lệ liên gai sau (ISP Ratio):** Tỷ lệ khoảng cách mấu gai so với đốt lân cận (chuyển đỏ khi $> 1.30$ báo hiệu đứt dây chằng sau).
+  - **Độ di lệch trượt (Translation):** Độ trượt vuông góc khe đĩa đệm (chuyển đỏ khi $> 3.5\text{ mm}$).
+  - **Tỷ lệ xẹp tương đối (Relative Collapse):** Tỷ lệ xẹp mâm trên/dưới so với đốt liền kề (chuyển đỏ khi $< 0.75$).
+* **Biện giải lâm sàng tự động (Clinical Rationale):** Đoạn tóm tắt cơ chế chẩn đoán tiếng Việt và các cảnh báo nguy cơ (loãng xương, gãy nghi ngờ).
+
+### Bước 8: Lưu trữ 1-Click & Bảo toàn lịch sử (Audit Trail)
 * **Nút `Lưu` (1-Click):** Tự động lưu bản ghi mới vào thư mục:
   ```text
   data/output/<slug>/do_than_dot/<level>_<timestamp>_<uuid>/

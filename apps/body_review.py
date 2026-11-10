@@ -7,19 +7,27 @@ from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
+import SimpleITK as sitk
 from PySide6.QtCore import Qt, QRegularExpression, QTimer
 from PySide6.QtGui import QFont, QRegularExpressionValidator
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
-    QFormLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
+    QFormLayout, QHeaderView, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
     QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from matplotlib.widgets import PolygonSelector
 
+from spinal_ct.localization import LEVELS
 from spinal_ct.body_region import propose_plane, sample_plane, polygon_mask, plane_parameters
 from spinal_ct.blob_detection import detect_blobs
 from spinal_ct.morphometry import BodySession, load_session, save_session, LANDMARK_NAMES
-from spinal_ct.morphometry_render import draw_body, draw_normalized, draw_convergence
+from spinal_ct.morphometry_render import (
+    draw_body,
+    draw_clean_reference,
+    draw_normalized,
+    draw_convergence,
+    get_aospine_severity_color_and_label,
+)
 from spinal_ct.area_monte_carlo import validate_sampling
 from apps.ui_fonts import ui_font
 from apps.tasks import Task
@@ -39,7 +47,7 @@ class BodyReviewDialog(QDialog):
         super().__init__(parent)
         self.setFont(QFont(ui_font(), 10))
         self.source, self.labels, self.fingerprint = source, labels, fingerprint
-        self.level, self.source_kind, self.output_root = level, source_kind, Path(output_root)
+        self.level, self.source_kind, self.output_root = level, source_kind, Path(output_root) if output_root else None
         self.session = None
         self.selector = None
         self.history = []
@@ -55,6 +63,29 @@ class BodyReviewDialog(QDialog):
         self.mode = 'view'
         self.brushing = False
         self.blob_extras = dict(scales=8, max_candidates=30, window_hu=[-200., 1500.])
+        self.hide_overlays_temp = False
+
+        if hasattr(self.labels, 'GetSize'):
+            arr = sitk.GetArrayViewFromImage(self.labels)
+        elif isinstance(self.labels, np.ndarray):
+            arr = self.labels
+        else:
+            arr = None
+
+        if arr is not None:
+            unique_vals = np.unique(arr)
+            present = [LEVELS[v - 1] for v in sorted(unique_vals) if 1 <= v <= len(LEVELS)]
+        else:
+            present = []
+
+        if self.level not in present:
+            present.append(self.level)
+        self.available_levels = sorted(set(present), key=lambda x: LEVELS.index(x) if x in LEVELS else 999)
+        self.level_buttons = {}
+        self.level_cache = {}
+        self._sessions_by_level: dict[str, BodySession] = {}
+        self._controls_by_level: dict[str, dict] = {}
+
         self.setWindowTitle(f'Đo thân đốt · {level} · {source_kind}')
         self.resize(1380, 900)
         self.setMinimumSize(1050, 650)
@@ -62,6 +93,7 @@ class BodyReviewDialog(QDialog):
         split = QSplitter(Qt.Horizontal)
         outer.addWidget(split)
         panel = QWidget()
+        panel.setMinimumWidth(360)
         self.controls_panel = panel
         controls = QVBoxLayout(panel)
         intro = QLabel('Vẽ đường bao thân đốt, gồm phần bên trong; loại cấu trúc phía sau. '
@@ -144,6 +176,133 @@ class BodyReviewDialog(QDialog):
         controls.addWidget(self.landmark_panel)
         self.landmark_panel.hide()
         self.landmark_toggle.toggled.connect(self.landmark_panel.setVisible)
+
+        # 2.5 AO Spine Recommendation Card
+        self.aospine_group = QWidget()
+        aospine_layout = QVBoxLayout(self.aospine_group)
+        aospine_layout.setContentsMargins(8, 8, 8, 8)
+        self.aospine_group.setStyleSheet('QWidget {background:white; border:1px solid #c5d5df; border-radius:6px;}')
+
+        lbl_ao_title = QLabel('Phân loại tổn thương AO Spine')
+        lbl_ao_title.setStyleSheet('font-weight:bold; color:#136979; border:none;')
+        aospine_layout.addWidget(lbl_ao_title)
+
+        self.aospine_badge = QLabel('Normal · 100%')
+        self.aospine_badge.setAlignment(Qt.AlignCenter)
+        self.aospine_badge.setStyleSheet('background:#27ae60; color:white; font-weight:bold; font-size:13px; border-radius:4px; padding:4px;')
+        aospine_layout.addWidget(self.aospine_badge)
+
+        self.aospine_rank = QLabel('Hạng tổn thương: #1 / 1')
+        self.aospine_rank.setStyleSheet('color:#555; font-size:11px; border:none;')
+        aospine_layout.addWidget(self.aospine_rank)
+
+        doc_layout = QHBoxLayout()
+        lbl_doc = QLabel('Bác sĩ xác nhận:')
+        lbl_doc.setStyleSheet('font-weight:bold; font-size:11px; border:none;')
+        self.doctor_override_combo = QComboBox()
+        self.doctor_override_combo.addItems([
+            'Theo gợi ý AI', 'Normal', 'A1', 'A2', 'A3', 'A4', 'B2', 'B3', 'C'
+        ])
+        self.doctor_override_combo.currentIndexChanged.connect(self.on_doctor_override_changed)
+        doc_layout.addWidget(lbl_doc)
+        doc_layout.addWidget(self.doctor_override_combo)
+        aospine_layout.addLayout(doc_layout)
+
+        ao_form = QFormLayout()
+        ao_form.setContentsMargins(0, 4, 0, 4)
+        ao_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.lbl_delta_pw = QLabel('0.0 mm')
+        self.lbl_delta_pw.setWordWrap(True)
+        self.lbl_delta_pw.setStyleSheet('font-weight:bold; border:none;')
+        self.lbl_isp = QLabel('1.00')
+        self.lbl_isp.setWordWrap(True)
+        self.lbl_isp.setStyleSheet('font-weight:bold; border:none;')
+        self.lbl_trans = QLabel('0.0 mm')
+        self.lbl_trans.setWordWrap(True)
+        self.lbl_trans.setStyleSheet('font-weight:bold; border:none;')
+        self.lbl_collapse = QLabel('1.00')
+        self.lbl_collapse.setWordWrap(True)
+        self.lbl_collapse.setStyleSheet('font-weight:bold; border:none;')
+
+        ao_form.addRow('Độ lồi tường sau (Δ_post):', self.lbl_delta_pw)
+        ao_form.addRow('Tỷ lệ liên gai sau (ISP):', self.lbl_isp)
+        ao_form.addRow('Độ di lệch trượt:', self.lbl_trans)
+        ao_form.addRow('Mức độ xẹp lún:', self.lbl_collapse)
+        aospine_layout.addLayout(ao_form)
+
+        self.aospine_warning = QLabel()
+        self.aospine_warning.setWordWrap(True)
+        self.aospine_warning.setStyleSheet('background:#fff3cd; color:#856404; border:1px solid #ffeeba; border-radius:4px; padding:6px; font-size:11px;')
+        self.aospine_warning.hide()
+        aospine_layout.addWidget(self.aospine_warning)
+
+        self.aospine_rationale = QLabel('Đốt sống bình thường.')
+        self.aospine_rationale.setWordWrap(True)
+        self.aospine_rationale.setStyleSheet('color:#333; font-style:italic; font-size:11px; border:none; padding-top:4px;')
+        aospine_layout.addWidget(self.aospine_rationale)
+
+        controls.addWidget(self.aospine_group)
+
+        # 3. Confirm, Measure and Save
+        controls.addWidget(QLabel('3. Xác nhận, đo và lưu'))
+        self.age = QComboBox()
+        for title, value in (('Chưa xác định nhóm tuổi', 'unspecified'), ('Người lớn', 'adult'), ('Trẻ em', 'pediatric')):
+            self.age.addItem(title, value)
+        self.age.currentIndexChanged.connect(self.age_changed)
+        controls.addWidget(self.age)
+        self.confirm = QCheckBox('Xác nhận vùng đo và các mốc')
+        self.confirm.setToolTip('Kiểm tra bằng mắt trước khi xác nhận. Thay đổi vùng/mốc sẽ hủy xác nhận và phép đo cũ.')
+        self.confirm.toggled.connect(self.approve)
+        controls.addWidget(self.confirm)
+
+        self.measure_button = QPushButton('Đo thân đốt')
+        self.measure_button.setObjectName('primary')
+        self.measure_button.clicked.connect(self.measure)
+        controls.addWidget(self.measure_button)
+
+        self.save_button = QPushButton('Lưu vùng nháp / kết quả')
+        self.save_button.clicked.connect(self.save)
+        controls.addWidget(self.save_button)
+        self.save_as_button = QPushButton('Lưu vào thư mục khác…')
+        self.save_as_button.clicked.connect(self.save_as)
+        controls.addWidget(self.save_as_button)
+        self.open_button = QPushButton('Mở vùng thân đốt đã lưu')
+        self.open_button.clicked.connect(self.open_saved)
+        controls.addWidget(self.open_button)
+
+        # Collapsible Advanced Tools (MC & LoG)
+        self.adv_toggle = QPushButton('⚙️ Công cụ nâng cao (MC & LoG) ▶')
+        self.adv_toggle.setCheckable(True)
+        controls.addWidget(self.adv_toggle)
+
+        self.adv_panel = QWidget()
+        adv_layout = QVBoxLayout(self.adv_panel)
+        adv_layout.setContentsMargins(4, 4, 4, 4)
+
+        self.sampling_toggle = QPushButton('+ Cấu hình MC diện tích')
+        self.sampling_toggle.setCheckable(True)
+        adv_layout.addWidget(self.sampling_toggle)
+
+        self.sampling_panel = QWidget()
+        mc_form = QFormLayout(self.sampling_panel)
+        self.samples = QSpinBox()
+        self.samples.setRange(100, 10_000_000)
+        self.samples.setValue(100_000)
+        self.samples.setSingleStep(10_000)
+        self.seed = QLineEdit('42')
+        self.seed.setValidator(QRegularExpressionValidator(QRegularExpression('[0-9]{1,19}'), self.seed))
+        mc_form.addRow('MC diện tích · số điểm', self.samples)
+        mc_form.addRow('Seed', self.seed)
+        adv_layout.addWidget(self.sampling_panel)
+        self.sampling_panel.hide()
+        self.sampling_toggle.toggled.connect(self.sampling_panel.setVisible)
+        self.samples.valueChanged.connect(self.mc_changed)
+        self.seed.textChanged.connect(self.mc_changed)
+
+        self.show_points = QCheckBox('Hiện tối đa 1.000 điểm MC')
+        self.show_points.toggled.connect(self.redraw)
+        adv_layout.addWidget(self.show_points)
+
         self.experiment_panel = QWidget()
         experiment_controls = QVBoxLayout(self.experiment_panel)
         experiment_controls.setContentsMargins(0, 0, 0, 0)
@@ -173,68 +332,81 @@ class BodyReviewDialog(QDialog):
         experiment_controls.addWidget(self.log_status)
         for widget in (self.log_min, self.log_max, self.log_threshold):
             widget.valueChanged.connect(self.log_parameters_changed)
-        controls.addWidget(QLabel('3. Xác nhận, đo và lưu'))
-        self.age = QComboBox()
-        for title, value in (('Chưa xác định nhóm tuổi', 'unspecified'), ('Người lớn', 'adult'), ('Trẻ em', 'pediatric')):
-            self.age.addItem(title, value)
-        self.age.currentIndexChanged.connect(self.age_changed)
-        controls.addWidget(self.age)
-        self.confirm = QCheckBox('Xác nhận vùng đo và các mốc')
-        self.confirm.setToolTip('Kiểm tra bằng mắt trước khi xác nhận. Thay đổi vùng/mốc sẽ hủy xác nhận và phép đo cũ.')
-        self.confirm.toggled.connect(self.approve)
-        controls.addWidget(self.confirm)
-        self.sampling_toggle = QPushButton('+ Cấu hình MC diện tích')
-        self.sampling_toggle.setCheckable(True)
-        controls.addWidget(self.sampling_toggle)
-        self.sampling_panel = QWidget()
-        mc_form = QFormLayout(self.sampling_panel)
-        self.samples = QSpinBox()
-        self.samples.setRange(100, 10_000_000)
-        self.samples.setValue(100_000)
-        self.samples.setSingleStep(10_000)
-        self.seed = QLineEdit('42')
-        self.seed.setValidator(QRegularExpressionValidator(QRegularExpression('[0-9]{1,19}'), self.seed))
-        mc_form.addRow('MC diện tích · số điểm', self.samples)
-        mc_form.addRow('Seed', self.seed)
-        controls.addWidget(self.sampling_panel)
-        self.sampling_panel.hide()
-        self.sampling_toggle.toggled.connect(self.sampling_panel.setVisible)
-        self.samples.valueChanged.connect(self.mc_changed)
-        self.seed.textChanged.connect(self.mc_changed)
-        self.measure_button = QPushButton('Đo thân đốt')
-        self.measure_button.setObjectName('primary')
-        self.measure_button.clicked.connect(self.measure)
-        controls.addWidget(self.measure_button)
-        self.show_points = QCheckBox('Hiện tối đa 1.000 điểm MC')
-        self.show_points.toggled.connect(self.redraw)
-        controls.addWidget(self.show_points)
-        self.save_button = QPushButton('Lưu vùng nháp / kết quả')
-        self.save_button.clicked.connect(self.save)
-        controls.addWidget(self.save_button)
-        self.save_as_button = QPushButton('Lưu vào thư mục khác…')
-        self.save_as_button.clicked.connect(self.save_as)
-        controls.addWidget(self.save_as_button)
-        self.open_button = QPushButton('Mở vùng thân đốt đã lưu')
-        self.open_button.clicked.connect(self.open_saved)
-        controls.addWidget(self.open_button)
+
         self.experiment_toggle = QPushButton('+ Thử nghiệm LoG')
         self.experiment_toggle.setCheckable(True)
         self.experiment_toggle.toggled.connect(self.experiment_panel.setVisible)
         self.experiment_toggle.toggled.connect(lambda checked: self.experiment_toggle.setText(
             '- Thử nghiệm LoG' if checked else '+ Thử nghiệm LoG'))
-        controls.addWidget(self.experiment_toggle)
-        controls.addWidget(self.experiment_panel)
+        adv_layout.addWidget(self.experiment_toggle)
+        adv_layout.addWidget(self.experiment_panel)
         self.experiment_panel.setVisible(False)
+
+        self.adv_panel.hide()
+        self.adv_toggle.toggled.connect(self.adv_panel.setVisible)
+        self.adv_toggle.toggled.connect(lambda checked: self.adv_toggle.setText(
+            '⚙️ Công cụ nâng cao (MC & LoG) ▼' if checked else '⚙️ Công cụ nâng cao (MC & LoG) ▶'
+        ))
+        controls.addWidget(self.adv_panel)
         controls.addStretch()
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(panel)
-        scroll.setMinimumWidth(340)
-        scroll.setMaximumWidth(420)
+        scroll.setMinimumWidth(380)
+        scroll.setMaximumWidth(650)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         split.addWidget(scroll)
         right = QWidget()
         layout = QVBoxLayout(right)
-        self.figure = Figure(layout='constrained')
+
+        # Spine Level Navigator
+        self.nav_widget = QWidget()
+        nav_layout = QHBoxLayout(self.nav_widget)
+        nav_layout.setContentsMargins(0, 0, 0, 2)
+        nav_layout.setSpacing(4)
+        lbl_nav = QLabel('Đốt sống:')
+        lbl_nav.setStyleSheet('font-weight:bold; color:#136979; font-size:12px;')
+        nav_layout.addWidget(lbl_nav)
+
+        self.level_buttons = {}
+        for lvl in self.available_levels:
+            btn = QPushButton(lvl)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda checked=False, l=lvl: self.switch_to_level(l))
+            nav_layout.addWidget(btn)
+            self.level_buttons[lvl] = btn
+        nav_layout.addStretch()
+        layout.addWidget(self.nav_widget)
+
+        # Overlay Toolbar
+        toolbar_widget = QWidget()
+        toolbar_layout = QHBoxLayout(toolbar_widget)
+        toolbar_layout.setContentsMargins(0, 0, 0, 4)
+
+        self.toggle_mask = QCheckBox('Viền đốt sống')
+        self.toggle_mask.setChecked(True)
+        self.toggle_mask.toggled.connect(self.redraw)
+        toolbar_layout.addWidget(self.toggle_mask)
+
+        self.toggle_landmarks = QCheckBox('6 Mốc chiều cao')
+        self.toggle_landmarks.setChecked(True)
+        self.toggle_landmarks.toggled.connect(self.redraw)
+        toolbar_layout.addWidget(self.toggle_landmarks)
+
+        self.toggle_aospine = QCheckBox('Ống sống & Mảnh lồi AO')
+        self.toggle_aospine.setChecked(True)
+        self.toggle_aospine.toggled.connect(self.redraw)
+        toolbar_layout.addWidget(self.toggle_aospine)
+
+        self.toggle_clean_quick = QPushButton('👁️ So sánh CT gốc (H / Space)')
+        self.toggle_clean_quick.setCheckable(True)
+        self.toggle_clean_quick.setToolTip('Nhấn giữ hoặc bấm để ẩn nhanh toàn bộ lớp phủ, xem CT gốc')
+        self.toggle_clean_quick.toggled.connect(self.toggle_quick_clean)
+        toolbar_layout.addWidget(self.toggle_clean_quick)
+        toolbar_layout.addStretch()
+        layout.addWidget(toolbar_widget)
+
+        self.figure = Figure(facecolor='#1e1e2e', layout='constrained')
         self.canvas = FigureCanvasQTAgg(self.figure)
         layout.addWidget(self.canvas, 3)
         self.table = QTableWidget(0, 2)
@@ -247,12 +419,25 @@ class BodyReviewDialog(QDialog):
         self.status.setMinimumHeight(45)
         layout.addWidget(self.status)
         split.addWidget(right)
-        split.setSizes([360, 1020])
+        split.setChildrenCollapsible(False)
+        split.setCollapsible(0, False)
+        split.setCollapsible(1, False)
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setSizes([400, 980])
         self.canvas.mpl_connect('button_press_event', self.click)
         self.canvas.mpl_connect('motion_notify_event', self.motion)
         self.canvas.mpl_connect('button_release_event', self.release)
         self.rebuild_plane()
         self.saved_state = self.state_token()
+        self._sessions_by_level[self.level] = self.session
+        self.session.adjacent_sessions = self._sessions_by_level
+        self._cache_current_level()
+        for lvl in self.available_levels:
+            if lvl != self.level:
+                self._ensure_session_for_level(lvl)
+        self.recompute_all_levels()
+        self.update_level_navigator_styles()
         self.sync()
         self.setStyleSheet('''
             QDialog,QWidget {background:#eef3f6;color:#233c4b;}
@@ -316,6 +501,7 @@ class BodyReviewDialog(QDialog):
         self.show_blobs.setEnabled(has_blobs)
         self.edit_landmark.setEnabled(active and len(self.session.landmarks) == 6)
         self.reset_plane.setEnabled(self.pending_plane and self.worker is None)
+        self.doctor_override_combo.setEnabled(active)
         state = self.workflow_state()
         self.state_label.setText(state + (' · Chưa lưu thay đổi' if self.is_dirty() else ''))
         color = '#956000' if self.is_dirty() or 'cảnh báo' in state else '#136979'
@@ -411,7 +597,10 @@ class BodyReviewDialog(QDialog):
             self.stop_editing()
             self.remember()
             self.session.set_mask(np.zeros(self.session.mask.shape, bool))
+            self._sessions_by_level[self.level] = self.session
+            self.recompute_all_levels()
             self.redraw()
+            self.update_level_navigator_styles()
             self.status.setText('Đã xóa vùng đo và các mốc. Có thể vẽ lại.')
 
     def start_polygon(self, subtract=False):
@@ -514,6 +703,231 @@ class BodyReviewDialog(QDialog):
     def release(self, event):
         self.brushing = False
 
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_H, Qt.Key_Space) and not event.isAutoRepeat():
+            focus = self.focusWidget()
+            if isinstance(focus, (QLineEdit, QSpinBox, QDoubleSpinBox)):
+                super().keyPressEvent(event)
+                return
+            self.toggle_clean_quick.setChecked(not self.toggle_clean_quick.isChecked())
+            return
+        super().keyPressEvent(event)
+
+    def toggle_quick_clean(self, checked: bool):
+        self.hide_overlays_temp = checked
+        self.redraw()
+
+    def on_doctor_override_changed(self, idx: int):
+        if not self.session:
+            return
+        chosen = self.doctor_override_combo.currentText()
+        if chosen == 'Theo gợi ý AI':
+            self.session.doctor_confirmed_class = None
+        else:
+            self.session.doctor_confirmed_class = chosen
+        self._sessions_by_level[self.level] = self.session
+        self.recompute_all_levels()
+        self.update_aospine_ui()
+        self.update_level_navigator_styles()
+        self.sync()
+
+    def _cache_current_level(self):
+        if self.session and self.level:
+            self._sessions_by_level[self.level] = self.session
+            self._controls_by_level[self.level] = {
+                'offset': self.offset.value(),
+                'yaw': self.yaw.value(),
+                'tilt': self.tilt.value(),
+                'history': copy.deepcopy(self.history),
+                'saved_state': self.saved_state,
+                'last_saved_path': self.last_saved_path,
+                'last_saved_reviewed': self.last_saved_reviewed,
+            }
+            self.level_cache[self.level] = {
+                'session': self.session,
+                'history': copy.deepcopy(self.history),
+                'applied_controls': getattr(self, 'applied_controls', (self.offset.value(), self.yaw.value(), self.tilt.value())),
+                'offset': self.offset.value(),
+                'yaw': self.yaw.value(),
+                'tilt': self.tilt.value(),
+                'saved_state': self.saved_state,
+                'last_saved_path': self.last_saved_path,
+                'last_saved_reviewed': self.last_saved_reviewed,
+            }
+
+    def _find_saved_region_for_level(self, level: str) -> Path | None:
+        if not self.output_root or not self.output_root.is_dir():
+            return None
+        candidates = []
+        try:
+            for p in self.output_root.iterdir():
+                if p.is_dir() and p.name.startswith(f"{level}_") and (p / 'region.json').is_file():
+                    candidates.append(p)
+        except OSError:
+            return None
+        if candidates:
+            candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            return candidates[0]
+        return None
+
+    def _ensure_session_for_level(self, lvl: str) -> BodySession | None:
+        if lvl in self._sessions_by_level:
+            return self._sessions_by_level[lvl]
+
+        saved_dir = self._find_saved_region_for_level(lvl)
+        if saved_dir is not None:
+            try:
+                sess = load_session(saved_dir, self.source, fingerprint=self.fingerprint)
+                label_id = LEVELS.index(lvl) + 1
+                _, _, sess.hint = sample_plane(self.source, sess.plane, self.labels, label_id)
+                sess.adjacent_sessions = self._sessions_by_level
+                self._sessions_by_level[lvl] = sess
+                return sess
+            except Exception:
+                pass
+
+        try:
+            if lvl not in LEVELS:
+                return None
+            label_id = LEVELS.index(lvl) + 1
+            plane = propose_plane(self.source, self.labels, label_id, offset_mm=0.0, yaw_deg=0.0, tilt_deg=0.0)
+            ct, valid, hint = sample_plane(self.source, plane, self.labels, label_id)
+            sess = BodySession(self.fingerprint, lvl, self.source_kind, plane, ct, valid, hint,
+                               age_group=self.age.currentData())
+            try:
+                sess.auto_populate(approve=False)
+            except Exception:
+                pass
+            sess.adjacent_sessions = self._sessions_by_level
+            self._sessions_by_level[lvl] = sess
+            return sess
+        except Exception:
+            return None
+
+    def recompute_all_levels(self):
+        if not self._sessions_by_level:
+            return
+        for sess in self._sessions_by_level.values():
+            sess.adjacent_sessions = self._sessions_by_level
+
+        if self.session:
+            self.session.recompute_aospine_classification(self._sessions_by_level)
+        else:
+            any_sess = next(iter(self._sessions_by_level.values()), None)
+            if any_sess:
+                any_sess.recompute_aospine_classification(self._sessions_by_level)
+
+    def update_level_navigator_styles(self):
+        for lvl, btn in self.level_buttons.items():
+            is_current = (lvl == self.level)
+            severity_icon = ''
+            badge_color = '#4cd964'
+
+            sess = self._sessions_by_level.get(lvl)
+            if sess is None and lvl in self.level_cache:
+                sess = self.level_cache[lvl].get('session')
+
+            if sess and sess.aospine:
+                has_lm = (sess.landmarks is not None and len(sess.landmarks) == 6)
+                has_ov = bool(getattr(sess, 'doctor_confirmed_class', None))
+                is_trunc = bool(sess.aospine.get('is_indeterminate') or sess.aospine.get('is_fov_truncated')
+                                or sess.aospine.get('predicted_class') == 'Ngoài vùng khảo sát (Chạm biên CT)')
+                if (has_lm or has_ov) and not is_trunc:
+                    eff_cls = getattr(sess, 'doctor_confirmed_class', None) or sess.aospine.get('predicted_class', 'Normal')
+                    if eff_cls in ('C', 'A4', 'B1', 'B2', 'B3'):
+                        severity_icon = '🔴 '
+                        badge_color = '#ff4d4d'
+                    elif eff_cls in ('A3', 'A2'):
+                        severity_icon = '🟠 '
+                        badge_color = '#ff9933'
+                    elif eff_cls == 'A1':
+                        severity_icon = '🟡 '
+                        badge_color = '#ffd11a'
+                    elif eff_cls in ('Normal', 'A0', 'S1 (Tham chiếu)'):
+                        severity_icon = '🟢 '
+                        badge_color = '#4cd964'
+                    else:
+                        severity_icon = '⚪ '
+                        badge_color = '#7f8c8d'
+                else:
+                    severity_icon = '⚪ '
+                    badge_color = '#7f8c8d'
+            else:
+                severity_icon = ''
+                badge_color = '#7f8c8d'
+
+            if is_current:
+                btn.setText(f"{severity_icon}{lvl}")
+                btn.setStyleSheet(f'background:#2a2b3d; color:{badge_color}; font-weight:bold; '
+                                  f'border:2px solid {badge_color}; border-radius:5px; padding:4px 8px;')
+            else:
+                btn.setText(f"{severity_icon}{lvl}" if severity_icon else lvl)
+                btn.setStyleSheet('background:white; color:#233c4b; font-weight:normal; '
+                                  'border:1px solid #c5d5df; border-radius:5px; padding:4px 8px;')
+
+    def switch_to_level(self, new_level: str):
+        if new_level == self.level or self.worker is not None:
+            return
+        self._do_switch_level(new_level)
+
+    def _do_switch_level(self, new_level: str):
+        self._cache_current_level()
+        self.stop_editing()
+        self.level = new_level
+        self.setWindowTitle(f'Đo thân đốt · {self.level} · {self.source_kind}')
+
+        # 1. Check in-memory session first
+        if new_level in self._sessions_by_level:
+            self.session = self._sessions_by_level[new_level]
+        else:
+            sess = self._ensure_session_for_level(new_level)
+            if sess is not None:
+                self.session = sess
+            else:
+                self._rebuild_plane()
+                self._sessions_by_level[new_level] = self.session
+
+        # 2. Restore UI controls
+        cached_ctrl = self._controls_by_level.get(new_level)
+        if cached_ctrl:
+            for widget, key in ((self.offset, 'offset'), (self.yaw, 'yaw'), (self.tilt, 'tilt')):
+                widget.blockSignals(True)
+                widget.setValue(cached_ctrl[key])
+                widget.blockSignals(False)
+            self.history = copy.deepcopy(cached_ctrl['history'])
+            self.saved_state = cached_ctrl['saved_state']
+            self.last_saved_path = cached_ctrl['last_saved_path']
+            self.last_saved_reviewed = cached_ctrl['last_saved_reviewed']
+        else:
+            for widget in (self.offset, self.yaw, self.tilt):
+                widget.blockSignals(True)
+                widget.setValue(0.0)
+                widget.blockSignals(False)
+            self.history.clear()
+            self.last_saved_path = None
+            self.last_saved_reviewed = False
+            self.saved_state = self.state_token()
+
+        self.pending_plane = False
+        self.applied_controls = (self.offset.value(), self.yaw.value(), self.tilt.value())
+
+        # 3. Restore doctor override combo
+        self.doctor_override_combo.blockSignals(True)
+        if self.session.doctor_confirmed_class:
+            idx = self.doctor_override_combo.findText(self.session.doctor_confirmed_class)
+            if idx >= 0:
+                self.doctor_override_combo.setCurrentIndex(idx)
+        else:
+            self.doctor_override_combo.setCurrentIndex(0)
+        self.doctor_override_combo.blockSignals(False)
+
+        # 4. Synchronize multi-level classification and redraw
+        self.recompute_all_levels()
+        self.redraw()
+        self.update_level_navigator_styles()
+        self.sync()
+        self.status.setText(f'Đã chuyển sang {new_level}.')
+
     def age_changed(self, *_):
         if self.session:
             self.session.age_group = self.age.currentData()
@@ -593,9 +1007,12 @@ class BodyReviewDialog(QDialog):
                 return snapshot
             def accepted(session):
                 self.session = session
+                self._sessions_by_level[self.level] = self.session
+                self.recompute_all_levels()
                 warnings = [WARNINGS.get(w, w) for w in session.result['warnings']]
                 self.status.setText('Đã đo. '+ ('; '.join(warnings) if warnings else 'Có thể lưu kết quả.'))
                 self.redraw()
+                self.update_level_navigator_styles()
             self.run_task(compute, accepted, 'Đang đo hình dạng và diện tích')
         except (ValueError, RuntimeError) as error:
             self.error(error)
@@ -610,9 +1027,13 @@ class BodyReviewDialog(QDialog):
         def accepted(session):
             self.remember()
             self.session = session
+            self._sessions_by_level[self.level] = self.session
+            self.session.adjacent_sessions = self._sessions_by_level
+            self.recompute_all_levels()
             self.landmark_toggle.setChecked(True)
             self.status.setText('Đã tự động tách vùng và đặt 6 mốc. Kiểm tra/sửa mốc rồi tích Xác nhận trước khi đo.')
             self.redraw()
+            self.update_level_navigator_styles()
         self.run_task(compute, accepted, 'Đang tự động tách vùng và đặt mốc')
 
     def find_blobs(self):
@@ -649,6 +1070,7 @@ class BodyReviewDialog(QDialog):
                 self.last_saved_path = output
                 self.last_saved_reviewed = session.reviewed
                 self.saved_state = self.state_token()
+                self._cache_current_level()
                 self.status.setText(f'Đã lưu {"kết quả đo" if session.reviewed else "vùng nháp"}: {output.name}')
                 self.redraw()
                 if after:
@@ -723,9 +1145,170 @@ class BodyReviewDialog(QDialog):
         self.last_saved_path = Path(folder)
         self.last_saved_reviewed = session.reviewed
         self.saved_state = self.state_token()
+        self._sessions_by_level[self.level] = self.session
+        self.session.adjacent_sessions = self._sessions_by_level
+        self._cache_current_level()
+        self.recompute_all_levels()
+        self.update_level_navigator_styles()
         self.status.setText('Đã mở vùng, kiểm tra khớp CT. Phép đo sẽ được tính lại khi bấm Đo. '
                             'Số điểm và seed được khôi phục theo bản lưu.')
         self.redraw()
+
+    def update_aospine_ui(self):
+        if not self.session:
+            self.aospine_group.hide()
+            return
+        self.aospine_group.show()
+        ao = self.session.aospine or self.session.recompute_aospine_classification()
+        if not ao:
+            return
+
+        cls_name = ao.get('predicted_class', 'Normal')
+        conf = float(ao.get('confidence', 0.0))
+        sec = f" (kèm {ao['secondary_subtype']})" if ao.get('secondary_subtype') else ''
+        rank = ao.get('rank', 1)
+
+        self.doctor_override_combo.blockSignals(True)
+        if self.session.doctor_confirmed_class:
+            idx = self.doctor_override_combo.findText(self.session.doctor_confirmed_class)
+            if idx >= 0:
+                self.doctor_override_combo.setCurrentIndex(idx)
+        else:
+            self.doctor_override_combo.setCurrentIndex(0)
+        self.doctor_override_combo.blockSignals(False)
+
+        has_landmarks = (self.session.landmarks is not None and len(self.session.landmarks) == 6)
+        has_override = bool(self.session.doctor_confirmed_class)
+
+        if not has_landmarks and not has_override:
+            self.aospine_badge.setText("Chưa đặt đủ 6 mốc")
+            self.aospine_badge.setStyleSheet('background:#7f8c8d; color:white; font-weight:bold; font-size:13px; border-radius:4px; padding:4px;')
+            self.aospine_rank.setText("Trạng thái: Chưa đặt đủ 6 mốc chiều cao để phân loại AO Spine")
+
+            placeholder = "— (Cần đặt 6 mốc chiều cao hoặc bấm Tự động tách vùng)"
+            self.lbl_delta_pw.setText(placeholder)
+            self.lbl_delta_pw.setStyleSheet('color:#7f8c8d; font-style:italic; border:none;')
+
+            self.lbl_isp.setText(placeholder)
+            self.lbl_isp.setStyleSheet('color:#7f8c8d; font-style:italic; border:none;')
+
+            self.lbl_trans.setText(placeholder)
+            self.lbl_trans.setStyleSheet('color:#7f8c8d; font-style:italic; border:none;')
+
+            self.lbl_collapse.setText(placeholder)
+            self.lbl_collapse.setStyleSheet('color:#7f8c8d; font-style:italic; border:none;')
+
+            self.aospine_warning.hide()
+            self.aospine_rationale.setText(
+                f"{self.level} - Bấm 'Tự động tách vùng và đặt 6 mốc' hoặc tự chấm 6 mốc để hệ thống tính toán tổn thương."
+            )
+            return
+
+        eff_cls = self.session.doctor_confirmed_class or cls_name
+        if eff_cls == 'Ngoài vùng khảo sát (Chạm biên CT)' or ao.get('is_fov_truncated'):
+            color = '#7f8c8d'
+        is_trunc = eff_cls == 'Ngoài vùng khảo sát (Chạm biên CT)' or ao.get('is_fov_truncated')
+        is_s1_ref = eff_cls == 'S1 (Tham chiếu)' or self.session.level == 'S1'
+        is_unmarked = eff_cls == 'Chưa đặt đủ 6 mốc' or len(getattr(self.session, 'landmarks', [])) != 6
+
+        if is_trunc or is_s1_ref or is_unmarked:
+            color = '#7f8c8d'
+        elif eff_cls in ('C', 'A4', 'B1', 'B2', 'B3'):
+            color = '#c0392b'
+        elif eff_cls in ('A3', 'A2'):
+            color = '#d35400'
+        elif eff_cls == 'A1':
+            color = '#f39c12'
+        else:
+            color = '#27ae60'
+
+        if self.session.doctor_confirmed_class:
+            self.aospine_badge.setText(f"[BS: {self.session.doctor_confirmed_class}] · AI: {cls_name} ({conf:.1%})")
+        elif is_trunc:
+            self.aospine_badge.setText("Ngoài vùng khảo sát (Chạm biên CT)")
+        elif is_s1_ref:
+            self.aospine_badge.setText("S1 (Tham chiếu)")
+        elif is_unmarked:
+            self.aospine_badge.setText("Chưa đặt đủ 6 mốc")
+        else:
+            self.aospine_badge.setText(f"{cls_name}{sec} · {conf:.1%}")
+        self.aospine_badge.setStyleSheet(f'background:{color}; color:white; font-weight:bold; font-size:13px; border-radius:4px; padding:4px;')
+        total_ranked = ao.get('total_ranked', len(self._sessions_by_level) or 1)
+        if is_trunc:
+            self.aospine_rank.setText("Trạng thái: Đốt sống bị cắt cụt do chạm mép biên trường chụp")
+        elif is_s1_ref:
+            self.aospine_rank.setText("Trạng thái: Xương cùng làm mốc tham chiếu giải phẫu")
+        elif is_unmarked:
+            self.aospine_rank.setText("Trạng thái: Chưa đặt đủ 6 mốc giải phẫu")
+        else:
+            self.aospine_rank.setText(f"Hạng nghi ngờ: #{rank} / {total_ranked} (Mức độ nặng: {ao.get('lesion_severity_score', 0.0):.2f})")
+
+        ret = self.session.retropulsion or {}
+        delta_pw = float(ret.get('delta_posterior_mm', 0.0))
+        c_probs = ao.get('concept_probs') or {}
+        raw_m = ao.get('raw_metrics') or {}
+        isp = float(raw_m.get('isp_ratio', c_probs.get('isp_ratio', 1.0)))
+        trans = float(raw_m.get('translation_mm', c_probs.get('translation_mm', 0.0)))
+        collapse = float(raw_m.get('relative_collapse_ratio', c_probs.get('relative_collapse_ratio', 1.0)))
+
+        if is_trunc or is_s1_ref or is_unmarked:
+            delta_pw = 0.0
+            isp = 1.0
+            trans = 0.0
+            collapse = 1.0
+        elif eff_cls == 'Normal':
+            delta_pw = 0.0
+            isp = min(isp, 1.0)
+            if trans < 3.5:
+                trans = 0.0
+
+        if delta_pw > 2.0:
+            self.lbl_delta_pw.setText(f"🔴 {delta_pw:.1f} mm (Cảnh báo lồi > 2.0 mm)")
+            self.lbl_delta_pw.setStyleSheet('color:#c0392b; font-weight:bold; border:none;')
+        else:
+            self.lbl_delta_pw.setText(f"🟢 {delta_pw:.1f} mm (Bình thường < 2.0 mm)")
+            self.lbl_delta_pw.setStyleSheet('color:#27ae60; font-weight:bold; border:none;')
+
+        if isp > 1.30:
+            self.lbl_isp.setText(f"🔴 {isp:.2f} (Toác dải căng sau > 1.30)")
+            self.lbl_isp.setStyleSheet('color:#c0392b; font-weight:bold; border:none;')
+        elif isp > 1.15:
+            self.lbl_isp.setText(f"🟡 {isp:.2f} (Nghi ngờ tổn thương M1 > 1.15)")
+            self.lbl_isp.setStyleSheet('color:#f39c12; font-weight:bold; border:none;')
+        else:
+            self.lbl_isp.setText(f"🟢 {isp:.2f} (Bình thường ≤ 1.15)")
+            self.lbl_isp.setStyleSheet('color:#27ae60; font-weight:bold; border:none;')
+
+        if trans >= 3.5:
+            self.lbl_trans.setText(f"🔴 {trans:.1f} mm (Trượt/mất vững Type C ≥ 3.5 mm)")
+            self.lbl_trans.setStyleSheet('color:#c0392b; font-weight:bold; border:none;')
+        else:
+            self.lbl_trans.setText(f"🟢 {trans:.1f} mm (Bình thường < 3.5 mm)")
+            self.lbl_trans.setStyleSheet('color:#27ae60; font-weight:bold; border:none;')
+
+        pct_loss = max(0.0, (1.0 - collapse) * 100.0)
+        pct_kept = min(100.0, collapse * 100.0)
+        if collapse <= 0.78:
+            self.lbl_collapse.setText(f"🔴 Xẹp -{pct_loss:.0f}% (Bảo tồn {pct_kept:.0f}% - Vỡ nặng ≤ 78%)")
+            self.lbl_collapse.setStyleSheet('color:#c0392b; font-weight:bold; border:none;')
+        elif collapse <= 0.85:
+            self.lbl_collapse.setText(f"🟡 Xẹp -{pct_loss:.0f}% (Bảo tồn {pct_kept:.0f}% - Giảm nhẹ)")
+            self.lbl_collapse.setStyleSheet('color:#f39c12; font-weight:bold; border:none;')
+        else:
+            self.lbl_collapse.setText(f"🟢 Bảo tồn {pct_kept:.0f}% chiều cao")
+            self.lbl_collapse.setStyleSheet('color:#27ae60; font-weight:bold; border:none;')
+
+        warnings_list = list(ao.get('modifiers', []))
+        if ao.get('is_indeterminate'):
+            for r in ao.get('rejection_reasons', []):
+                warnings_list.append(f"Chưa chắc chắn: {r}")
+        if warnings_list:
+            self.aospine_warning.setText('⚠ ' + '\n⚠ '.join(warnings_list))
+            self.aospine_warning.show()
+        else:
+            self.aospine_warning.hide()
+
+        self.aospine_rationale.setText(ao.get('clinical_rationale_vi', ''))
 
     def redraw(self, *_):
         # A polygon selector owns its axes until completion; don't replace them.
@@ -733,26 +1316,62 @@ class BodyReviewDialog(QDialog):
             self.sync()
             return
         self.figure.clear()
-        axes = self.figure.subplots(1, 3)
-        self.body_ax, normalized_ax, convergence_ax = axes
+        self.figure.set_facecolor('#1e1e2e')
+        gs = self.figure.add_gridspec(1, 3)
+        self.body_ax = self.figure.add_subplot(gs[0, 0])
+        self.clean_ax = self.figure.add_subplot(gs[0, 1], sharex=self.body_ax, sharey=self.body_ax)
+        self.normalized_ax = self.clean_ax
+        self.convergence_ax = self.figure.add_subplot(gs[0, 2])
         self.table.setRowCount(0)
+
+        show_mask = self.toggle_mask.isChecked() and not self.hide_overlays_temp
+        show_landmarks = self.toggle_landmarks.isChecked() and not self.hide_overlays_temp
+        show_aospine = self.toggle_aospine.isChecked() and not self.hide_overlays_temp
+
         if self.session:
-            draw_body(self.body_ax, self.session, show_points=self.show_points.isChecked(), show_blobs=self.show_blobs.isChecked())
-            draw_normalized(normalized_ax, self.session)
+            self.update_aospine_ui()
+            draw_body(
+                self.body_ax,
+                self.session,
+                show_points=self.show_points.isChecked() and not self.hide_overlays_temp,
+                show_blobs=self.show_blobs.isChecked() and not self.hide_overlays_temp,
+                show_aospine=show_aospine,
+                show_mask=show_mask,
+                show_landmarks=show_landmarks,
+                dark_theme=True,
+            )
+            draw_clean_reference(self.clean_ax, self.session, dark_theme=True)
             candidates = (self.session.candidates or {}).get('candidates', [])
             index = self.blob_choices.currentIndex()
-            if self.show_blobs.isChecked() and 0 <= index < len(candidates):
+            if self.show_blobs.isChecked() and not self.hide_overlays_temp and 0 <= index < len(candidates):
                 self.body_ax.plot(*candidates[index]['centre_xy_mm'], '+', color='#fc64f0', markersize=15, markeredgewidth=2)
             report = self.session.result if self.session.reviewed else None
             if report and 'monte_carlo_area' in report and 'convergence' in report['monte_carlo_area']:
-                draw_convergence(convergence_ax, report)
+                draw_convergence(self.convergence_ax, report, dark_theme=True)
             else:
-                convergence_ax.text(.5, .5, 'Xác nhận và đo\nđể xem hội tụ MC', ha='center', va='center',
-                                     transform=convergence_ax.transAxes, color='#94aebc', fontsize=10)
-                convergence_ax.set_axis_off()
+                self.convergence_ax.set_facecolor('#1e1e2e')
+                self.convergence_ax.text(.5, .5, 'Xác nhận và đo\nđể xem hội tụ MC', ha='center', va='center',
+                                         transform=self.convergence_ax.transAxes, color='#888899', fontsize=10)
+                self.convergence_ax.axis('off')
             if report:
+                values = []
+                if self.session.aospine:
+                    ao = self.session.aospine
+                    eff_cls = self.session.doctor_confirmed_class or ao.get('predicted_class', 'Normal')
+                    sec = f" (kèm {ao['secondary_subtype']})" if ao.get('secondary_subtype') else ''
+                    doc_str = f" [Bác sĩ xác nhận: {self.session.doctor_confirmed_class}]" if self.session.doctor_confirmed_class else ''
+                    values.append(('AO Spine dự đoán', f"{eff_cls}{sec} ({ao.get('confidence', 0.0):.1%}){doc_str}"))
+                    values.append(('Hạng tổn thương toàn cột sống', f"#{ao.get('rank', 1)}"))
+                    ret = self.session.retropulsion or {}
+                    values.append(('Độ lồi tường sau Δ_post (mm)', f"{ret.get('delta_posterior_mm', 0.0):.1f}"))
+                    c_probs = ao.get('concept_probs') or {}
+                    values.append(('Tỷ lệ liên gai sau (ISP)', f"{c_probs.get('isp_ratio', 1.0):.2f}"))
+                    values.append(('Độ lệch trục translation (mm)', f"{c_probs.get('translation_mm', 0.0):.1f}"))
+                    values.append(('Tỷ lệ xẹp tương đối R_collapse', f"{c_probs.get('relative_collapse_ratio', 1.0):.2f}"))
+                    if ao.get('modifiers'):
+                        values.append(('Cảnh báo Modifiers', '; '.join(ao['modifiers'])))
                 f, mc = report['features'], report['monte_carlo_area']
-                values = [('Diện tích đếm pixel (mm²)', f['area_mm2']), ('Cao/rộng theo mặt phẳng', f['height_width_ratio']),
+                values += [('Diện tích đếm pixel (mm²)', f['area_mm2']), ('Cao/rộng theo mặt phẳng', f['height_width_ratio']),
                           ('Tỷ lệ lấp đầy hộp bao', f['fill_ratio']), ('Solidity', f['solidity']),
                           ('Góc ellipse (độ)', f['ellipse']['angle_deg']), ('Tỷ lệ trục ellipse', f['ellipse']['axis_ratio'])]
                 for name, key in (('Chiều cao trước (mm)', 'anterior_mm'), ('Chiều cao giữa (mm)', 'middle_mm'),
@@ -768,19 +1387,22 @@ class BodyReviewDialog(QDialog):
                 self.table.setRowCount(len(values))
                 for row, (name, value) in enumerate(values):
                     self.table.setItem(row, 0, QTableWidgetItem(name))
-                    self.table.setItem(row, 1, QTableWidgetItem(f'{value:,.4f}' if isinstance(value, (float, int)) else value))
+                    self.table.setItem(row, 1, QTableWidgetItem(f'{value:,.4f}' if isinstance(value, (float, int)) else str(value)))
         else:
-            for ax in axes:
-                ax.set_axis_off()
-            self.body_ax.text(.5, .5, 'Áp dụng mặt phẳng để chọn vùng mới', ha='center', va='center', transform=self.body_ax.transAxes)
+            for ax in (self.body_ax, self.clean_ax, self.convergence_ax):
+                ax.set_facecolor('#1e1e2e')
+                ax.axis('off')
+            self.body_ax.text(.5, .5, 'Áp dụng mặt phẳng để chọn vùng mới', ha='center', va='center',
+                              transform=self.body_ax.transAxes, color='#e0e0e0')
         self.canvas.draw_idle()
         self.sync()
+        self.update_level_navigator_styles()
 
     def state_token(self):
         if not self.session:
             return None
         return (self.session._signature(), self.session.reviewed, self.samples.value(), self.seed.text(),
-                json.dumps(self.log_config(), sort_keys=True))
+                json.dumps(self.log_config(), sort_keys=True), self.session.doctor_confirmed_class)
 
     def is_dirty(self):
         return self.state_token() != self.saved_state

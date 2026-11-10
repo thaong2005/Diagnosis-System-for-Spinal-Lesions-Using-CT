@@ -321,6 +321,81 @@ class BodyReviewUITests(unittest.TestCase):
         self.assertFalse(dialog.session.reviewed)
         dialog.close()
 
+    def test_overlay_toggles_and_quick_clean_shortcut(self):
+        """Test toggling overlay layers and H/Space quick clean comparison."""
+        from PySide6.QtCore import Qt
+        dialog = self.dialog()
+        self.draw(dialog)
+
+        # 1. Overlay checkboxes
+        self.assertTrue(dialog.toggle_mask.isChecked())
+        self.assertTrue(dialog.toggle_landmarks.isChecked())
+        self.assertTrue(dialog.toggle_aospine.isChecked())
+
+        dialog.toggle_mask.setChecked(False)
+        dialog.toggle_landmarks.setChecked(False)
+        dialog.toggle_aospine.setChecked(False)
+        self.assertFalse(dialog.hide_overlays_temp)
+
+        # 2. Quick clean button
+        dialog.toggle_clean_quick.setChecked(True)
+        self.assertTrue(dialog.hide_overlays_temp)
+        dialog.toggle_clean_quick.setChecked(False)
+        self.assertFalse(dialog.hide_overlays_temp)
+
+        # 3. Key press H and Space
+        QTest.keyClick(dialog, Qt.Key_H)
+        self.assertTrue(dialog.toggle_clean_quick.isChecked())
+        self.assertTrue(dialog.hide_overlays_temp)
+
+        QTest.keyClick(dialog, Qt.Key_Space)
+        self.assertFalse(dialog.toggle_clean_quick.isChecked())
+        self.assertFalse(dialog.hide_overlays_temp)
+
+        dialog.close()
+
+    def test_doctor_override_and_navigator_switch(self):
+        """Test doctor confirmation dropdown and spine level navigator."""
+        dialog = self.dialog()
+        self.draw(dialog)
+
+        # 1. Doctor override combo
+        self.assertIsNotNone(dialog.doctor_override_combo)
+        self.assertIsNone(dialog.session.doctor_confirmed_class)
+
+        dialog.doctor_override_combo.setCurrentText('A3')
+        self.assertEqual(dialog.session.doctor_confirmed_class, 'A3')
+        self.assertIn('BS: A3', dialog.aospine_badge.text())
+        self.assertTrue(dialog.is_dirty())
+
+        # Reset to AI recommendation
+        dialog.doctor_override_combo.setCurrentText('Theo gợi ý AI')
+        self.assertIsNone(dialog.session.doctor_confirmed_class)
+
+        # 2. Spine level navigator
+        self.assertIn('L1', dialog.available_levels)
+        self.assertIn('L1', dialog.level_buttons)
+
+        # Level switch
+        if len(dialog.available_levels) > 1:
+            target_level = [lvl for lvl in dialog.available_levels if lvl != 'L1'][0]
+            # Add 6 landmarks to L1
+            dialog.start_landmarks()
+            for x, y in ((12, 27), (12, 12), (20, 29), (20, 12), (28, 30), (28, 12)):
+                dialog.click(SimpleNamespace(inaxes=dialog.body_ax, xdata=x, ydata=y, button=1))
+            self.assertEqual(len(dialog.session.landmarks), 6)
+
+            dialog.switch_to_level(target_level)
+            self.assertEqual(dialog.level, target_level)
+
+            # Switch back to L1 and verify content is NOT lost
+            dialog.switch_to_level('L1')
+            self.assertEqual(dialog.level, 'L1')
+            self.assertEqual(len(dialog.session.landmarks), 6)
+            self.assertTrue(dialog.session.mask.any())
+
+        dialog.close()
+
 
 if __name__ == '__main__':
     unittest.main()
