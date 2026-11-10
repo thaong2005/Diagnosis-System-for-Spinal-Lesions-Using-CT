@@ -29,3 +29,5 @@ dist/
 # Workspace theo phiên làm việc: bản nháp, ảnh, log và báo cáo cục bộ.
 # Chỉ đưa báo cáo đã chọn lọc vào docs/reports/.
 /20??-??-??/
+/outputs/
+Bao_cao_*.md
