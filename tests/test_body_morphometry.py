@@ -251,9 +251,9 @@ class SessionTests(unittest.TestCase):
             save_session(session, root)
             self.assertFalse((root/'measurements.json').exists())
             self.assertFalse(load_session(root, source).reviewed)
-            document = json.loads((root/'region.json').read_text())
+            document = json.loads((root/'region.json').read_text(encoding='utf-8'))
             document['plane']['origin_lps_mm'][1] += 1
-            (root/'region.json').write_text(json.dumps(document))
+            (root/'region.json').write_text(json.dumps(document), encoding='utf-8')
             with self.assertRaisesRegex(ValueError, 'changed'):
                 load_session(root, source)
 
@@ -281,9 +281,9 @@ class SessionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)/'legacy'
             save_session(session, root, samples=700, seed=1234)
-            document = json.loads((root/'region.json').read_text())
+            document = json.loads((root/'region.json').read_text(encoding='utf-8'))
             document.pop('area_sampling')
-            (root/'region.json').write_text(json.dumps(document))
+            (root/'region.json').write_text(json.dumps(document), encoding='utf-8')
             loaded = load_session(root, source)
             self.assertEqual(loaded.sampling_config, dict(samples=700, seed=1234))
             self.assertIsNone(loaded.result)
@@ -315,7 +315,7 @@ class SessionTests(unittest.TestCase):
                     '--output', str(root/'evaluation.json'), '--tolerance-mm', '5']
             with patch.object(sys, 'argv', argv):
                 self.assertEqual(evaluate(), 0)
-            report = json.loads((root/'evaluation.json').read_text())
+            report = json.loads((root/'evaluation.json').read_text(encoding='utf-8'))
             self.assertEqual(report['regions'], 1)
             self.assertEqual(report['per_region'][0]['level'], 'L1')
             self.assertNotIn(str(root), json.dumps(report))
@@ -339,7 +339,7 @@ class SessionTests(unittest.TestCase):
             argv = ['body', '--input', str(path), '--region', str(root/'region'), '--output', str(root/'recomputed'), '--samples', '500']
             with patch.object(sys, 'argv', argv):
                 self.assertEqual(main(), 0)
-            report = json.loads((root/'recomputed/measurements.json').read_text())
+            report = json.loads((root/'recomputed/measurements.json').read_text(encoding='utf-8'))
             self.assertEqual(report['monte_carlo_area']['samples'], 500)
             with patch.object(sys, 'argv', argv), self.assertRaises(SystemExit):
                 main()
@@ -933,6 +933,94 @@ class AutoVsManualEvaluationCLITests(unittest.TestCase):
             with patch.object(sys, 'argv', argv_draft):
                 self.assertEqual(eval_main(), 1)
             self.assertFalse(out_json.exists())
+
+
+class NormalizationUpgradeTests(unittest.TestCase):
+    def test_normalize_region_preserves_anatomical_orientation_on_square_or_collapsed_body(self):
+        # A nearly square or compressed body where moments alone could flip 90 or 180 degrees
+        mask = np.zeros((50, 50), bool)
+        mask[15:35, 15:35] = True
+        ct = np.full((50, 50), 200.0, dtype=np.float32)
+        spacing = (1.0, 1.0)
+
+        # 6 anatomical landmarks: AS, AI, MS, MI, PS, PI
+        # Anterior is at x=18, Posterior is at x=32
+        # Inferior is at y=18, Superior is at y=32
+        landmarks = [
+            [18.0, 32.0],  # AS
+            [18.0, 18.0],  # AI
+            [25.0, 32.0],  # MS
+            [25.0, 18.0],  # MI
+            [32.0, 32.0],  # PS
+            [32.0, 18.0],  # PI
+        ]
+
+        result = normalize_region(ct, mask, spacing, landmarks_xy_mm=landmarks)
+        transform = np.array(result['transform']['output_pixel_to_plane_mm'])
+        A = transform[:2, :2]
+
+        # Axis 0 (column/horizontal in normalized image) must point Anterior -> Posterior (positive x direction)
+        self.assertGreater(A[0, 0], 0.0)
+        # Axis 1 (row/vertical in normalized image) must point Inferior -> Superior (positive y direction)
+        self.assertGreater(A[1, 1], 0.0)
+
+        # Invertibility of normalized landmarks mapping
+        norm_lm = result['transform']['normalized_landmarks_px']
+        self.assertEqual(len(norm_lm), 6)
+        for p_px, p_orig in zip(norm_lm, landmarks):
+            reconstructed = transform @ [p_px[0], p_px[1], 1.0]
+            np.testing.assert_allclose(reconstructed[:2], p_orig, atol=1e-5)
+
+        # Coordinate ordering in 256x256 normalized space:
+        # Anterior landmarks (AS, AI: idx 0, 1) must be to the left of Posterior (PS, PI: idx 4, 5)
+        self.assertLess(norm_lm[0][0], norm_lm[4][0])
+        self.assertLess(norm_lm[1][0], norm_lm[5][0])
+        # Inferior landmarks (AI, MI, PI: idx 1, 3, 5) must be below Superior (AS, MS, PS: idx 0, 2, 4)
+        self.assertLess(norm_lm[1][1], norm_lm[0][1])
+        self.assertLess(norm_lm[3][1], norm_lm[2][1])
+        self.assertLess(norm_lm[5][1], norm_lm[4][1])
+
+    def test_true_25d_parasagittal_extraction_in_session(self):
+        from spinal_ct.body_region import sample_parasagittal_slices
+        source, labels, session = session_fixture()
+
+        # 1. Fallback mode (parasagittal_slices is None)
+        self.assertIsNone(session.parasagittal_slices)
+        fb_rois = session.extract_dualstream_rois()
+        self.assertIsNotNone(fb_rois)
+        body_fb, arch_fb = fb_rois
+        self.assertEqual(body_fb.shape, (5, 128, 128))
+
+        # 2. True 2.5D mode with sampled parasagittal slices
+        slices = sample_parasagittal_slices(source, session.plane, offsets_mm=(-4.0, 4.0))
+        self.assertEqual(len(slices), 2)
+        session.parasagittal_slices = slices
+        session._cached_rois_sig = None
+        session._cached_rois = None
+
+        true_rois = session.extract_dualstream_rois()
+        self.assertIsNotNone(true_rois)
+        body_true, arch_true = true_rois
+        self.assertEqual(body_true.shape, (5, 128, 128))
+
+        # Channel 1 & Channel 2 in true 2.5D use real CT bone window slices, not Sobel gradient
+        self.assertFalse(np.allclose(body_true[1], body_fb[1]))
+        self.assertFalse(np.allclose(body_true[2], body_fb[2]))
+
+    def test_draw_normalized_renders_valid_artists(self):
+        from matplotlib.figure import Figure
+        from spinal_ct.morphometry_render import draw_normalized
+        source, labels, session = session_fixture()
+        session.set_landmarks([[12.0, 28.0], [12.0, 12.0], [21.0, 28.0], [21.0, 12.0], [30.0, 28.0], [30.0, 12.0]])
+
+        fig = Figure()
+        ax = fig.add_subplot(111)
+        draw_normalized(ax, session, dark_theme=True)
+
+        self.assertGreater(len(ax.images), 0)       # CT imshow
+        self.assertGreater(len(ax.collections), 0)  # Mask contour
+        self.assertGreater(len(ax.lines), 0)        # Centroid + Landmarks
+        self.assertGreater(len(ax.texts), 0)        # Direction annotations & labels
 
 
 if __name__ == '__main__':

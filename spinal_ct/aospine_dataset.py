@@ -63,6 +63,7 @@ def extract_body_canal_roi_25d(
     target_size: tuple[int, int] = (128, 128),
     canal_depth_mm: float = 12.0,
     vertical_margin_mm: float = 6.0,
+    parasagittal_slices: list[np.ndarray] | tuple[np.ndarray, np.ndarray] | None = None,
 ) -> np.ndarray:
     """Extract 5-channel 2.5D Body + Canal ROI centered on vertebral body and spinal canal.
 
@@ -150,6 +151,11 @@ def extract_body_canal_roi_25d(
         ch2_full = apply_ct_window(ct_volume_or_slice[:, :, x_right], BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
         ch1 = _resize_2d(ch1_full[r_start:r_end, c_start:c_end], target_size, is_mask=False)
         ch2 = _resize_2d(ch2_full[r_start:r_end, c_start:c_end], target_size, is_mask=False)
+    elif parasagittal_slices is not None and len(parasagittal_slices) >= 2:
+        ch1_full = apply_ct_window(parasagittal_slices[0], BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
+        ch2_full = apply_ct_window(parasagittal_slices[1], BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
+        ch1 = _resize_2d(ch1_full[r_start:r_end, c_start:c_end], target_size, is_mask=False)
+        ch2 = _resize_2d(ch2_full[r_start:r_end, c_start:c_end], target_size, is_mask=False)
     else:
         # Fallback for 2D: Sobel gradient edges
         grad_r = np.abs(np.diff(ch0_full, axis=0, prepend=ch0_full[:1, :]))
@@ -194,6 +200,7 @@ def extract_posterior_arch_roi_25d(
     slice_x_index: int | None = None,
     target_size: tuple[int, int] = (128, 128),
     margin_mm: float = 6.0,
+    parasagittal_slices: list[np.ndarray] | tuple[np.ndarray, np.ndarray] | None = None,
 ) -> np.ndarray:
     """Extract 5-channel 2.5D Posterior Arch ROI covering spinous processes and tension band.
 
@@ -279,6 +286,11 @@ def extract_posterior_arch_roi_25d(
         x_right = int(np.clip(mid_x + dx_vox, 0, x_dim - 1))
         ch1_full = apply_ct_window(ct_volume_or_slice[:, :, x_left], BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
         ch2_full = apply_ct_window(ct_volume_or_slice[:, :, x_right], BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
+        ch1 = _resize_2d(ch1_full[r_start:r_end, c_start:c_end], target_size, is_mask=False)
+        ch2 = _resize_2d(ch2_full[r_start:r_end, c_start:c_end], target_size, is_mask=False)
+    elif parasagittal_slices is not None and len(parasagittal_slices) >= 2:
+        ch1_full = apply_ct_window(parasagittal_slices[0], BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
+        ch2_full = apply_ct_window(parasagittal_slices[1], BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
         ch1 = _resize_2d(ch1_full[r_start:r_end, c_start:c_end], target_size, is_mask=False)
         ch2 = _resize_2d(ch2_full[r_start:r_end, c_start:c_end], target_size, is_mask=False)
     else:

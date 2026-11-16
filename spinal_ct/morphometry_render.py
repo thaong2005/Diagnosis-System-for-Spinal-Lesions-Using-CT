@@ -436,16 +436,60 @@ def draw_clean_reference(ax, session, *, dark_theme: bool = True) -> None:
     ax.set_aspect('equal')
 
 
-def draw_normalized(ax, session) -> None:
-    """Retained for backward compatibility."""
-    if not session.mask.any():
-        ax.text(0.5, 0.5, 'Vẽ vùng thân đốt để chuẩn hóa', ha='center', va='center', transform=ax.transAxes)
-        ax.set_axis_off()
+def draw_normalized(ax, session, *, dark_theme: bool = True) -> None:
+    """Render canonical 256x256 normalized vertebra region with bone window, mask contour, centroid and landmarks."""
+    bg_color = '#1e1e2e' if dark_theme else '#252525'
+    text_color = '#e0e0e0' if dark_theme else '#233c4b'
+    ax.set_facecolor(bg_color)
+
+    if session is None or session.mask is None or not session.mask.any():
+        ax.text(0.5, 0.5, 'Vẽ vùng thân đốt để chuẩn hóa', ha='center', va='center',
+                transform=ax.transAxes, color=text_color, fontsize=10)
+        ax.axis('off')
         return
-    normalized = normalize_region(session.ct, session.mask, session.plane.spacing_xy_mm)
-    ax.imshow(normalized['ct'], origin='lower', cmap='gray', vmin=-500, vmax=1500)
-    ax.contour(normalized['mask'], levels=[0.5], colors=['#3bf4b0'], linewidths=1)
-    ax.set(title='256 × 256 · giữ tỷ lệ', xlabel='Pixel', ylabel='Pixel')
+
+    landmarks = getattr(session, 'landmarks', None)
+    normalized = normalize_region(session.ct, session.mask, session.plane.spacing_xy_mm, landmarks_xy_mm=landmarks)
+    norm_ct = normalized['ct']
+    norm_mask = normalized['mask']
+    transform_info = normalized['transform']
+
+    # Display normalized CT on standard bone window
+    ax.imshow(norm_ct, origin='lower', cmap='gray', vmin=-500, vmax=1500)
+
+    # Contour of normalized body mask
+    ax.contour(norm_mask, levels=[0.5], colors=['#3bf4b0'], linewidths=1.5)
+
+    # Centroid at center of normalized grid
+    ax.plot([127.5], [127.5], '+', color='#ffd166', markersize=10, markeredgewidth=2, label='Tâm khối')
+
+    # Draw orientation indicators
+    ax.annotate('', xy=(240, 16), xytext=(200, 16),
+                arrowprops=dict(arrowstyle="->", color='#06d6a0', lw=1.5))
+    ax.text(242, 16, 'Sau (P)', color='#06d6a0', fontsize=8, va='center', fontweight='bold')
+    ax.annotate('', xy=(16, 240), xytext=(16, 200),
+                arrowprops=dict(arrowstyle="->", color='#118ab2', lw=1.5))
+    ax.text(16, 246, 'Trên (S)', color='#118ab2', fontsize=8, ha='center', fontweight='bold')
+
+    # Draw normalized 6 landmarks if present
+    norm_lm = transform_info.get('normalized_landmarks_px') or []
+    lm_colors = ['#06d6a0', '#118ab2', '#ffd166', '#f78c6b', '#ef476f', '#b5179e']
+    lm_labels = ['AS', 'AI', 'MS', 'MI', 'PS', 'PI']
+    if len(norm_lm) == 6:
+        for idx, (pt, col, lbl) in enumerate(zip(norm_lm, lm_colors, lm_labels)):
+            ax.plot(pt[0], pt[1], 'o', color=col, markersize=5, markeredgewidth=1, markeredgecolor='white')
+            dx = 5 if 'P' in lbl else -15
+            dy = 5 if 'S' in lbl else -12
+            ax.text(pt[0] + dx, pt[1] + dy, lbl, color=col, fontsize=7, fontweight='bold')
+
+    step_mm = transform_info.get('spacing_mm', 1.0)
+    title_str = f"Chuẩn hóa 256×256 · {step_mm:.3f} mm/px"
+    ax.set_title(title_str, color=text_color, fontsize=10, fontweight='bold')
+    ax.set_xlabel('Pixel (Trước ➔ Sau)', color=text_color, fontsize=8)
+    ax.set_ylabel('Pixel (Dưới ➔ Trên)', color=text_color, fontsize=8)
+    ax.tick_params(colors=text_color, labelsize=7)
+    for spine in ax.spines.values():
+        spine.set_color('#444466')
     ax.set_aspect('equal')
 
 

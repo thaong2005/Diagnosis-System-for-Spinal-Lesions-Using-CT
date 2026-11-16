@@ -403,6 +403,12 @@ class BodyReviewDialog(QDialog):
         self.toggle_clean_quick.setToolTip('Nhấn giữ hoặc bấm để ẩn nhanh toàn bộ lớp phủ, xem CT gốc')
         self.toggle_clean_quick.toggled.connect(self.toggle_quick_clean)
         toolbar_layout.addWidget(self.toggle_clean_quick)
+
+        self.toggle_norm_view = QPushButton('📐 Xem chuẩn hóa 256×256')
+        self.toggle_norm_view.setCheckable(True)
+        self.toggle_norm_view.setToolTip('Chuyển đổi khung giữa giữa CT gốc tham chiếu và vùng thân đốt chuẩn hóa 256×256')
+        self.toggle_norm_view.toggled.connect(self.redraw)
+        toolbar_layout.addWidget(self.toggle_norm_view)
         toolbar_layout.addStretch()
         layout.addWidget(toolbar_widget)
 
@@ -559,8 +565,15 @@ class BodyReviewDialog(QDialog):
             plane = propose_plane(self.source, self.labels, label_id, offset_mm=self.offset.value(),
                                   yaw_deg=self.yaw.value(), tilt_deg=self.tilt.value())
             ct, valid, hint = sample_plane(self.source, plane, self.labels, label_id)
+            parasagittal_slices = None
+            if hasattr(self.source, 'GetSpacing'):
+                try:
+                    from spinal_ct.body_region import sample_parasagittal_slices
+                    parasagittal_slices = sample_parasagittal_slices(self.source, plane)
+                except Exception:
+                    parasagittal_slices = None
             session = BodySession(self.fingerprint, self.level, self.source_kind, plane, ct, valid, hint,
-                                  age_group=self.age.currentData())
+                                  age_group=self.age.currentData(), parasagittal_slices=parasagittal_slices)
             self.stop_editing()
             self.session = session
             self.pending_plane = False
@@ -721,7 +734,7 @@ class BodyReviewDialog(QDialog):
         if not self.session:
             return
         chosen = self.doctor_override_combo.currentText()
-        if chosen == 'Theo gợi ý AI':
+        if chosen in ('Theo gợi ý AI', 'Model gợi ý'):
             self.session.doctor_confirmed_class = None
         else:
             self.session.doctor_confirmed_class = chosen
@@ -792,8 +805,15 @@ class BodyReviewDialog(QDialog):
             label_id = LEVELS.index(lvl) + 1
             plane = propose_plane(self.source, self.labels, label_id, offset_mm=0.0, yaw_deg=0.0, tilt_deg=0.0)
             ct, valid, hint = sample_plane(self.source, plane, self.labels, label_id)
+            parasagittal_slices = None
+            if hasattr(self.source, 'GetSpacing'):
+                try:
+                    from spinal_ct.body_region import sample_parasagittal_slices
+                    parasagittal_slices = sample_parasagittal_slices(self.source, plane)
+                except Exception:
+                    parasagittal_slices = None
             sess = BodySession(self.fingerprint, lvl, self.source_kind, plane, ct, valid, hint,
-                               age_group=self.age.currentData())
+                               age_group=self.age.currentData(), parasagittal_slices=parasagittal_slices)
             try:
                 sess.auto_populate(approve=False)
             except Exception:
@@ -1319,8 +1339,13 @@ class BodyReviewDialog(QDialog):
         self.figure.set_facecolor('#1e1e2e')
         gs = self.figure.add_gridspec(1, 3)
         self.body_ax = self.figure.add_subplot(gs[0, 0])
-        self.clean_ax = self.figure.add_subplot(gs[0, 1], sharex=self.body_ax, sharey=self.body_ax)
-        self.normalized_ax = self.clean_ax
+        show_norm = getattr(self, 'toggle_norm_view', None) and self.toggle_norm_view.isChecked()
+        if show_norm:
+            self.clean_ax = self.figure.add_subplot(gs[0, 1])
+            self.normalized_ax = self.clean_ax
+        else:
+            self.clean_ax = self.figure.add_subplot(gs[0, 1], sharex=self.body_ax, sharey=self.body_ax)
+            self.normalized_ax = self.clean_ax
         self.convergence_ax = self.figure.add_subplot(gs[0, 2])
         self.table.setRowCount(0)
 
@@ -1340,7 +1365,10 @@ class BodyReviewDialog(QDialog):
                 show_landmarks=show_landmarks,
                 dark_theme=True,
             )
-            draw_clean_reference(self.clean_ax, self.session, dark_theme=True)
+            if show_norm:
+                draw_normalized(self.normalized_ax, self.session, dark_theme=True)
+            else:
+                draw_clean_reference(self.clean_ax, self.session, dark_theme=True)
             candidates = (self.session.candidates or {}).get('candidates', [])
             index = self.blob_choices.currentIndex()
             if self.show_blobs.isChecked() and not self.hide_overlays_temp and 0 <= index < len(candidates):

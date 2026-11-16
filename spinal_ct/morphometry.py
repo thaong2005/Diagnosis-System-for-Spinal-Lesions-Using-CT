@@ -473,33 +473,37 @@ def compute_endplate_deformities(
 
 
 def is_vertebra_fov_truncated(session_or_data) -> bool:
-    """Check if vertebra is truncated at the CT field of view boundary (< 10 mm height or < 150 mm2 area)."""
+    """Check if vertebra is truncated at the CT field of view boundary (< 8 mm height or < 200 mm2 area)."""
     if hasattr(session_or_data, 'landmarks') and getattr(session_or_data, 'landmarks', None) is not None:
         lm = session_or_data.landmarks
-        if len(lm) == 6:
-            plane = getattr(session_or_data, 'plane', None)
-            if plane is not None:
-                h = measure_heights(lm, plane)
-                max_h = max(h.get('anterior_mm', 0.0), h.get('middle_mm', 0.0), h.get('posterior_mm', 0.0))
-                if 0.0 < max_h < 10.0:
-                    return True
         mask = getattr(session_or_data, 'mask', None)
         plane = getattr(session_or_data, 'plane', None)
+        area_mm2 = 999.0
         if mask is not None and mask.any() and plane is not None:
             sx, sy = getattr(plane, 'spacing_xy_mm', (1.0, 1.0))
             area_mm2 = float(np.sum(mask)) * sx * sy
-            if area_mm2 < 150.0:
+            if 0.0 < area_mm2 < 200.0:
                 return True
+
+        if len(lm) == 6:
+            if plane is not None:
+                h = measure_heights(lm, plane)
+                ha = h.get('anterior_mm', 0.0)
+                hm = h.get('middle_mm', 0.0)
+                hp = h.get('posterior_mm', 0.0)
+                max_h = max(ha, hm, hp)
+                if (0.0 < max_h < 8.0) or (0.0 < max_h < 12.0 and area_mm2 < 250.0):
+                    return True
     elif isinstance(session_or_data, dict):
         h = session_or_data.get('heights') or {}
         ha = h.get('anterior_mm', 0.0)
         hm = h.get('middle_mm', 0.0)
         hp = h.get('posterior_mm', 0.0)
         max_h = max(ha, hm, hp)
-        if 0.0 < max_h < 10.0:
-            return True
         area = session_or_data.get('area_mm2', 999.0)
-        if area < 150.0:
+        if 0.0 < area < 200.0:
+            return True
+        if (0.0 < max_h < 8.0) or (0.0 < max_h < 12.0 and area < 250.0):
             return True
     return False
 
@@ -927,9 +931,80 @@ def compute_intervertebral_metrics(vertebrae_data: list[dict],
             return np.mean(item_parsed['landmarks_lps'], axis=0)
         return np.array(item_parsed['centroid_xy'] + [0.0], dtype=float)
 
+    def _calc_kinematic_gap(item1: dict, item2: dict) -> tuple[float, float]:
+        """Compute kinematically compensated interspinous gap between adjacent vertebrae.
+
+        Compensates for angular divergence caused by normal sagittal curvature (kyphosis/lordosis)
+        or anterior wedge deformity when the posterior disc space and wall are intact.
+        In true flexion-distraction (B2), posterior disc distraction prevents compensation.
+        """
+        p1 = _get_tip_pt(item1)
+        p2 = _get_tip_pt(item2)
+        if p1 is None or p2 is None:
+            return 0.0, 1.0
+
+        d_sp = float(np.linalg.norm(p1 - p2))
+        c1 = _get_body_center(item1)
+        c2 = _get_body_center(item2)
+        d_b = float(np.linalg.norm(c1 - c2))
+        if d_sp <= 0 or d_b <= 0:
+            return d_sp, 1.0
+
+        # Determine cranial-caudal ordering
+        lvl1 = item1['raw'].get('level', '')
+        lvl2 = item2['raw'].get('level', '')
+        if lvl1 in LEVELS and lvl2 in LEVELS:
+            v_sup, v_inf = (item1, item2) if LEVELS.index(lvl1) < LEVELS.index(lvl2) else (item2, item1)
+        elif len(c1) > 2 and len(c2) > 2 and abs(c1[2] - c2[2]) > 1e-3:
+            v_sup, v_inf = (item1, item2) if c1[2] > c2[2] else (item2, item1)
+        else:
+            v_sup, v_inf = (item1, item2) if c1[1] > c2[1] else (item2, item1)
+
+        # Inferior endplate of v_sup: AI (1) to PI (5)
+        # Superior endplate of v_inf: AS (0) to PS (4)
+        if v_sup.get('landmarks_lps') and v_inf.get('landmarks_lps'):
+            lm_sup = v_sup['landmarks_lps']
+            lm_inf = v_inf['landmarks_lps']
+            as_sup, ai_sup = np.array(lm_sup[0], dtype=float), np.array(lm_sup[1], dtype=float)
+            ps_sup, pi_sup = np.array(lm_sup[4], dtype=float), np.array(lm_sup[5], dtype=float)
+            as_inf, ai_inf = np.array(lm_inf[0], dtype=float), np.array(lm_inf[1], dtype=float)
+            ps_inf, pi_inf = np.array(lm_inf[4], dtype=float), np.array(lm_inf[5], dtype=float)
+        else:
+            as_sup, ai_sup = np.array(v_sup['as_pt'], dtype=float), np.array(v_sup['ai_pt'], dtype=float)
+            ps_sup, pi_sup = np.array(v_sup['ps_pt'], dtype=float), np.array(v_sup['pi_pt'], dtype=float)
+            as_inf, ai_inf = np.array(v_inf['as_pt'], dtype=float), np.array(v_inf['ai_pt'], dtype=float)
+            ps_inf, pi_inf = np.array(v_inf['ps_pt'], dtype=float), np.array(v_inf['pi_pt'], dtype=float)
+
+        u_sup = pi_sup - ai_sup
+        u_inf = ps_inf - as_inf
+        len_u = float(np.linalg.norm(u_sup))
+        len_l = float(np.linalg.norm(u_inf))
+        delta_th = 0.0
+        if len_u > 1e-4 and len_l > 1e-4:
+            cos_th = float(np.clip(np.dot(u_sup, u_inf) / (len_u * len_l), -1.0, 1.0))
+            delta_th = float(np.arccos(cos_th))
+
+        d_ant = float(np.linalg.norm(ai_sup - as_inf))
+        d_post = float(np.linalg.norm(pi_sup - ps_inf))
+
+        l_sup = _spinous_ap_length(v_sup)
+        l_inf = _spinous_ap_length(v_inf)
+        l_arm = 0.5 * (l_sup + l_inf) if (l_sup is not None and l_inf is not None) else 45.0
+
+        # Posterior disc space check:
+        # In B2 distraction, posterior disc and ligament complex are torn and widened (d_post > 1.35 * d_ant AND d_post > 7.0mm)
+        is_posterior_disc_intact = (d_post <= 1.35 * max(d_ant, 1.0) or d_post <= 6.5)
+
+        delta_ang = 0.0
+        if is_posterior_disc_intact and delta_th > 0.0:
+            delta_ang = l_arm * np.sin(delta_th)
+
+        d_sp_eff = max(d_sp - delta_ang, d_b * 0.70)
+        norm_g = d_sp_eff / max(d_b, 15.0)
+        return d_sp, norm_g
+
     # Step 1: Compute pairwise adjacent interspinous distances to establish baseline
-    pair_gaps_t: list[float] = []
-    pair_gaps_l: list[float] = []
+    pair_gaps: list[float] = []
     for i in range(n):
         if parsed[i].get('is_fov_truncated') or parsed[i]['raw'].get('level') == 'S1':
             continue
@@ -937,32 +1012,21 @@ def compute_intervertebral_metrics(vertebrae_data: list[dict],
         if inf_neigh and not inf_neigh.get('is_fov_truncated') and inf_neigh['raw'].get('level') != 'S1':
             if not _is_spinous_pair_reliable(parsed[i], inf_neigh):
                 continue
-            p_curr = _get_tip_pt(parsed[i])
-            p_inf = _get_tip_pt(inf_neigh)
             q_curr = parsed[i]['raw'].get('q_seg', 1.0)
             q_inf = inf_neigh['raw'].get('q_seg', 1.0)
-            if p_curr is not None and p_inf is not None and q_curr >= 0.50 and q_inf >= 0.50:
-                d_sp = float(np.linalg.norm(p_curr - p_inf))
-                d_b = float(np.linalg.norm(_get_body_center(parsed[i]) - _get_body_center(inf_neigh)))
-                if d_sp > 0 and d_b > 0:
-                    norm_g = d_sp / max(d_b, 15.0)
-                    lvl_c = parsed[i]['raw'].get('level', '')
-                    if str(lvl_c).startswith('L'):
-                        pair_gaps_l.append(norm_g)
-                    else:
-                        pair_gaps_t.append(norm_g)
+            if q_curr >= 0.50 and q_inf >= 0.50:
+                d_sp, norm_g = _calc_kinematic_gap(parsed[i], inf_neigh)
+                if d_sp > 0 and norm_g > 0:
+                    pair_gaps.append(norm_g)
 
-    def _get_ref_isp(lvl_str: str) -> float:
-        if baseline_isp_mm is not None and baseline_isp_mm > 0:
-            return float(baseline_isp_mm)
-        gaps = pair_gaps_l if str(lvl_str).startswith('L') else pair_gaps_t
-        if not gaps:
-            gaps = pair_gaps_l + pair_gaps_t
-        if len(gaps) >= 3:
-            return float(np.median(gaps))
-        elif len(gaps) > 0:
-            return float(np.min(gaps))
-        return 1.0
+    if baseline_isp_mm is not None and baseline_isp_mm > 0:
+        ref_isp = float(baseline_isp_mm)
+    elif len(pair_gaps) >= 3:
+        ref_isp = float(np.median(pair_gaps))
+    elif len(pair_gaps) > 0:
+        ref_isp = float(np.min(pair_gaps))
+    else:
+        ref_isp = 1.0
 
     # Step 2: Helper for disc metrics between superior and inferior vertebra
     def _calc_disc(v_sup: dict, v_inf: dict) -> tuple[float, float]:
@@ -1112,27 +1176,22 @@ def compute_intervertebral_metrics(vertebrae_data: list[dict],
         # a) Interspinous distance ratio (isp_ratio)
         p_curr = _get_tip_pt(curr)
         q_curr = curr['raw'].get('q_seg', 1.0)
-        norm_adjacent: list[float] = []
-        if p_curr is not None and q_curr >= 0.50 and not curr.get('is_fov_truncated') and curr['raw'].get('level') != 'S1':
-            c_curr = _get_body_center(curr)
+        adj_ratios: list[float] = []
+        lvl_curr = str(curr['raw'].get('level', ''))
+        if p_curr is not None and q_curr >= 0.50 and not curr.get('is_fov_truncated') and lvl_curr != 'S1':
             if v_sup and v_sup['raw'].get('q_seg', 1.0) >= 0.50 and v_sup['raw'].get('level') != 'S1':
                 if _is_spinous_pair_reliable(curr, v_sup):
-                    p_sup = _get_tip_pt(v_sup)
-                    if p_sup is not None:
-                        d_sp = float(np.linalg.norm(p_curr - p_sup))
-                        d_b = float(np.linalg.norm(c_curr - _get_body_center(v_sup)))
-                        norm_adjacent.append(d_sp / max(d_b, 15.0))
+                    _, norm_g = _calc_kinematic_gap(curr, v_sup)
+                    if ref_isp > 1e-3:
+                        adj_ratios.append(norm_g / ref_isp)
             if v_inf and v_inf['raw'].get('q_seg', 1.0) >= 0.50 and v_inf['raw'].get('level') != 'S1':
                 if _is_spinous_pair_reliable(curr, v_inf):
-                    p_inf = _get_tip_pt(v_inf)
-                    if p_inf is not None:
-                        d_sp = float(np.linalg.norm(p_curr - p_inf))
-                        d_b = float(np.linalg.norm(c_curr - _get_body_center(v_inf)))
-                        norm_adjacent.append(d_sp / max(d_b, 15.0))
+                    _, norm_g = _calc_kinematic_gap(curr, v_inf)
+                    if ref_isp > 1e-3:
+                        adj_ratios.append(norm_g / ref_isp)
 
-        ref_isp = _get_ref_isp(curr['raw'].get('level', ''))
-        if norm_adjacent and ref_isp > 1e-3:
-            isp_ratio = float(max(norm_adjacent) / ref_isp)
+        if adj_ratios:
+            isp_ratio = float(max(adj_ratios))
         else:
             isp_ratio = 1.0
 
@@ -1221,7 +1280,11 @@ def compute_intervertebral_metrics(vertebrae_data: list[dict],
             rel_collapse = 1.0
 
         out = dict(curr['raw'])
+        ha_val = float(curr['heights'].get('anterior_posterior_ratio', 1.0))
+        hm_val = float(curr['heights'].get('middle_posterior_ratio', 1.0))
         out.update({
+            'ha_hp_ratio': round(ha_val, 3),
+            'hm_hp_ratio': round(hm_val, 3),
             'isp_ratio': round(isp_ratio, 3),
             'anterior_disc_angle_deg': round(ant_disc_angle, 2),
             'disc_opening_ratio': round(disc_open_ratio, 3),
@@ -1235,6 +1298,39 @@ def compute_intervertebral_metrics(vertebrae_data: list[dict],
         results.append(out)
 
     return results
+
+
+_INFERENCE_ENGINE = None
+
+
+def get_aospine_inference_engine(model_path: str | Path | None = None):
+    """Lazy-load singleton BatchedCPUInferenceEngine from checkpoint."""
+    global _INFERENCE_ENGINE
+    if _INFERENCE_ENGINE is not None:
+        return _INFERENCE_ENGINE
+
+    import torch
+    from spinal_ct.aospine_model import BatchedCPUInferenceEngine, DualStreamAOSpineNet
+
+    if model_path is None:
+        default_pt = Path('models/aospine_dualstream_best.pt')
+        if default_pt.exists():
+            model_path = default_pt
+
+    if model_path and Path(model_path).exists():
+        try:
+            ckpt = torch.load(str(model_path), map_location='cpu')
+            state_dict = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
+            net = DualStreamAOSpineNet()
+            net.load_state_dict(state_dict)
+            net.eval()
+            _INFERENCE_ENGINE = BatchedCPUInferenceEngine(net)
+            return _INFERENCE_ENGINE
+        except Exception as e:
+            import warnings
+            warnings.warn(f"Failed to load DualStreamAOSpineNet from {model_path}: {e}")
+            return None
+    return None
 
 
 @dataclass
@@ -1260,6 +1356,11 @@ class BodySession:
     adjacent_sessions: dict | list | None = None
     aospine: dict | None = None
     doctor_confirmed_class: str | None = None
+    _cached_rois_sig: str | None = None
+    _cached_rois: tuple | None = None
+    _cached_dl_sig: str | None = None
+    _cached_dl_probs: dict | None = None
+    parasagittal_slices: list[np.ndarray] | None = None
 
     def __post_init__(self):
         shape = tuple(self.plane.size_xy[::-1])
@@ -1284,6 +1385,41 @@ class BodySession:
     def invalidate(self):
         self._approved_signature = None
         self.result = None
+        self._cached_rois_sig = None
+        self._cached_rois = None
+        self._cached_dl_sig = None
+        self._cached_dl_probs = None
+
+    def extract_dualstream_rois(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """Extract 5-channel 2.5D Body+Canal ROI and Posterior Arch ROI for Deep Learning."""
+        if self.mask is None or not self.mask.any() or self.plane is None or self.ct is None:
+            return None
+        sig = self._signature()
+        if getattr(self, '_cached_rois_sig', None) == sig and getattr(self, '_cached_rois', None) is not None:
+            return self._cached_rois
+
+        from spinal_ct.aospine_dataset import extract_body_canal_roi_25d, extract_posterior_arch_roi_25d
+        spacing = getattr(self.plane, 'spacing_xy_mm', (1.0, 1.0))
+        arch_mask = getattr(self, 'posterior_arch_mask', None)
+        if arch_mask is None or not arch_mask.any():
+            arch_mask = np.zeros_like(self.mask)
+
+        try:
+            body_roi = extract_body_canal_roi_25d(
+                self.ct, self.mask, spacing,
+                curr_vert_landmarks=self.landmarks if len(self.landmarks) == 6 else None,
+                parasagittal_slices=self.parasagittal_slices,
+            )
+            arch_roi = extract_posterior_arch_roi_25d(
+                self.ct, arch_mask, spacing,
+                body_mask=self.mask,
+                parasagittal_slices=self.parasagittal_slices,
+            )
+            self._cached_rois_sig = sig
+            self._cached_rois = (body_roi, arch_roi)
+            return self._cached_rois
+        except Exception:
+            return None
 
     def set_candidates(self, detection):
         # LoG is ancillary to area/height measurements on the unchanged body mask.
@@ -1379,6 +1515,7 @@ class BodySession:
             upper_vert_pi=upper_vert_pi, lower_vert_ps=lower_vert_ps,
             exclude_mask=self.posterior_arch_mask,
             body_mask=self.mask,
+            parasagittal_slices=self.parasagittal_slices,
         )
         if len(self.landmarks) == 6:
             h = measure_heights(self.landmarks, self.plane)
@@ -1532,7 +1669,38 @@ class BodySession:
 
             if v_metrics_list:
                 inter_metrics = compute_intervertebral_metrics(v_metrics_list)
-                ranked_result = fuse_and_classify_spine(inter_metrics)
+
+                # Batch DL concept inference across spine session
+                dl_probs_map: dict[str, dict[str, float]] = {}
+                engine = get_aospine_inference_engine()
+                if engine is not None:
+                    sessions_to_infer = []
+                    body_rois = []
+                    arch_rois = []
+                    for s in session_list:
+                        if isinstance(s, BodySession) and s.mask is not None and s.mask.any():
+                            sig = s._signature()
+                            if getattr(s, '_cached_dl_sig', None) == sig and getattr(s, '_cached_dl_probs', None) is not None:
+                                dl_probs_map[s.level] = s._cached_dl_probs
+                            else:
+                                rois = s.extract_dualstream_rois()
+                                if rois is not None:
+                                    sessions_to_infer.append(s)
+                                    body_rois.append(rois[0])
+                                    arch_rois.append(rois[1])
+                    if sessions_to_infer:
+                        try:
+                            batch_probs, _ = engine.predict_batch(body_rois, arch_rois)
+                            for sess, probs in zip(sessions_to_infer, batch_probs):
+                                sess._cached_dl_sig = sess._signature()
+                                sess._cached_dl_probs = probs
+                                dl_probs_map[sess.level] = probs
+                        except Exception as ex:
+                            import warnings
+                            warnings.warn(f"DualStream batch inference failed: {ex}")
+
+                dl_concept_probs_list = [dl_probs_map.get(m['level']) for m in inter_metrics] if dl_probs_map else None
+                ranked_result = fuse_and_classify_spine(inter_metrics, dl_concept_probs_list=dl_concept_probs_list)
 
                 tot = len(ranked_result['ranked_vertebrae'])
                 for r_idx, ranked_eval in enumerate(ranked_result['ranked_vertebrae'], 1):
@@ -1576,8 +1744,27 @@ class BodySession:
                 'lower_endplate_deformity_mm': lo_d,
                 'is_fov_truncated': is_trunc,
             }
+            dl_concept = None
+            engine = get_aospine_inference_engine()
+            if engine is not None and self.mask is not None and self.mask.any():
+                sig = self._signature()
+                if getattr(self, '_cached_dl_sig', None) == sig and getattr(self, '_cached_dl_probs', None) is not None:
+                    dl_concept = self._cached_dl_probs
+                else:
+                    rois = self.extract_dualstream_rois()
+                    if rois is not None:
+                        try:
+                            batch_probs, _ = engine.predict_batch([rois[0]], [rois[1]])
+                            if batch_probs:
+                                dl_concept = batch_probs[0]
+                                self._cached_dl_sig = sig
+                                self._cached_dl_probs = dl_concept
+                        except Exception:
+                            pass
+
+            dl_concept_list = [dl_concept] if dl_concept else None
             inter_metrics = compute_intervertebral_metrics([v_metrics])
-            ranked_result = fuse_and_classify_spine(inter_metrics)
+            ranked_result = fuse_and_classify_spine(inter_metrics, dl_concept_probs_list=dl_concept_list)
             eval_res = ranked_result['ranked_vertebrae'][0]
             eval_res['rank'] = 1
             eval_res['total_ranked'] = 1
@@ -1608,7 +1795,8 @@ class BodySession:
             self.approve()
 
     def approve(self):
-        features = analyze_blob(self.mask, self.plane.spacing_xy_mm)
+        features = analyze_blob(self.mask, self.plane.spacing_xy_mm,
+                                landmarks_xy_mm=self.landmarks if len(self.landmarks) == 6 else None)
         if len(self.landmarks) not in (0, 6):
             raise ValueError('Finish all six height landmarks or clear them before review.')
         measure_heights(self.landmarks, self.plane)
@@ -1626,7 +1814,8 @@ class BodySession:
         if not self.reviewed:
             raise ValueError('Confirm the current body region and plane before measuring.')
         configuration = validate_sampling(samples, seed)
-        features = analyze_blob(self.mask, self.plane.spacing_xy_mm)
+        features = analyze_blob(self.mask, self.plane.spacing_xy_mm,
+                                landmarks_xy_mm=self.landmarks if len(self.landmarks) == 6 else None)
         warnings = list(features['warnings'])
         params = (BodyAutoParams(**self.auto_provenance['params'])
                   if self.auto_provenance and 'params' in self.auto_provenance
@@ -1647,7 +1836,7 @@ class BodySession:
                 eroded_valid &= np.roll(self.valid, shift, axis=axis)
         if (self.mask & ~eroded_valid).any():
             warnings.append('touches_ct_field_boundary')
-        normalization = normalize_region(self.ct, self.mask, self.plane.spacing_xy_mm, features)
+        normalization = normalize_region(self.ct, self.mask, self.plane.spacing_xy_mm, features, landmarks_xy_mm=self.landmarks)
         aospine = self.recompute_aospine_classification()
         self.result = dict(schema_version=1, task='vertebral_body_morphometry',
                            input_fingerprint=self.input_fingerprint, level=self.level, source_kind=self.source_kind,
@@ -1697,7 +1886,7 @@ def save_session(session, output, *, samples=100_000, seed=42):
         (root/'region.json').write_text(json.dumps(document, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
         if report:
             (root/'measurements.json').write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
-            normalized = normalize_region(session.ct, session.mask, session.plane.spacing_xy_mm, report['features'])
+            normalized = normalize_region(session.ct, session.mask, session.plane.spacing_xy_mm, report['features'], landmarks_xy_mm=session.landmarks)
             np.save(root/'normalized_ct.npy', normalized['ct'], allow_pickle=False)
             np.save(root/'normalized_mask.npy', normalized['mask'].astype(np.uint8), allow_pickle=False)
             aospine = report.get('aospine') or {}
@@ -1766,11 +1955,18 @@ def load_session(folder, source, *, fingerprint=None):
         raise ValueError('Region schema or CT fingerprint mismatch.')
     plane = BodyPlane(**document['plane'])
     ct, valid, hint = sample_plane(source, plane)
+    parasagittal_slices = None
+    try:
+        from spinal_ct.body_region import sample_parasagittal_slices
+        if hasattr(source, 'GetSpacing'):
+            parasagittal_slices = sample_parasagittal_slices(source, plane)
+    except Exception:
+        parasagittal_slices = None
     mask = binary_mask(np.load(folder/'body_mask.npy', allow_pickle=False))
     if mask_digest(mask) != document.get('mask_sha256'):
         raise ValueError('Body mask has changed since this region was saved.')
     session = BodySession(fingerprint, document['level'], document['source_kind'], plane, ct, valid, hint,
-                          mask=mask, age_group=document['age_group'])
+                          mask=mask, age_group=document['age_group'], parasagittal_slices=parasagittal_slices)
     session.set_landmarks(document['landmarks_xy_mm'])
     session.auto_provenance = document.get('auto_provenance')
     if session._signature() != document.get('region_signature'):
