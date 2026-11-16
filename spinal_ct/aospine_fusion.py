@@ -22,6 +22,7 @@ import numpy as np
 from spinal_ct.aospine_rules import (
     compute_anatomical_rule_probabilities,
     rank_and_classify_spine,
+    is_classic_wedge_fracture,
 )
 
 
@@ -115,34 +116,32 @@ def fuse_vertebra_concept_probabilities(
     q_seg = float(metrics.get('q_seg', 1.0))
 
     if dl_probs is None or not dl_model_trained:
-        # Full fallback to pure geometric rule
-        fused = dict(p_rule)
-        diagnostics = {
-            'alpha_weights': {k: 0.0 for k in ('pw', 'ep2', 'post_tb', 'ant_tb', 'trans', 'fracture')},
-            'raw_p_rule': p_rule,
-            'raw_p_dl': {},
-            'fused_probs': fused,
-            'triggered_guards': [],
-            'q_seg': q_seg,
-        }
-        return fused, diagnostics
-
-    alphas = compute_adaptive_fusion_weights(q_seg, morph_metrics=metrics, dl_model_trained=True)
-
-    # Initial convex combination: S_k = alpha_k * P_DL + (1 - alpha_k) * P_Rule
-    s_pw = alphas['pw'] * dl_probs.get('p_pw', 0.5) + (1.0 - alphas['pw']) * p_rule['p_pw']
-    s_ep2 = alphas['ep2'] * dl_probs.get('p_ep2', 0.5) + (1.0 - alphas['ep2']) * p_rule['p_ep2']
-    s_post_tb = alphas['post_tb'] * dl_probs.get('p_post_tb', 0.5) + (1.0 - alphas['post_tb']) * p_rule['p_post_tb']
-
-    # For anterior tension band (Type B3): do not suppress high geometric evidence if DL has default/dummy low probability
-    p_dl_ant = dl_probs.get('p_ant_tb', 0.01)
-    if p_dl_ant <= 0.02 and p_rule['p_ant_tb'] > 0.10:
+        # Fallback to pure physical rule while preserving safety boundary guards
+        alphas = {k: 0.0 for k in ('pw', 'ep2', 'post_tb', 'ant_tb', 'trans', 'fracture')}
+        s_pw = p_rule['p_pw']
+        s_ep2 = p_rule['p_ep2']
+        s_post_tb = p_rule['p_post_tb']
         s_ant_tb = p_rule['p_ant_tb']
+        s_trans = p_rule['p_trans']
+        s_frac = p_rule['p_fracture']
+        dl_probs_used = {}
     else:
-        s_ant_tb = alphas['ant_tb'] * p_dl_ant + (1.0 - alphas['ant_tb']) * p_rule['p_ant_tb']
+        alphas = compute_adaptive_fusion_weights(q_seg, morph_metrics=metrics, dl_model_trained=True)
+        # Initial convex combination: S_k = alpha_k * P_DL + (1 - alpha_k) * P_Rule
+        s_pw = alphas['pw'] * dl_probs.get('p_pw', 0.5) + (1.0 - alphas['pw']) * p_rule['p_pw']
+        s_ep2 = alphas['ep2'] * dl_probs.get('p_ep2', 0.5) + (1.0 - alphas['ep2']) * p_rule['p_ep2']
+        s_post_tb = alphas['post_tb'] * dl_probs.get('p_post_tb', 0.5) + (1.0 - alphas['post_tb']) * p_rule['p_post_tb']
 
-    s_trans = alphas['trans'] * dl_probs.get('p_trans', 0.5) + (1.0 - alphas['trans']) * p_rule['p_trans']
-    s_frac = alphas['fracture'] * dl_probs.get('p_fracture', 0.5) + (1.0 - alphas['fracture']) * p_rule['p_fracture']
+        # For anterior tension band (Type B3): do not suppress high geometric evidence if DL has default/dummy low probability
+        p_dl_ant = dl_probs.get('p_ant_tb', 0.01)
+        if p_dl_ant <= 0.02 and p_rule['p_ant_tb'] > 0.10:
+            s_ant_tb = p_rule['p_ant_tb']
+        else:
+            s_ant_tb = alphas['ant_tb'] * p_dl_ant + (1.0 - alphas['ant_tb']) * p_rule['p_ant_tb']
+
+        s_trans = alphas['trans'] * dl_probs.get('p_trans', 0.5) + (1.0 - alphas['trans']) * p_rule['p_trans']
+        s_frac = alphas['fracture'] * dl_probs.get('p_fracture', 0.5) + (1.0 - alphas['fracture']) * p_rule['p_fracture']
+        dl_probs_used = dl_probs
 
     triggered_guards: list[str] = []
 
@@ -152,13 +151,28 @@ def fuse_vertebra_concept_probabilities(
     trans_mm = float(metrics.get('translation_mm', 0.0))
     disc_deg = float(metrics.get('anterior_disc_angle_deg', 0.0))
     disc_ratio = float(metrics.get('disc_opening_ratio', 1.0))
+    h_info = metrics.get('heights') or {}
+    ha_hp = float(metrics.get('ha_hp_ratio', h_info.get('anterior_posterior_ratio', 1.0)))
+    hm_hp = float(metrics.get('hm_hp_ratio', h_info.get('middle_posterior_ratio', 1.0)))
+    rel_coll = float(metrics.get('relative_collapse_ratio', 1.0))
+    up_def = float(metrics.get('upper_endplate_deformity_mm', 0.0))
+    lo_def = float(metrics.get('lower_endplate_deformity_mm', 0.0))
+
+    is_morphologically_intact = (
+        ha_hp >= 0.80 and hm_hp >= 0.80 and rel_coll >= 0.85
+        and delta_pw < 1.0 and trans_mm < 2.0
+        and up_def < 2.0 and lo_def < 2.0
+    )
+
+    is_classic_a1_wedge = is_classic_wedge_fracture(metrics, s_ep2=s_ep2)
 
     # Guard 1: Intact Wall Guard (Rescues pure A1 from CNN false alarms)
     if q_seg >= 0.70 and delta_pw < 1.0 and p_rule['p_pw'] < 0.15:
-        s_pw = min(s_pw, 0.35)
-        if dl_probs.get('p_pw', 0.0) >= 0.40 or s_pw >= 0.35:
+        max_pw = 0.05 if is_classic_a1_wedge else 0.35
+        s_pw = min(s_pw, max_pw)
+        if (dl_probs_used.get('p_pw', 0.0) >= 0.40 or s_pw >= max_pw) and dl_probs_used:
             triggered_guards.append(
-                f"Intact Wall Guard (q_seg={q_seg:.2f}, delta_pw={delta_pw:.1f}mm: S_pw constrained to {s_pw:.4f} <= 0.35)"
+                f"Intact Wall Guard (q_seg={q_seg:.2f}, delta_pw={delta_pw:.1f}mm: S_pw constrained to {s_pw:.4f} <= {max_pw:.2f})"
             )
 
     # Guard 2: Bone Fragment Floor Guard (Burst fracture with clear retropulsion)
@@ -169,12 +183,21 @@ def fuse_vertebra_concept_probabilities(
             f"Bone Fragment Floor Guard (delta_pw={delta_pw:.1f}mm: S_pw and S_frac floored to >= 0.65)"
         )
 
-    # Guard 3: Distraction Floor Guard (Interspinous widening B2)
-    if isp_ratio >= 1.35:
+    # Guard 3: Distraction Floor Guard (Interspinous widening B2 vs Classic A1 Wedge)
+    dl_tb = dl_probs_used.get('p_post_tb', 0.0) if dl_probs_used else 0.0
+    is_true_dl_distraction = (dl_tb >= 0.50)
+
+    if isp_ratio >= 1.35 and (is_true_dl_distraction or not is_classic_a1_wedge):
         s_post_tb = max(s_post_tb, 0.65)
         s_frac = max(s_frac, 0.65)
         triggered_guards.append(
             f"Distraction Floor Guard (isp_ratio={isp_ratio:.2f}: S_post_tb and S_frac floored to 0.65)"
+        )
+    elif is_classic_a1_wedge and not is_true_dl_distraction:
+        max_tb = 0.02 if isp_ratio < 1.30 else 0.10
+        s_post_tb = min(s_post_tb, max_tb)
+        triggered_guards.append(
+            f"Classic A1 Wedge Guard (Ha/Hp={ha_hp:.2f}, delta_pw={delta_pw:.1f}mm: S_post_tb constrained to <= {max_tb:.2f})"
         )
 
     # Guard 4: Translation Floor Guard (Dislocation C)
@@ -196,7 +219,7 @@ def fuse_vertebra_concept_probabilities(
     # Guard 6: Intact Tension Band Guard (Prevents CNN vertical laminar crack noise triggering false B2)
     if q_seg >= 0.75 and isp_ratio < 1.12 and p_rule['p_post_tb'] < 0.15:
         s_post_tb = min(s_post_tb, 0.35)
-        if dl_probs.get('p_post_tb', 0.0) >= 0.40 or s_post_tb >= 0.35:
+        if (dl_probs_used.get('p_post_tb', 0.0) >= 0.40 or s_post_tb >= 0.35) and dl_probs_used:
             triggered_guards.append(
                 f"Intact Tension Band Guard (q_seg={q_seg:.2f}, isp_ratio={isp_ratio:.2f}: S_post_tb constrained to {s_post_tb:.4f} <= 0.35)"
             )
@@ -214,7 +237,7 @@ def fuse_vertebra_concept_probabilities(
     diagnostics = {
         'alpha_weights': alphas,
         'raw_p_rule': p_rule,
-        'raw_p_dl': dl_probs,
+        'raw_p_dl': dl_probs or {},
         'fused_probs': fused_probs,
         'triggered_guards': triggered_guards,
         'q_seg': q_seg,

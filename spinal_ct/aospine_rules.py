@@ -53,6 +53,40 @@ def fuzzy_sigmoid(x: float, threshold: float, temperature: float, invert: bool =
     return float(np.clip(p, 0.01, 0.99))
 
 
+def is_classic_wedge_fracture(metrics: dict[str, Any], s_ep2: float = 0.0) -> bool:
+    """Biomechanical consistency check for isolated anterior wedge compression fracture (A1).
+    
+    Clinical criteria:
+    - Anterior height loss (Ha/Hp < 0.82)
+    - Asymmetric anterior vs middle/posterior (Ha/Hp <= Hm/Hp + 0.05)
+    - Preserved overall body height (RelColl >= 0.78)
+    - Intact inferior endplate (lower_endplate_deformity < 1.5 mm)
+    - Intact posterior wall (delta_posterior_mm < 1.0 mm)
+    - No sagittal translation (translation_mm < 1.5 mm)
+    - No hyperextension gaping (anterior_disc_angle_deg < 15.0 deg)
+    - No comminuted endplate fracture (s_ep2 < 0.40)
+    """
+    h_info = metrics.get('heights') or {}
+    ha_hp = float(metrics.get('ha_hp_ratio', h_info.get('anterior_posterior_ratio', 1.0)))
+    hm_hp = float(metrics.get('hm_hp_ratio', h_info.get('middle_posterior_ratio', 1.0)))
+    rel_coll = float(metrics.get('relative_collapse_ratio', 1.0))
+    delta_pw = float(metrics.get('delta_posterior_mm', 0.0))
+    trans_mm = float(metrics.get('translation_mm', 0.0))
+    disc_deg = float(metrics.get('anterior_disc_angle_deg', 0.0))
+    lo_def = float(metrics.get('lower_endplate_deformity_mm', 0.0))
+
+    return bool(
+        ha_hp < 0.82
+        and ha_hp <= hm_hp + 0.05
+        and rel_coll >= 0.78
+        and s_ep2 < 0.40
+        and delta_pw < 1.0
+        and trans_mm < 1.5
+        and disc_deg < 15.0
+        and lo_def < 1.5
+    )
+
+
 def compute_anatomical_rule_probabilities(metrics: dict[str, Any]) -> dict[str, float]:
     """Compute calibrated probabilities for 6 core anatomical concepts from physical metrics.
 
@@ -104,11 +138,16 @@ def compute_anatomical_rule_probabilities(metrics: dict[str, Any]) -> dict[str, 
         p_trans = min(p_trans, 0.01)
 
     # 2. Anterior tension band (Type B3): geometric mean of opening angle and height ratio
+    # Physiological lumbar lordotic disc angle is naturally 10°-14°.
+    # Type B3 hyperextension requires wide anterior gaping (angle >= 15° AND disc_opening >= 1.6).
     anterior_disc_angle_deg = float(metrics.get('anterior_disc_angle_deg', 0.0))
     disc_opening_ratio = float(metrics.get('disc_opening_ratio', 1.0))
-    p_angle = fuzzy_sigmoid(anterior_disc_angle_deg, threshold=17.5, temperature=1.5)
-    p_open = fuzzy_sigmoid(disc_opening_ratio, threshold=2.0, temperature=0.35)
-    p_ant_tb = float(np.clip(np.sqrt(p_angle * p_open), 0.01, 0.99))
+    if anterior_disc_angle_deg < 15.0 or disc_opening_ratio < 1.6:
+        p_ant_tb = 0.01
+    else:
+        p_angle = fuzzy_sigmoid(anterior_disc_angle_deg, threshold=17.5, temperature=1.5)
+        p_open = fuzzy_sigmoid(disc_opening_ratio, threshold=2.0, temperature=0.35)
+        p_ant_tb = float(np.clip(np.sqrt(p_angle * p_open), 0.01, 0.99))
     if is_morphologically_intact and anterior_disc_angle_deg < 15.0:
         p_ant_tb = min(p_ant_tb, 0.01)
 
@@ -179,9 +218,23 @@ def compute_anatomical_rule_probabilities(metrics: dict[str, Any]) -> dict[str, 
         p_ep_max = fuzzy_sigmoid(max(up_def_val, lo_def_val), threshold=2.0, temperature=0.4)
         p_fracture = float(np.clip(max(p_genant, p_rel_frac, p_pw, p_split, p_ep_max), 0.01, 0.99))
 
-    # Isolated B2 suppression: an intact vertebral body without translation cannot have isolated B2 disruption
+        # Genant Grade 1-2 standard: height loss >= 20% (ha_hp <= 0.80 or hm_hp <= 0.80)
+        # represents an unambiguous structural fracture with high clinical certainty.
+        if (ha_hp <= 0.80 or hm_hp <= 0.80) and relative_collapse_ratio >= 0.70:
+            p_fracture = max(p_fracture, 0.95)
+
+    # Classic A1 Wedge Guard: isolated wedge compression fracture with intact posterior wall,
+    # intact alignment, single endplate (rel_coll >= 0.78, p_ep2 < 0.40, lo_def < 1.5)
+    is_classic_a1_wedge = is_classic_wedge_fracture(metrics, s_ep2=p_ep2)
+
+    # Isolated B2 suppression: an intact vertebral body without translation cannot have isolated B2 disruption.
+    # Similarly, a classic A1 wedge fracture with intact walls cannot be overridden into B2 unless substantial widening (>= 1.35)
     if is_morphologically_intact or (p_fracture < 0.40 and translation_mm < 2.0):
-        p_post_tb = min(p_post_tb, 0.20)
+        p_post_tb = min(p_post_tb, 0.05)
+    elif is_classic_a1_wedge and isp_ratio < 1.30:
+        p_post_tb = min(p_post_tb, 0.02)
+    elif is_classic_a1_wedge and isp_ratio < 1.35:
+        p_post_tb = min(p_post_tb, 0.10)
 
     return dict(
         p_trans=round(p_trans, 4),
@@ -310,25 +363,34 @@ def evaluate_aospine_decision_tree(
     predicted_class = max(class_probs, key=class_probs.get)
     confidence = float(class_probs[predicted_class])
 
+    # Check for Classic A1 Wedge Guard
+    is_classic_a1_wedge = is_classic_wedge_fracture(metrics, s_ep2=s_ep2)
+    isp_ratio = float(metrics.get('isp_ratio', 1.0))
+
     # Combined Morphology Rule for B2
     # If posterior tension band is disrupted and vertebral body has fracture:
     # AO Spine dictates primary class B2 with secondary A subtype
     secondary_subtype = None
     if s_trans < 0.50 and s_frac >= 0.40 and (s_post_tb >= 0.55 or (predicted_class == 'B2' and s_frac >= 0.50)):
-        predicted_class = 'B2'
-        confidence = float(max(confidence, class_probs.get('B2', 0.50)))
-        if s_pw >= 0.50 and s_ep2 >= 0.50:
-            secondary_subtype = 'A4'
-        elif s_pw >= 0.50:
-            secondary_subtype = 'A3'
-        elif s_split >= 0.50:
-            secondary_subtype = 'A2'
-        elif s_frac >= 0.50:
-            secondary_subtype = 'A1'
+        if is_classic_a1_wedge and s_post_tb < 0.65:
+            # Classic A1 Wedge Guard: preserve primary A1, flag suspicion with modifier M1
+            predicted_class = 'A1'
+            confidence = float(max(confidence, class_probs.get('A1', 0.65)))
+            secondary_subtype = None
+        else:
+            predicted_class = 'B2'
+            confidence = float(max(confidence, class_probs.get('B2', 0.50)))
+            if s_pw >= 0.50 and s_ep2 >= 0.50:
+                secondary_subtype = 'A4'
+            elif s_pw >= 0.50:
+                secondary_subtype = 'A3'
+            elif s_split >= 0.50:
+                secondary_subtype = 'A2'
+            elif s_frac >= 0.50:
+                secondary_subtype = 'A1'
 
     # Modifiers
-    isp_ratio = float(metrics.get('isp_ratio', 1.0))
-    modifier_m1 = bool(1.15 < isp_ratio <= 1.30 and predicted_class not in ('B2', 'C', 'Normal'))
+    modifier_m1 = bool((1.15 < isp_ratio <= 1.30 or (is_classic_a1_wedge and 1.15 < isp_ratio < 1.60)) and predicted_class not in ('B2', 'C', 'Normal'))
     modifier_m2 = bool(predicted_class == 'B3' or metrics.get('modifier_m2', False))
 
     modifiers: list[str] = []

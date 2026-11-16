@@ -323,6 +323,31 @@ class TestAOSpineRules(unittest.TestCase):
         self.assertLess(res['concept_probs']['p_ep2'], 0.40)
         self.assertGreater(res['class_probabilities']['A3'], 0.50)
 
+    def test_thoracolumbar_a1_wedge_regression(self):
+        """Regression test for thoracolumbar junction (T12-L1) A1 wedge compression.
+
+        Ensures that subtle physiological ISP ratio (1.08) at the thoracolumbar junction
+        does not falsely trigger B2 distraction override on a classic A1 wedge fracture.
+        """
+        metrics = {
+            'level': 'L1',
+            'ha_hp_ratio': 0.784,
+            'hm_hp_ratio': 0.814,
+            'relative_collapse_ratio': 0.953,
+            'delta_posterior_mm': 0.3,
+            'isp_ratio': 1.080,
+            'translation_mm': 0.94,
+            'anterior_disc_angle_deg': 12.73,
+            'disc_opening_ratio': 1.0,
+            'q_seg': 0.88,
+        }
+        res = evaluate_aospine_decision_tree(metrics)
+        self.assertEqual(res['predicted_class'], 'A1')
+        self.assertGreater(res['confidence'], 0.45)
+        self.assertIn('Gãy lún chêm A1', res['clinical_rationale_vi'])
+        self.assertLess(res['concept_probs']['p_post_tb'], 0.25)
+
+
 
 if __name__ == '__main__':
     unittest.main()
