@@ -375,6 +375,11 @@ class BodyReviewUITests(unittest.TestCase):
         # 2. Spine level navigator
         self.assertIn('L1', dialog.available_levels)
         self.assertIn('L1', dialog.level_buttons)
+        self.assertIsNotNone(dialog.nav_scroll)
+        self.assertIsNotNone(dialog.btn_prev_level)
+        self.assertIsNotNone(dialog.btn_next_level)
+        self.assertGreaterEqual(dialog.level_buttons['L1'].minimumWidth(), 44)
+        self.assertTrue(bool(dialog.level_buttons['L1'].toolTip()))
 
         # Level switch
         if len(dialog.available_levels) > 1:
@@ -388,11 +393,25 @@ class BodyReviewUITests(unittest.TestCase):
             dialog.switch_to_level(target_level)
             self.assertEqual(dialog.level, target_level)
 
+            # Arrow buttons navigation
+            curr_idx = dialog.available_levels.index(target_level)
+            if curr_idx > 0:
+                dialog.prev_level()
+                self.assertEqual(dialog.level, dialog.available_levels[curr_idx - 1])
+                dialog.next_level()
+                self.assertEqual(dialog.level, target_level)
+
             # Switch back to L1 and verify content is NOT lost
             dialog.switch_to_level('L1')
             self.assertEqual(dialog.level, 'L1')
             self.assertEqual(len(dialog.session.landmarks), 6)
             self.assertTrue(dialog.session.mask.any())
+
+        # 3. AO Spine metrics display and dynamic height
+        self.assertIsNotNone(dialog.ao_form)
+        dialog.lbl_delta_pw.setText('🔴 2.7 mm (Cảnh báo lồi > 2.0 mm)')
+        dialog._refresh_metric_label_heights()
+        self.assertGreaterEqual(dialog.lbl_delta_pw.minimumHeight(), 18)
 
         dialog.close()
 

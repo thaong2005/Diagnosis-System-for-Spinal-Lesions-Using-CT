@@ -11,8 +11,8 @@ import SimpleITK as sitk
 from PySide6.QtCore import Qt, QRegularExpression, QTimer
 from PySide6.QtGui import QFont, QRegularExpressionValidator
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
-    QFormLayout, QHeaderView, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
-    QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+    QFormLayout, QFrame, QHeaderView, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
+    QSizePolicy, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from matplotlib.widgets import PolygonSelector
@@ -179,12 +179,23 @@ class BodyReviewDialog(QDialog):
 
         # 2.5 AO Spine Recommendation Card
         self.aospine_group = QWidget()
+        self.aospine_group.setObjectName('aospine_group')
         aospine_layout = QVBoxLayout(self.aospine_group)
         aospine_layout.setContentsMargins(8, 8, 8, 8)
-        self.aospine_group.setStyleSheet('QWidget {background:white; border:1px solid #c5d5df; border-radius:6px;}')
+        self.aospine_group.setStyleSheet('''
+            #aospine_group {
+                background: white;
+                border: 1px solid #c5d5df;
+                border-radius: 6px;
+            }
+            #aospine_group QLabel {
+                border: none;
+                background: transparent;
+            }
+        ''')
 
         lbl_ao_title = QLabel('Phân loại tổn thương AO Spine')
-        lbl_ao_title.setStyleSheet('font-weight:bold; color:#136979; border:none;')
+        lbl_ao_title.setStyleSheet('font-weight:bold; color:#136979; font-size:12px;')
         aospine_layout.addWidget(lbl_ao_title)
 
         self.aospine_badge = QLabel('Normal · 100%')
@@ -193,12 +204,12 @@ class BodyReviewDialog(QDialog):
         aospine_layout.addWidget(self.aospine_badge)
 
         self.aospine_rank = QLabel('Hạng tổn thương: #1 / 1')
-        self.aospine_rank.setStyleSheet('color:#555; font-size:11px; border:none;')
+        self.aospine_rank.setStyleSheet('color:#555; font-size:11px;')
         aospine_layout.addWidget(self.aospine_rank)
 
         doc_layout = QHBoxLayout()
         lbl_doc = QLabel('Bác sĩ xác nhận:')
-        lbl_doc.setStyleSheet('font-weight:bold; font-size:11px; border:none;')
+        lbl_doc.setStyleSheet('font-weight:bold; font-size:11px;')
         self.doctor_override_combo = QComboBox()
         self.doctor_override_combo.addItems([
             'Theo gợi ý AI', 'Normal', 'A1', 'A2', 'A3', 'A4', 'B2', 'B3', 'C'
@@ -208,27 +219,46 @@ class BodyReviewDialog(QDialog):
         doc_layout.addWidget(self.doctor_override_combo)
         aospine_layout.addLayout(doc_layout)
 
-        ao_form = QFormLayout()
-        ao_form.setContentsMargins(0, 4, 0, 4)
-        ao_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.ao_form = QFormLayout()
+        self.ao_form.setContentsMargins(0, 4, 0, 4)
+        self.ao_form.setVerticalSpacing(8)
+        self.ao_form.setLabelAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.ao_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
         self.lbl_delta_pw = QLabel('0.0 mm')
         self.lbl_delta_pw.setWordWrap(True)
-        self.lbl_delta_pw.setStyleSheet('font-weight:bold; border:none;')
+        self.lbl_delta_pw.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_delta_pw.setStyleSheet('font-weight:bold; font-size:11px;')
+
         self.lbl_isp = QLabel('1.00')
         self.lbl_isp.setWordWrap(True)
-        self.lbl_isp.setStyleSheet('font-weight:bold; border:none;')
+        self.lbl_isp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_isp.setStyleSheet('font-weight:bold; font-size:11px;')
+
         self.lbl_trans = QLabel('0.0 mm')
         self.lbl_trans.setWordWrap(True)
-        self.lbl_trans.setStyleSheet('font-weight:bold; border:none;')
+        self.lbl_trans.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_trans.setStyleSheet('font-weight:bold; font-size:11px;')
+
         self.lbl_collapse = QLabel('1.00')
         self.lbl_collapse.setWordWrap(True)
-        self.lbl_collapse.setStyleSheet('font-weight:bold; border:none;')
+        self.lbl_collapse.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_collapse.setStyleSheet('font-weight:bold; font-size:11px;')
 
-        ao_form.addRow('Độ lồi tường sau (Δ_post):', self.lbl_delta_pw)
-        ao_form.addRow('Tỷ lệ liên gai sau (ISP):', self.lbl_isp)
-        ao_form.addRow('Độ di lệch trượt:', self.lbl_trans)
-        ao_form.addRow('Mức độ xẹp lún:', self.lbl_collapse)
-        aospine_layout.addLayout(ao_form)
+        lbl_delta_title = QLabel('Độ lồi tường sau (Δ_post):')
+        lbl_delta_title.setStyleSheet('color:#233c4b; font-size:11px;')
+        lbl_isp_title = QLabel('Tỷ lệ liên gai sau (ISP):')
+        lbl_isp_title.setStyleSheet('color:#233c4b; font-size:11px;')
+        lbl_trans_title = QLabel('Độ di lệch trượt:')
+        lbl_trans_title.setStyleSheet('color:#233c4b; font-size:11px;')
+        lbl_collapse_title = QLabel('Mức độ xẹp lún:')
+        lbl_collapse_title.setStyleSheet('color:#233c4b; font-size:11px;')
+
+        self.ao_form.addRow(lbl_delta_title, self.lbl_delta_pw)
+        self.ao_form.addRow(lbl_isp_title, self.lbl_isp)
+        self.ao_form.addRow(lbl_trans_title, self.lbl_trans)
+        self.ao_form.addRow(lbl_collapse_title, self.lbl_collapse)
+        aospine_layout.addLayout(self.ao_form)
 
         self.aospine_warning = QLabel()
         self.aospine_warning.setWordWrap(True)
@@ -368,14 +398,76 @@ class BodyReviewDialog(QDialog):
         lbl_nav.setStyleSheet('font-weight:bold; color:#136979; font-size:12px;')
         nav_layout.addWidget(lbl_nav)
 
+        self.btn_prev_level = QPushButton('◀')
+        self.btn_prev_level.setToolTip('Chuyển sang đốt sống trước đó')
+        self.btn_prev_level.setFixedSize(26, 26)
+        self.btn_prev_level.setStyleSheet('font-size:10px; padding:0px;')
+        self.btn_prev_level.setCursor(Qt.PointingHandCursor)
+        self.btn_prev_level.clicked.connect(self.prev_level)
+        nav_layout.addWidget(self.btn_prev_level)
+
+        self.btn_next_level = QPushButton('▶')
+        self.btn_next_level.setToolTip('Chuyển sang đốt sống tiếp theo')
+        self.btn_next_level.setFixedSize(26, 26)
+        self.btn_next_level.setStyleSheet('font-size:10px; padding:0px;')
+        self.btn_next_level.setCursor(Qt.PointingHandCursor)
+        self.btn_next_level.clicked.connect(self.next_level)
+        nav_layout.addWidget(self.btn_next_level)
+
+        self.nav_scroll = QScrollArea()
+        self.nav_scroll.setWidgetResizable(True)
+        self.nav_scroll.setFixedHeight(34)
+        self.nav_scroll.setFrameShape(QFrame.NoFrame)
+        self.nav_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.nav_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.nav_scroll.setStyleSheet('''
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:horizontal {
+                height: 4px;
+                background: transparent;
+                margin: 0px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #b0c4de;
+                border-radius: 2px;
+                min-width: 20px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #136979;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+                background: none;
+            }
+        ''')
+
+        def scroll_wheel_event(event):
+            delta = event.angleDelta().y() or event.angleDelta().x()
+            self.nav_scroll.horizontalScrollBar().setValue(
+                self.nav_scroll.horizontalScrollBar().value() - delta
+            )
+            event.accept()
+
+        self.nav_scroll.wheelEvent = scroll_wheel_event
+
+        self.nav_buttons_container = QWidget()
+        self.nav_buttons_container.setStyleSheet('background: transparent;')
+        nav_buttons_layout = QHBoxLayout(self.nav_buttons_container)
+        nav_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        nav_buttons_layout.setSpacing(3)
+
         self.level_buttons = {}
         for lvl in self.available_levels:
             btn = QPushButton(lvl)
             btn.setCursor(Qt.PointingHandCursor)
+            btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+            btn.setMinimumWidth(44)
             btn.clicked.connect(lambda checked=False, l=lvl: self.switch_to_level(l))
-            nav_layout.addWidget(btn)
+            nav_buttons_layout.addWidget(btn)
             self.level_buttons[lvl] = btn
-        nav_layout.addStretch()
+        nav_buttons_layout.addStretch()
+        self.nav_scroll.setWidget(self.nav_buttons_container)
+        nav_layout.addWidget(self.nav_scroll, 1)
         layout.addWidget(self.nav_widget)
 
         # Overlay Toolbar
@@ -431,6 +523,7 @@ class BodyReviewDialog(QDialog):
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
         split.setSizes([400, 980])
+        split.splitterMoved.connect(lambda *_: self._refresh_metric_label_heights())
         self.canvas.mpl_connect('button_press_event', self.click)
         self.canvas.mpl_connect('motion_notify_event', self.motion)
         self.canvas.mpl_connect('button_release_event', self.release)
@@ -847,6 +940,7 @@ class BodyReviewDialog(QDialog):
             if sess is None and lvl in self.level_cache:
                 sess = self.level_cache[lvl].get('session')
 
+            cls_desc = 'Bình thường'
             if sess and sess.aospine:
                 has_lm = (sess.landmarks is not None and len(sess.landmarks) == 6)
                 has_ov = bool(getattr(sess, 'doctor_confirmed_class', None))
@@ -854,6 +948,7 @@ class BodyReviewDialog(QDialog):
                                 or sess.aospine.get('predicted_class') == 'Ngoài vùng khảo sát (Chạm biên CT)')
                 if (has_lm or has_ov) and not is_trunc:
                     eff_cls = getattr(sess, 'doctor_confirmed_class', None) or sess.aospine.get('predicted_class', 'Normal')
+                    cls_desc = f"Phân loại: {eff_cls}"
                     if eff_cls in ('C', 'A4', 'B1', 'B2', 'B3'):
                         severity_icon = '🔴 '
                         badge_color = '#ff4d4d'
@@ -872,18 +967,53 @@ class BodyReviewDialog(QDialog):
                 else:
                     severity_icon = '⚪ '
                     badge_color = '#7f8c8d'
+                    cls_desc = 'Chạm biên CT' if is_trunc else 'Chưa đo 6 mốc'
             else:
                 severity_icon = ''
                 badge_color = '#7f8c8d'
+                cls_desc = 'Chưa phân tích'
+
+            btn.setToolTip(f"Đốt sống {lvl} · {cls_desc}")
 
             if is_current:
                 btn.setText(f"{severity_icon}{lvl}")
                 btn.setStyleSheet(f'background:#2a2b3d; color:{badge_color}; font-weight:bold; '
-                                  f'border:2px solid {badge_color}; border-radius:5px; padding:4px 8px;')
+                                  f'border:2px solid {badge_color}; border-radius:5px; padding:3px 6px; min-width:44px;')
             else:
                 btn.setText(f"{severity_icon}{lvl}" if severity_icon else lvl)
                 btn.setStyleSheet('background:white; color:#233c4b; font-weight:normal; '
-                                  'border:1px solid #c5d5df; border-radius:5px; padding:4px 8px;')
+                                  'border:1px solid #c5d5df; border-radius:5px; padding:3px 6px; min-width:44px;')
+
+        if hasattr(self, 'btn_prev_level') and hasattr(self, 'btn_next_level'):
+            try:
+                curr_idx = self.available_levels.index(self.level)
+                self.btn_prev_level.setEnabled(curr_idx > 0)
+                self.btn_next_level.setEnabled(curr_idx < len(self.available_levels) - 1)
+            except (ValueError, IndexError, AttributeError):
+                pass
+
+        if hasattr(self, 'nav_scroll') and self.level in self.level_buttons:
+            self.nav_scroll.ensureWidgetVisible(self.level_buttons[self.level], 40, 0)
+
+    def prev_level(self):
+        if not self.available_levels or self.worker is not None:
+            return
+        try:
+            curr_idx = self.available_levels.index(self.level)
+            if curr_idx > 0:
+                self.switch_to_level(self.available_levels[curr_idx - 1])
+        except (ValueError, IndexError):
+            pass
+
+    def next_level(self):
+        if not self.available_levels or self.worker is not None:
+            return
+        try:
+            curr_idx = self.available_levels.index(self.level)
+            if curr_idx < len(self.available_levels) - 1:
+                self.switch_to_level(self.available_levels[curr_idx + 1])
+        except (ValueError, IndexError):
+            pass
 
     def switch_to_level(self, new_level: str):
         if new_level == self.level or self.worker is not None:
@@ -1207,21 +1337,22 @@ class BodyReviewDialog(QDialog):
 
             placeholder = "— (Cần đặt 6 mốc chiều cao hoặc bấm Tự động tách vùng)"
             self.lbl_delta_pw.setText(placeholder)
-            self.lbl_delta_pw.setStyleSheet('color:#7f8c8d; font-style:italic; border:none;')
+            self.lbl_delta_pw.setStyleSheet('color:#7f8c8d; font-style:italic; font-size:11px;')
 
             self.lbl_isp.setText(placeholder)
-            self.lbl_isp.setStyleSheet('color:#7f8c8d; font-style:italic; border:none;')
+            self.lbl_isp.setStyleSheet('color:#7f8c8d; font-style:italic; font-size:11px;')
 
             self.lbl_trans.setText(placeholder)
-            self.lbl_trans.setStyleSheet('color:#7f8c8d; font-style:italic; border:none;')
+            self.lbl_trans.setStyleSheet('color:#7f8c8d; font-style:italic; font-size:11px;')
 
             self.lbl_collapse.setText(placeholder)
-            self.lbl_collapse.setStyleSheet('color:#7f8c8d; font-style:italic; border:none;')
+            self.lbl_collapse.setStyleSheet('color:#7f8c8d; font-style:italic; font-size:11px;')
 
             self.aospine_warning.hide()
             self.aospine_rationale.setText(
                 f"{self.level} - Bấm 'Tự động tách vùng và đặt 6 mốc' hoặc tự chấm 6 mốc để hệ thống tính toán tổn thương."
             )
+            self._refresh_metric_label_heights()
             return
 
         eff_cls = self.session.doctor_confirmed_class or cls_name
@@ -1284,39 +1415,39 @@ class BodyReviewDialog(QDialog):
 
         if delta_pw > 2.0:
             self.lbl_delta_pw.setText(f"🔴 {delta_pw:.1f} mm (Cảnh báo lồi > 2.0 mm)")
-            self.lbl_delta_pw.setStyleSheet('color:#c0392b; font-weight:bold; border:none;')
+            self.lbl_delta_pw.setStyleSheet('color:#c0392b; font-weight:bold; font-size:11px;')
         else:
             self.lbl_delta_pw.setText(f"🟢 {delta_pw:.1f} mm (Bình thường < 2.0 mm)")
-            self.lbl_delta_pw.setStyleSheet('color:#27ae60; font-weight:bold; border:none;')
+            self.lbl_delta_pw.setStyleSheet('color:#27ae60; font-weight:bold; font-size:11px;')
 
         if isp > 1.30:
             self.lbl_isp.setText(f"🔴 {isp:.2f} (Toác dải căng sau > 1.30)")
-            self.lbl_isp.setStyleSheet('color:#c0392b; font-weight:bold; border:none;')
+            self.lbl_isp.setStyleSheet('color:#c0392b; font-weight:bold; font-size:11px;')
         elif isp > 1.15:
             self.lbl_isp.setText(f"🟡 {isp:.2f} (Nghi ngờ tổn thương M1 > 1.15)")
-            self.lbl_isp.setStyleSheet('color:#f39c12; font-weight:bold; border:none;')
+            self.lbl_isp.setStyleSheet('color:#f39c12; font-weight:bold; font-size:11px;')
         else:
             self.lbl_isp.setText(f"🟢 {isp:.2f} (Bình thường ≤ 1.15)")
-            self.lbl_isp.setStyleSheet('color:#27ae60; font-weight:bold; border:none;')
+            self.lbl_isp.setStyleSheet('color:#27ae60; font-weight:bold; font-size:11px;')
 
         if trans >= 3.5:
             self.lbl_trans.setText(f"🔴 {trans:.1f} mm (Trượt/mất vững Type C ≥ 3.5 mm)")
-            self.lbl_trans.setStyleSheet('color:#c0392b; font-weight:bold; border:none;')
+            self.lbl_trans.setStyleSheet('color:#c0392b; font-weight:bold; font-size:11px;')
         else:
             self.lbl_trans.setText(f"🟢 {trans:.1f} mm (Bình thường < 3.5 mm)")
-            self.lbl_trans.setStyleSheet('color:#27ae60; font-weight:bold; border:none;')
+            self.lbl_trans.setStyleSheet('color:#27ae60; font-weight:bold; font-size:11px;')
 
         pct_loss = max(0.0, (1.0 - collapse) * 100.0)
         pct_kept = min(100.0, collapse * 100.0)
         if collapse <= 0.78:
             self.lbl_collapse.setText(f"🔴 Xẹp -{pct_loss:.0f}% (Bảo tồn {pct_kept:.0f}% - Vỡ nặng ≤ 78%)")
-            self.lbl_collapse.setStyleSheet('color:#c0392b; font-weight:bold; border:none;')
+            self.lbl_collapse.setStyleSheet('color:#c0392b; font-weight:bold; font-size:11px;')
         elif collapse <= 0.85:
             self.lbl_collapse.setText(f"🟡 Xẹp -{pct_loss:.0f}% (Bảo tồn {pct_kept:.0f}% - Giảm nhẹ)")
-            self.lbl_collapse.setStyleSheet('color:#f39c12; font-weight:bold; border:none;')
+            self.lbl_collapse.setStyleSheet('color:#f39c12; font-weight:bold; font-size:11px;')
         else:
             self.lbl_collapse.setText(f"🟢 Bảo tồn {pct_kept:.0f}% chiều cao")
-            self.lbl_collapse.setStyleSheet('color:#27ae60; font-weight:bold; border:none;')
+            self.lbl_collapse.setStyleSheet('color:#27ae60; font-weight:bold; font-size:11px;')
 
         warnings_list = list(ao.get('modifiers', []))
         if ao.get('is_indeterminate'):
@@ -1329,6 +1460,26 @@ class BodyReviewDialog(QDialog):
             self.aospine_warning.hide()
 
         self.aospine_rationale.setText(ao.get('clinical_rationale_vi', ''))
+        self._refresh_metric_label_heights()
+
+    def _refresh_metric_label_heights(self):
+        if not hasattr(self, 'ao_form'):
+            return
+        for lbl in (self.lbl_delta_pw, self.lbl_isp, self.lbl_trans, self.lbl_collapse):
+            if lbl is not None:
+                lbl.setMinimumHeight(0)
+                avail_w = max(100, lbl.width())
+                needed_h = lbl.heightForWidth(avail_w)
+                lbl.setMinimumHeight(max(18, needed_h))
+        self.ao_form.invalidate()
+        if hasattr(self, 'aospine_group'):
+            self.aospine_group.updateGeometry()
+        if hasattr(self, 'controls_panel'):
+            self.controls_panel.updateGeometry()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_metric_label_heights()
 
     def redraw(self, *_):
         # A polygon selector owns its axes until completion; don't replace them.
