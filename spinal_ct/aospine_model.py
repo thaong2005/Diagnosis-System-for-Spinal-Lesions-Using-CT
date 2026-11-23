@@ -250,11 +250,30 @@ class MaskedMultiConceptLoss(nn.Module):
     - Optional is_fractured supervision for head_fracture.
 
     Elements where concept_mask == 0 produce 0 loss and receive no gradient backpropagation.
+    Supports optional positive class weighting for class imbalance.
     """
 
-    def __init__(self, fracture_weight: float = 0.5):
+    def __init__(
+        self,
+        fracture_weight: float = 0.5,
+        pos_weight_concepts: torch.Tensor | None = None,
+        pos_weight_frac: float | torch.Tensor | None = None,
+    ):
         super().__init__()
         self.fracture_weight = fracture_weight
+        if pos_weight_concepts is not None:
+            self.register_buffer('pos_weight_concepts', pos_weight_concepts.clone().detach().float())
+        else:
+            self.pos_weight_concepts = None
+
+        if pos_weight_frac is not None:
+            if isinstance(pos_weight_frac, (int, float)):
+                t_pw = torch.tensor([float(pos_weight_frac)], dtype=torch.float32)
+            else:
+                t_pw = pos_weight_frac.clone().detach().float()
+            self.register_buffer('pos_weight_frac', t_pw)
+        else:
+            self.pos_weight_frac = None
 
     def forward(
         self,
@@ -293,7 +312,8 @@ class MaskedMultiConceptLoss(nn.Module):
         mask_float = concept_mask.float()
 
         # BCE with logits: (B, 4)
-        bce = F.binary_cross_entropy_with_logits(logits_stack, y_float, reduction='none')
+        pw_c = self.pos_weight_concepts.to(logits_stack.device) if self.pos_weight_concepts is not None else None
+        bce = F.binary_cross_entropy_with_logits(logits_stack, y_float, pos_weight=pw_c, reduction='none')
         masked_bce = bce * mask_float
 
         mask_sum = mask_float.sum()
@@ -306,9 +326,11 @@ class MaskedMultiConceptLoss(nn.Module):
             frac_target = is_fractured.float()
             if frac_target.ndim == 1:
                 frac_target = frac_target.unsqueeze(-1)
+            pw_f = self.pos_weight_frac.to(logits_stack.device) if self.pos_weight_frac is not None else None
             loss_frac = F.binary_cross_entropy_with_logits(
                 logits_dict['logits_fracture'],
                 frac_target,
+                pos_weight=pw_f,
             )
             return loss_concepts + self.fracture_weight * loss_frac
 

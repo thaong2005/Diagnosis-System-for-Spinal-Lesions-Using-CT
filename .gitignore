@@ -31,3 +31,7 @@ dist/
 /outputs/
 Bao_cao_*.md
 docs/reports/
+docs/archive/reports/
+
+# Checkpoint fold trung gian trong huấn luyện (chỉ lưu trữ checkpoint tối ưu best trong git)
+models/aospine_dualstream_fold*

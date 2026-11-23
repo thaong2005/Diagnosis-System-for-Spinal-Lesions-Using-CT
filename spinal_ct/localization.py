@@ -11,6 +11,8 @@ LEVELS = tuple([f'C{i}' for i in range(1, 8)] +
                [f'T{i}' for i in range(1, 13)] +
                [f'L{i}' for i in range(1, 6)] + ['S1'])
 
+AOSPINE_TARGET_LEVELS = ('T10', 'T11', 'T12', 'L1', 'L2', 'L3', 'L4', 'L5')
+
 # Frozen TotalSegmentator 2.18.0 / task total / v2 IDs. These are NOT our IDs:
 # backend C1=50, ..., L1=31, ..., S1=26; project C1=1, ..., L1=20, S1=25.
 BACKEND_LABEL_IDS = dict(zip(LEVELS, range(50, 25, -1)))

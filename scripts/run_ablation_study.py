@@ -276,9 +276,10 @@ def build_evaluation_cohort(
             elif ptype == 'b2_burst_distraction':
                 # B2 flexion-distraction with vertebral burst:
                 # DL focuses on prominent vertebral burst and misses ligament rupture (predicts A3)
-                # Physical morphometry detects interspinous distraction (isp_ratio = 1.48 >= 1.25)
+                # Physical morphometry detects interspinous distraction (isp_ratio = 1.50 >= 1.45)
                 # Guard 1 (Distraction Floor Guard) forces S_post_tb >= 0.75 -> correctly predicts B2
-                m_metrics['interspinous_ratio'] = 1.48
+                m_metrics['interspinous_ratio'] = 1.50
+                m_metrics['isp_ratio'] = 1.50
                 m_metrics['delta_posterior_mm'] = 3.4
                 item['simulated_dl'] = {
                     'p_pw': 0.82,

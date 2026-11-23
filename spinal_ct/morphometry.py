@@ -14,7 +14,7 @@ import SimpleITK as sitk
 from spinal_ct.body_region import BodyPlane, binary_mask, sample_plane, spacing_xy
 from spinal_ct.blob_analysis import analyze_blob, normalize_region
 from spinal_ct.area_monte_carlo import estimate_area, validate_sampling
-from spinal_ct.localization import LEVELS
+from spinal_ct.localization import LEVELS, AOSPINE_TARGET_LEVELS
 from spinal_ct.review import ct_fingerprint
 from spinal_ct.aospine_rules import evaluate_aospine_decision_tree, rank_and_classify_spine
 from spinal_ct.aospine_fusion import fuse_and_classify_spine
@@ -888,9 +888,13 @@ def compute_intervertebral_metrics(vertebrae_data: list[dict],
             return None
         return parsed[target]
 
+    has_any_lps = any(p.get('spinous_tip_lps') is not None or p.get('landmarks_lps') is not None for p in parsed)
+
     def _get_tip_pt(item_parsed: dict) -> np.ndarray | None:
-        if item_parsed.get('spinous_tip_lps') is not None:
-            return np.asarray(item_parsed['spinous_tip_lps'], dtype=float)
+        if has_any_lps:
+            if item_parsed.get('spinous_tip_lps') is not None:
+                return np.asarray(item_parsed['spinous_tip_lps'], dtype=float)
+            return None
         if item_parsed.get('spinous_tip') is not None:
             return np.asarray(item_parsed['spinous_tip'], dtype=float)
         return None
@@ -940,12 +944,14 @@ def compute_intervertebral_metrics(vertebrae_data: list[dict],
         """
         p1 = _get_tip_pt(item1)
         p2 = _get_tip_pt(item2)
-        if p1 is None or p2 is None:
+        if p1 is None or p2 is None or len(p1) != len(p2):
             return 0.0, 1.0
 
         d_sp = float(np.linalg.norm(p1 - p2))
         c1 = _get_body_center(item1)
         c2 = _get_body_center(item2)
+        if c1 is None or c2 is None or len(c1) != len(c2):
+            return 0.0, 1.0
         d_b = float(np.linalg.norm(c1 - c2))
         if d_sp <= 0 or d_b <= 0:
             return d_sp, 1.0
@@ -969,6 +975,8 @@ def compute_intervertebral_metrics(vertebrae_data: list[dict],
             ps_sup, pi_sup = np.array(lm_sup[4], dtype=float), np.array(lm_sup[5], dtype=float)
             as_inf, ai_inf = np.array(lm_inf[0], dtype=float), np.array(lm_inf[1], dtype=float)
             ps_inf, pi_inf = np.array(lm_inf[4], dtype=float), np.array(lm_inf[5], dtype=float)
+        elif has_any_lps:
+            return 0.0, 1.0
         else:
             as_sup, ai_sup = np.array(v_sup['as_pt'], dtype=float), np.array(v_sup['ai_pt'], dtype=float)
             ps_sup, pi_sup = np.array(v_sup['ps_pt'], dtype=float), np.array(v_sup['pi_pt'], dtype=float)
@@ -1042,6 +1050,8 @@ def compute_intervertebral_metrics(vertebrae_data: list[dict],
             ps_sup, pi_sup = np.array(lm_sup[4], dtype=float), np.array(lm_sup[5], dtype=float)
             as_inf, ai_inf = np.array(lm_inf[0], dtype=float), np.array(lm_inf[1], dtype=float)
             ps_inf, pi_inf = np.array(lm_inf[4], dtype=float), np.array(lm_inf[5], dtype=float)
+        elif has_any_lps:
+            return 0.0, 1.0
         else:
             as_sup, ai_sup = np.array(v_sup['as_pt'], dtype=float), np.array(v_sup['ai_pt'], dtype=float)
             ps_sup, pi_sup = np.array(v_sup['ps_pt'], dtype=float), np.array(v_sup['pi_pt'], dtype=float)
@@ -1095,6 +1105,8 @@ def compute_intervertebral_metrics(vertebrae_data: list[dict],
                 step_post = float(np.linalg.norm(d_post))
                 step_ant = float(np.linalg.norm(d_ant))
             return float(min(step_post, step_ant))
+        elif has_any_lps:
+            return 0.0
         else:
             # Posterior wall step-off across disc space
             ps_inf = np.array(v_inf['ps_pt'], dtype=float)
@@ -1301,6 +1313,7 @@ def compute_intervertebral_metrics(vertebrae_data: list[dict],
 
 
 _INFERENCE_ENGINE = None
+_PROTOTYPE_BANK = None
 
 
 def get_aospine_inference_engine(model_path: str | Path | None = None):
@@ -1333,6 +1346,39 @@ def get_aospine_inference_engine(model_path: str | Path | None = None):
     return None
 
 
+def get_aospine_prototype_bank(bank_path: str | Path | None = None):
+    """Lazy-load singleton AOSpinePrototypeBank from JSON file.
+
+    Graceful fallback: Tries models/aospine_prototype_bank.json, then
+    data/processed/prototype_banks/bank_fold_0.json, returns None if neither exists.
+    """
+    global _PROTOTYPE_BANK
+    if _PROTOTYPE_BANK is not None:
+        return _PROTOTYPE_BANK
+
+    from spinal_ct.prototype_bank import AOSpinePrototypeBank
+
+    if bank_path is None:
+        default_json = Path('models/aospine_prototype_bank.json')
+        if default_json.exists():
+            bank_path = default_json
+        else:
+            fallback_json = Path('data/processed/prototype_banks/bank_fold_0.json')
+            if fallback_json.exists():
+                bank_path = fallback_json
+
+    if bank_path and Path(bank_path).exists():
+        try:
+            bank = AOSpinePrototypeBank().load(str(bank_path))
+            _PROTOTYPE_BANK = bank
+            return _PROTOTYPE_BANK
+        except Exception as e:
+            import warnings
+            warnings.warn(f"Failed to load AOSpinePrototypeBank from {bank_path}: {e}")
+            return None
+    return None
+
+
 @dataclass
 class BodySession:
     input_fingerprint: str
@@ -1360,6 +1406,8 @@ class BodySession:
     _cached_rois: tuple | None = None
     _cached_dl_sig: str | None = None
     _cached_dl_probs: dict | None = None
+    _cached_proto_sig: str | None = None
+    _cached_proto_result: dict | None = None
     parasagittal_slices: list[np.ndarray] | None = None
 
     def __post_init__(self):
@@ -1389,6 +1437,8 @@ class BodySession:
         self._cached_rois = None
         self._cached_dl_sig = None
         self._cached_dl_probs = None
+        self._cached_proto_sig = None
+        self._cached_proto_result = None
 
     def extract_dualstream_rois(self) -> tuple[np.ndarray, np.ndarray] | None:
         """Extract 5-channel 2.5D Body+Canal ROI and Posterior Arch ROI for Deep Learning."""
@@ -1678,7 +1728,7 @@ class BodySession:
                     body_rois = []
                     arch_rois = []
                     for s in session_list:
-                        if isinstance(s, BodySession) and s.mask is not None and s.mask.any():
+                        if isinstance(s, BodySession) and s.mask is not None and s.mask.any() and s.level in AOSPINE_TARGET_LEVELS:
                             sig = s._signature()
                             if getattr(s, '_cached_dl_sig', None) == sig and getattr(s, '_cached_dl_probs', None) is not None:
                                 dl_probs_map[s.level] = s._cached_dl_probs
@@ -1700,7 +1750,37 @@ class BodySession:
                             warnings.warn(f"DualStream batch inference failed: {ex}")
 
                 dl_concept_probs_list = [dl_probs_map.get(m['level']) for m in inter_metrics] if dl_probs_map else None
-                ranked_result = fuse_and_classify_spine(inter_metrics, dl_concept_probs_list=dl_concept_probs_list)
+
+                # Batch Prototype bank inference across spine session (T10-L5 only)
+                proto_results_map: dict[str, dict[str, Any]] = {}
+                bank = get_aospine_prototype_bank()
+                if bank is not None:
+                    from spinal_ct.prototype_bank import extract_roi_prototype_features
+                    for s in session_list:
+                        if isinstance(s, BodySession) and s.mask is not None and s.mask.any() and s.level in AOSPINE_TARGET_LEVELS:
+                            sig = s._signature()
+                            if getattr(s, '_cached_proto_sig', None) == sig and getattr(s, '_cached_proto_result', None) is not None:
+                                proto_results_map[s.level] = s._cached_proto_result
+                            else:
+                                rois = s.extract_dualstream_rois()
+                                if rois is not None:
+                                    try:
+                                        feats = extract_roi_prototype_features(rois[0], rois[1])
+                                        res = bank.predict(feats, level=s.level)
+                                        s._cached_proto_sig = sig
+                                        s._cached_proto_result = res
+                                        proto_results_map[s.level] = res
+                                    except Exception as ex_p:
+                                        import warnings
+                                        warnings.warn(f"Prototype inference failed for {s.level}: {ex_p}")
+
+                proto_results_list = [proto_results_map.get(m['level']) for m in inter_metrics] if proto_results_map else None
+                ranked_result = fuse_and_classify_spine(
+                    inter_metrics,
+                    dl_concept_probs_list=dl_concept_probs_list,
+                    dl_model_trained=(engine is not None),
+                    prototype_results_list=proto_results_list,
+                )
 
                 tot = len(ranked_result['ranked_vertebrae'])
                 for r_idx, ranked_eval in enumerate(ranked_result['ranked_vertebrae'], 1):
@@ -1711,6 +1791,9 @@ class BodySession:
                             eval_copy['rank'] = r_idx
                             eval_copy['total_ranked'] = tot
                             eval_copy['patient_summary'] = ranked_result['patient_summary']
+                            if lvl not in AOSPINE_TARGET_LEVELS and lvl != 'S1' and not getattr(s, 'doctor_confirmed_class', None):
+                                eval_copy['is_out_of_aospine_scope'] = True
+                                eval_copy['lesion_severity_score'] = 0.0
                             s.aospine = eval_copy
                             if self.level == lvl:
                                 self.aospine = eval_copy
@@ -1720,10 +1803,16 @@ class BodySession:
                     self.aospine['rank'] = 1
                     self.aospine['total_ranked'] = tot
                     self.aospine['patient_summary'] = ranked_result['patient_summary']
+                    if self.level not in AOSPINE_TARGET_LEVELS and self.level != 'S1' and not getattr(self, 'doctor_confirmed_class', None):
+                        self.aospine['is_out_of_aospine_scope'] = True
+                        self.aospine['lesion_severity_score'] = 0.0
             else:
                 self.aospine = evaluate_aospine_decision_tree({'level': self.level})
                 self.aospine['rank'] = 1
                 self.aospine['total_ranked'] = 1
+                if self.level not in AOSPINE_TARGET_LEVELS and self.level != 'S1' and not getattr(self, 'doctor_confirmed_class', None):
+                    self.aospine['is_out_of_aospine_scope'] = True
+                    self.aospine['lesion_severity_score'] = 0.0
         else:
             h = measure_heights(self.landmarks, self.plane)
             pw_delta = self.retropulsion.get('delta_posterior_mm', 0.0) if self.retropulsion else 0.0
@@ -1746,26 +1835,56 @@ class BodySession:
             }
             dl_concept = None
             engine = get_aospine_inference_engine()
-            if engine is not None and self.mask is not None and self.mask.any():
+            rois = None
+            if self.mask is not None and self.mask.any() and self.level in AOSPINE_TARGET_LEVELS:
                 sig = self._signature()
-                if getattr(self, '_cached_dl_sig', None) == sig and getattr(self, '_cached_dl_probs', None) is not None:
-                    dl_concept = self._cached_dl_probs
+                if engine is not None:
+                    if getattr(self, '_cached_dl_sig', None) == sig and getattr(self, '_cached_dl_probs', None) is not None:
+                        dl_concept = self._cached_dl_probs
+                    else:
+                        rois = self.extract_dualstream_rois()
+                        if rois is not None:
+                            try:
+                                batch_probs, _ = engine.predict_batch([rois[0]], [rois[1]])
+                                if batch_probs:
+                                    dl_concept = batch_probs[0]
+                                    self._cached_dl_sig = sig
+                                    self._cached_dl_probs = dl_concept
+                            except Exception:
+                                pass
+
+            proto_result = None
+            bank = get_aospine_prototype_bank()
+            if bank is not None and self.mask is not None and self.mask.any() and self.level in AOSPINE_TARGET_LEVELS:
+                sig = self._signature()
+                if getattr(self, '_cached_proto_sig', None) == sig and getattr(self, '_cached_proto_result', None) is not None:
+                    proto_result = self._cached_proto_result
                 else:
-                    rois = self.extract_dualstream_rois()
+                    if rois is None:
+                        rois = self.extract_dualstream_rois()
                     if rois is not None:
                         try:
-                            batch_probs, _ = engine.predict_batch([rois[0]], [rois[1]])
-                            if batch_probs:
-                                dl_concept = batch_probs[0]
-                                self._cached_dl_sig = sig
-                                self._cached_dl_probs = dl_concept
+                            from spinal_ct.prototype_bank import extract_roi_prototype_features
+                            feats = extract_roi_prototype_features(rois[0], rois[1])
+                            proto_result = bank.predict(feats, level=self.level)
+                            self._cached_proto_sig = sig
+                            self._cached_proto_result = proto_result
                         except Exception:
                             pass
 
             dl_concept_list = [dl_concept] if dl_concept else None
+            proto_result_list = [proto_result] if proto_result else None
             inter_metrics = compute_intervertebral_metrics([v_metrics])
-            ranked_result = fuse_and_classify_spine(inter_metrics, dl_concept_probs_list=dl_concept_list)
+            ranked_result = fuse_and_classify_spine(
+                inter_metrics,
+                dl_concept_probs_list=dl_concept_list,
+                dl_model_trained=(engine is not None),
+                prototype_results_list=proto_result_list,
+            )
             eval_res = ranked_result['ranked_vertebrae'][0]
+            if self.level not in AOSPINE_TARGET_LEVELS and self.level != 'S1' and not getattr(self, 'doctor_confirmed_class', None):
+                eval_res['is_out_of_aospine_scope'] = True
+                eval_res['lesion_severity_score'] = 0.0
             eval_res['rank'] = 1
             eval_res['total_ranked'] = 1
             eval_res['patient_summary'] = ranked_result['patient_summary']
@@ -1891,6 +2010,12 @@ def save_session(session, output, *, samples=100_000, seed=42):
             np.save(root/'normalized_mask.npy', normalized['mask'].astype(np.uint8), allow_pickle=False)
             aospine = report.get('aospine') or {}
             raw_metrics = aospine.get('raw_metrics') or {}
+            fusion_diag = aospine.get('fusion_diagnostics') or {}
+            proto_res = fusion_diag.get('prototype_result') or {}
+            p_anom_val = proto_res.get('p_anomaly')
+            proto_cls_val = proto_res.get('predicted_class')
+            guards_val = ';'.join(fusion_diag.get('triggered_guards', []))
+
             flat = dict(level=session.level, source_kind=session.source_kind, age_group=session.age_group,
                         area_mm2=report['features']['area_mm2'], fill_ratio=report['features']['fill_ratio'],
                         solidity=report['features']['solidity'], height_width_ratio=report['features']['height_width_ratio'],
@@ -1905,6 +2030,9 @@ def save_session(session, output, *, samples=100_000, seed=42):
                         isp_ratio=raw_metrics.get('isp_ratio', 1.0),
                         translation_mm=raw_metrics.get('translation_mm', 0.0),
                         relative_collapse_ratio=raw_metrics.get('relative_collapse_ratio', 1.0),
+                        p_anomaly=round(float(p_anom_val), 4) if p_anom_val is not None else '',
+                        prototype_class=str(proto_cls_val) if proto_cls_val else '',
+                        triggered_guards=guards_val,
                         doctor_confirmed_class=getattr(session, 'doctor_confirmed_class', None) or '',
                         aospine_modifiers=';'.join(aospine.get('modifiers', [])),
                         aospine_rationale=aospine.get('clinical_rationale_vi', ''),
@@ -1920,6 +2048,7 @@ def save_session(session, output, *, samples=100_000, seed=42):
             export_preview(session, report, root/'preview.png')
             rows = ''.join(f'<tr><th>{html.escape(str(k))}</th><td>{html.escape(str(v))}</td></tr>' for k, v in flat.items())
             aospine_html = ''
+            pillar_html = ''
             if aospine:
                 cls_name = aospine.get('predicted_class', 'Normal')
                 conf = float(aospine.get('confidence', 0.0))
@@ -1935,11 +2064,49 @@ def save_session(session, output, *, samples=100_000, seed=42):
                     f'<tr><th>Lý giải lâm sàng</th><td>{rationale}</td></tr>'
                     f'{mod_row}</table>'
                 )
+
+                if fusion_diag:
+                    p_anom_pct = f"{float(p_anom_val)*100:.1f}%" if p_anom_val is not None else "N/A"
+                    proto_ref_lvl = proto_res.get('reference_level', session.level)
+                    proto_pred = proto_res.get('predicted_class', 'Normal')
+                    dl_probs = fusion_diag.get('raw_p_dl') or fusion_diag.get('dl_probs') or {}
+                    rule_probs = fusion_diag.get('raw_p_rule') or fusion_diag.get('rule_probs') or {}
+                    guards_list = fusion_diag.get('triggered_guards') or []
+                    guards_str = '<br>'.join(f"• {html.escape(g)}" for g in guards_list) if guards_list else '<span style="color:#27ae60">Không có chốt nào bị kích hoạt</span>'
+                    doc_conf = getattr(session, 'doctor_confirmed_class', None) or 'Theo gợi ý AI'
+
+                    dl_str = (
+                        f"P_frac={dl_probs.get('p_fracture', 0.0):.2f}, "
+                        f"P_pw={dl_probs.get('p_pw', 0.0):.2f}, "
+                        f"P_tb={dl_probs.get('p_post_tb', 0.0):.2f}, "
+                        f"P_trans={dl_probs.get('p_trans', 0.0):.2f}"
+                    ) if dl_probs else '<span style="color:#7f8c8d">Không khả dụng (Chạy Fallback)</span>'
+
+                    pillar_html = (
+                        f'<h2>Kiến trúc Hợp nhất 3 Trụ cột (Three-Pillar AI Fusion)</h2>'
+                        f'<table>'
+                        f'<tr><th style="width:28%">Trụ cột 1: Luật Hình thái 3D (Geometric Rules)</th>'
+                        f'<td>Δ_post: {raw_metrics.get("delta_posterior_mm", 0.0):.1f} mm | ISP: {raw_metrics.get("isp_ratio", 1.0):.2f} | '
+                        f'Trượt: {raw_metrics.get("translation_mm", 0.0):.1f} mm | Xẹp: {raw_metrics.get("relative_collapse_ratio", 1.0):.2f}<br>'
+                        f'<small style="color:#555">Xác suất hình thái: P_frac={rule_probs.get("p_fracture", 0.0):.2f}, P_pw={rule_probs.get("p_pw", 0.0):.2f}, '
+                        f'P_tb={rule_probs.get("p_post_tb", 0.0):.2f}, P_trans={rule_probs.get("p_trans", 0.0):.2f}</small></td></tr>'
+                        f'<tr><th>Trụ cột 2: Ngân hàng Mẫu 2 Bước (Prototype Bank w=0.3)</th>'
+                        f'<td>Điểm bất thường P_anomaly: <strong>{p_anom_pct}</strong> (Đối sánh chuẩn lành {proto_ref_lvl}) | '
+                        f'Lớp tổn thương gợi ý: <strong>{html.escape(str(proto_pred))}</strong></td></tr>'
+                        f'<tr><th>Trụ cột 3: Mạng Nơ-ron 2.5D Dual-Stream CNN</th>'
+                        f'<td>{dl_str}</td></tr>'
+                        f'<tr><th>Chốt bảo vệ Cơ sinh học (Guards)</th>'
+                        f'<td>{guards_str}</td></tr>'
+                        f'<tr><th>Bác sĩ phê duyệt (Human-in-the-loop)</th>'
+                        f'<td><strong style="color:#2c3e50">{html.escape(str(doc_conf))}</strong></td></tr>'
+                        f'</table>'
+                    )
+
             (root/'report.html').write_text('<!doctype html><html lang="vi"><meta charset="utf-8">'
                 '<title>Đo thân đốt sống</title><style>body{font:16px sans-serif;max-width:1200px;margin:30px auto}'
                 'th,td{padding:8px;text-align:left;border-bottom:1px solid #ccc}table{width:100%;margin-bottom:20px}img{width:100%}</style>'
                 '<h1>Đo hình dạng thân đốt sống & Phân loại AO Spine</h1><p>Vùng đo được người dùng xác nhận; kết quả cần kiểm tra. '
-                'Khoảng Monte Carlo chỉ mô tả sai số lấy mẫu trên mask.</p>' + aospine_html +
+                'Khoảng Monte Carlo chỉ mô tả sai số lấy mẫu trên mask.</p>' + aospine_html + pillar_html +
                 '<h2>Chi tiết hình thái học</h2><table>'+rows+
                 '</table><img src="preview.png" alt="Vùng đo, chuẩn hóa và hội tụ diện tích"></html>', encoding='utf-8')
         root.rename(output)
@@ -2020,16 +2187,22 @@ class SpineSession:
             if s.aospine:
                 self.ranked_vertebrae.append(s.aospine)
 
+        has_target_levels = any(
+            s.level in AOSPINE_TARGET_LEVELS for s in sorted_sessions
+        )
+
         def _spine_rank_sort_key(ev: dict):
             cls = ev.get('predicted_class', '')
             is_excluded = (
                 cls in ('Ngoài vùng khảo sát (Chạm biên CT)', 'S1 (Tham chiếu)', 'Chưa đặt đủ 6 mốc')
                 or ev.get('is_fov_truncated', False)
                 or ev.get('is_indeterminate', False)
+                or ev.get('is_out_of_aospine_scope', False)
             )
+            is_outside = (ev.get('level') not in AOSPINE_TARGET_LEVELS) if has_target_levels else False
             lvl = ev.get('level', '')
             lvl_idx = LEVELS.index(lvl) if lvl in LEVELS else 999
-            return (1 if is_excluded else 0, -ev.get('lesion_severity_score', 0.0), lvl_idx)
+            return (1 if is_excluded else 0, 1 if is_outside else 0, -ev.get('lesion_severity_score', 0.0), lvl_idx)
 
         self.ranked_vertebrae.sort(key=_spine_rank_sort_key)
         for rank_idx, v in enumerate(self.ranked_vertebrae, 1):
@@ -2038,6 +2211,10 @@ class SpineSession:
                 self.sessions[v['level']].aospine['rank'] = rank_idx
 
         self.patient_summary = (first_session.aospine or {}).get('patient_summary', {})
+        if self.ranked_vertebrae and has_target_levels:
+            top1_ranked = self.ranked_vertebrae[0]
+            if top1_ranked.get('patient_summary'):
+                self.patient_summary = top1_ranked['patient_summary']
         return dict(ranked_vertebrae=self.ranked_vertebrae, patient_summary=self.patient_summary)
 
     def save_session(self, output_dir: Path | str, *, samples=100_000, seed=42) -> Path:

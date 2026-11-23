@@ -120,7 +120,7 @@ class TestAOSpineRules(unittest.TestCase):
             'hm_hp_ratio': 0.85,
             'relative_collapse_ratio': 0.65,
             'delta_posterior_mm': 3.8,
-            'isp_ratio': 1.42,  # Distracted spinous process (ISP ratio > 1.30)
+            'isp_ratio': 1.50,  # Distracted spinous process (ISP ratio >= 1.45)
             'anterior_disc_angle_deg': 3.0,
             'disc_opening_ratio': 1.0,
             'translation_mm': 0.8,
@@ -132,7 +132,7 @@ class TestAOSpineRules(unittest.TestCase):
         self.assertIn('B2 (kèm gãy thân đốt kiểu A4)', res['clinical_rationale_vi'])
 
     def test_case_b3_hyperextension(self):
-        """Test B3 anterior tension band disruption: gaping anterior disc (19.5 deg, ratio 2.4)."""
+        """Test B3 anterior tension band disruption: gaping anterior disc (26.5 deg, ratio 2.4)."""
         metrics = {
             'level': 'T11',
             'ha_hp_ratio': 1.05,
@@ -140,7 +140,7 @@ class TestAOSpineRules(unittest.TestCase):
             'relative_collapse_ratio': 0.98,
             'delta_posterior_mm': 0.0,
             'isp_ratio': 1.02,
-            'anterior_disc_angle_deg': 19.5,
+            'anterior_disc_angle_deg': 26.5,  # Traumatic anterior disc gaping (>= 25.0 deg for intact body)
             'disc_opening_ratio': 2.4,
             'translation_mm': 0.5,
             'q_seg': 0.90,
@@ -152,7 +152,7 @@ class TestAOSpineRules(unittest.TestCase):
         self.assertIn('Tổn thương dải căng trước loại B3', res['clinical_rationale_vi'])
 
     def test_case_c_translation(self):
-        """Test Type C translation/dislocation: lateral/AP slip 5.2 mm (threshold 3.5 mm)."""
+        """Test Type C translation/dislocation: lateral/AP slip 5.8 mm (threshold 4.5 mm / intact body 5.5 mm)."""
         metrics = {
             'level': 'T12',
             'ha_hp_ratio': 0.90,
@@ -162,7 +162,7 @@ class TestAOSpineRules(unittest.TestCase):
             'isp_ratio': 1.10,
             'anterior_disc_angle_deg': 4.0,
             'disc_opening_ratio': 1.1,
-            'translation_mm': 5.2,
+            'translation_mm': 5.8,
             'q_seg': 0.85,
         }
         res = evaluate_aospine_decision_tree(metrics)

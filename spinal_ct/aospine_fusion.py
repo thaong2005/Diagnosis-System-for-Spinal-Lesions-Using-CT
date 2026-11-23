@@ -89,6 +89,7 @@ def fuse_vertebra_concept_probabilities(
     metrics: dict[str, Any],
     dl_probs: dict[str, float] | None = None,
     dl_model_trained: bool = True,
+    prototype_result: dict[str, Any] | None = None,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     """Fuse physical rule probabilities with DL visual concept probabilities for one vertebra.
 
@@ -97,6 +98,9 @@ def fuse_vertebra_concept_probabilities(
     - Bone Fragment Floor Guard: delta_pw >= 2.8mm -> S_pw >= 0.65
     - Distraction Floor Guard: isp_ratio >= 1.35 -> S_post_tb >= 0.65
     - Translation Floor Guard: translation_mm >= 3.5mm -> S_trans >= 0.65
+    - 2-Step Prototype Bank Gating & Support:
+      - Normal Prototype Anomaly Gating: p_anomaly < 0.35 -> suppresses false positive concept alarms.
+      - Lesion Prototype Distraction / Burst Support: boosts tension band or burst concepts when confirmed by prototype.
 
     Parameters
     ----------
@@ -106,6 +110,8 @@ def fuse_vertebra_concept_probabilities(
         Probabilities predicted by DualStreamAOSpineNet.
     dl_model_trained : bool
         Whether DL model is trained and active.
+    prototype_result : dict[str, Any], optional
+        Output from AOSpinePrototypeBank.predict() or compute_normal_anomaly_score().
 
     Returns
     -------
@@ -187,41 +193,119 @@ def fuse_vertebra_concept_probabilities(
     dl_tb = dl_probs_used.get('p_post_tb', 0.0) if dl_probs_used else 0.0
     is_true_dl_distraction = (dl_tb >= 0.50)
 
-    if isp_ratio >= 1.35 and (is_true_dl_distraction or not is_classic_a1_wedge):
+    if isp_ratio >= 1.45 or (isp_ratio >= 1.35 and is_true_dl_distraction):
         s_post_tb = max(s_post_tb, 0.65)
         s_frac = max(s_frac, 0.65)
         triggered_guards.append(
             f"Distraction Floor Guard (isp_ratio={isp_ratio:.2f}: S_post_tb and S_frac floored to 0.65)"
         )
-    elif is_classic_a1_wedge and not is_true_dl_distraction:
+    elif is_classic_a1_wedge and not is_true_dl_distraction and isp_ratio < 1.45:
         max_tb = 0.02 if isp_ratio < 1.30 else 0.10
         s_post_tb = min(s_post_tb, max_tb)
         triggered_guards.append(
             f"Classic A1 Wedge Guard (Ha/Hp={ha_hp:.2f}, delta_pw={delta_pw:.1f}mm: S_post_tb constrained to <= {max_tb:.2f})"
         )
 
-    # Guard 4: Translation Floor Guard (Dislocation C)
-    if trans_mm >= 3.5:
+    # --- Đọc sớm tín hiệu từ 2-Step Prototype Bank (đặt trước Guard 4 & Guard 6) ---
+    p_anom_val = None
+    p_anom = 0.5
+    proto_cls = ''
+    proto_probs: dict[str, Any] = {}
+    if prototype_result:
+        p_anom = float(prototype_result.get('p_anomaly', 0.5))
+        p_anom_val = p_anom
+        proto_cls = str(prototype_result.get('predicted_class', ''))
+        proto_probs = (
+            prototype_result.get('class_probabilities')
+            or prototype_result.get('confidence_distribution')
+            or {}
+        )
+
+    p_b2 = float(proto_probs.get('B2', 0.0))
+    is_proto_b2 = (
+        prototype_result is not None
+        and (proto_cls == 'B2' or p_b2 >= 0.45)
+        and p_anom >= 0.55
+        and not is_classic_a1_wedge
+    )
+
+    # Regional Level-Aware Thresholds
+    level_str = str(metrics.get('level', '')).upper()
+    if any(lvl in level_str for lvl in ('L4', 'L5')):
+        trans_thresh = 5.5
+    elif 'L3' in level_str:
+        trans_thresh = 4.5
+    else:
+        trans_thresh = 3.8
+
+    is_lumbar = any(lvl in level_str for lvl in ('L2', 'L3', 'L4', 'L5'))
+    disc_angle_thresh = 23.0 if is_lumbar else 15.0
+    disc_ratio_thresh = 2.0 if is_lumbar else 1.8
+
+    # Guard 4: Translation Floor Guard (phân tách Burst Collapse A3/A4 vs Dislocation C)
+    is_burst_collapse = (rel_coll < 0.78 and delta_pw >= 2.5)
+    dl_trans_low = (dl_probs_used.get('p_trans', 0.5) < 0.50) if dl_probs_used else False
+    proto_is_burst = (proto_cls in ('A3', 'A4'))
+    effective_trans_thresh = (
+        trans_thresh + 1.5
+        if (is_burst_collapse and (proto_is_burst or dl_trans_low))
+        else trans_thresh
+    )
+
+    if trans_mm >= effective_trans_thresh:
         s_trans = max(s_trans, 0.65)
         s_frac = max(s_frac, 0.65)
         triggered_guards.append(
-            f"Translation Floor Guard (translation_mm={trans_mm:.1f}mm: S_trans and S_frac floored to 0.65)"
+            f"Translation Floor Guard (translation_mm={trans_mm:.1f}mm >= {effective_trans_thresh:.1f}mm: S_trans floored to 0.65)"
+        )
+    elif is_burst_collapse and (proto_is_burst or dl_trans_low) and trans_mm < effective_trans_thresh:
+        s_trans = min(s_trans, 0.45)
+        triggered_guards.append(
+            f"Burst Collapse Guard (rel_coll={rel_coll:.2f}, delta_pw={delta_pw:.1f}mm: S_trans capped <= 0.45)"
         )
 
     # Guard 5: Hyperextension / Anterior Tension Band Floor Guard (Type B3)
-    if (disc_deg >= 15.0 and disc_ratio >= 1.8) or p_rule['p_ant_tb'] >= 0.65:
+    if (disc_deg >= disc_angle_thresh and disc_ratio >= disc_ratio_thresh) or p_rule['p_ant_tb'] >= 0.65:
         s_ant_tb = max(s_ant_tb, 0.65)
         s_frac = max(s_frac, 0.65)
         triggered_guards.append(
             f"Anterior Tension Band Floor Guard (angle={disc_deg:.1f}deg, ratio={disc_ratio:.2f}: S_ant_tb and S_frac floored to 0.65)"
         )
 
-    # Guard 6: Intact Tension Band Guard (Prevents CNN vertical laminar crack noise triggering false B2)
-    if q_seg >= 0.75 and isp_ratio < 1.12 and p_rule['p_post_tb'] < 0.15:
+    # Guard 6: Intact Tension Band Guard (không triệt tiêu khi Prototype xác nhận B2)
+    if (not is_proto_b2) and q_seg >= 0.75 and isp_ratio < 1.12 and p_rule['p_post_tb'] < 0.15:
         s_post_tb = min(s_post_tb, 0.35)
         if (dl_probs_used.get('p_post_tb', 0.0) >= 0.40 or s_post_tb >= 0.35) and dl_probs_used:
             triggered_guards.append(
                 f"Intact Tension Band Guard (q_seg={q_seg:.2f}, isp_ratio={isp_ratio:.2f}: S_post_tb constrained to {s_post_tb:.4f} <= 0.35)"
+            )
+
+    # Guard 7 & 8: 2-Step Prototype Bank Gating & Support
+    if prototype_result:
+        # 1. Anomaly Gating
+        if p_anom < 0.35 and delta_pw < 1.5 and trans_mm < 4.0:
+            s_pw = min(s_pw, 0.20)
+            s_post_tb = min(s_post_tb, 0.20)
+            s_frac = min(s_frac, 0.25)
+            triggered_guards.append(
+                f"Prototype Anomaly Gating (p_anomaly={p_anom:.3f} < 0.35: suppressed concept activations)"
+            )
+
+        # 2. Distraction / B2 Support (đồng bộ ngưỡng >= 0.70 với aospine_rules.py)
+        if is_proto_b2:
+            s_post_tb = max(s_post_tb, 0.70)
+            s_frac = max(s_frac, 0.65)
+            triggered_guards.append(
+                f"Prototype B2 Support (B2 prob={p_b2:.2f}, p_anomaly={p_anom:.2f}: S_post_tb floored to 0.70)"
+            )
+
+        # 3. Burst / Retropulsion Support
+        p_burst = float(proto_probs.get('A3', 0.0)) + float(proto_probs.get('A4', 0.0))
+        if (proto_cls in ('A3', 'A4') or p_burst >= 0.50) and p_anom >= 0.50 and delta_pw >= 2.0:
+            s_pw = max(s_pw, 0.60)
+            s_frac = max(s_frac, 0.65)
+            triggered_guards.append(
+                f"Prototype Burst Support (p_anomaly={p_anom:.2f}, delta_pw={delta_pw:.1f}mm)"
             )
 
     fused_probs = {
@@ -233,6 +317,8 @@ def fuse_vertebra_concept_probabilities(
         'p_fracture': float(round(float(np.clip(s_frac, 0.01, 0.99)), 4)),
         'p_split': p_rule.get('p_split', 0.0),
     }
+    if p_anom_val is not None:
+        fused_probs['p_anomaly'] = p_anom_val
 
     diagnostics = {
         'alpha_weights': alphas,
@@ -241,6 +327,7 @@ def fuse_vertebra_concept_probabilities(
         'fused_probs': fused_probs,
         'triggered_guards': triggered_guards,
         'q_seg': q_seg,
+        'prototype_result': prototype_result or {},
     }
 
     return fused_probs, diagnostics
@@ -250,8 +337,9 @@ def fuse_and_classify_spine(
     vertebrae_metrics: list[dict[str, Any]],
     dl_concept_probs_list: list[dict[str, float]] | None = None,
     dl_model_trained: bool = True,
+    prototype_results_list: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Fuse physical rules and DL visual features across spine and produce ranked diagnosis.
+    """Fuse physical rules, 2-step prototype bank, and DL visual features across spine.
 
     Parameters
     ----------
@@ -261,6 +349,8 @@ def fuse_and_classify_spine(
         Precomputed DL concept probabilities matching vertebrae_metrics.
     dl_model_trained : bool
         Whether DL concept predictions should be dynamically fused.
+    prototype_results_list : list of dict, optional
+        Precomputed 2-step prototype inference results matching vertebrae_metrics.
 
     Returns
     -------
@@ -281,10 +371,15 @@ def fuse_and_classify_spine(
         if dl_concept_probs_list and idx < len(dl_concept_probs_list):
             dl_p = dl_concept_probs_list[idx]
 
+        proto_r = None
+        if prototype_results_list and idx < len(prototype_results_list):
+            proto_r = prototype_results_list[idx]
+
         fused_p, diag = fuse_vertebra_concept_probabilities(
             item,
             dl_probs=dl_p,
             dl_model_trained=dl_model_trained,
+            prototype_result=proto_r,
         )
         fused_probs_list.append(fused_p)
         level_key = str(item.get('level', f"V_{idx}"))
