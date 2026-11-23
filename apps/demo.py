@@ -349,6 +349,11 @@ class DemoWindow(QMainWindow):
         navigation.addWidget(self.next_button)
         top_layout.addLayout(navigation)
 
+        self.triage_banner = QLabel('Chưa có dữ liệu đo thân đốt. Chọn đốt và bấm "Đo thân đốt" để kích hoạt chẩn đoán AO Spine 3 Trụ cột.')
+        self.triage_banner.setStyleSheet('background:#f8f9fa; color:#56717f; border:1px solid #dcdcdc; border-radius:4px; padding:6px; font-size:11px;')
+        self.triage_banner.setWordWrap(True)
+        top_layout.addWidget(self.triage_banner)
+
         tabs = QTabWidget()
         tabs.setMinimumHeight(130)
         self.table = QTableWidget(0, 5)
@@ -563,6 +568,9 @@ class DemoWindow(QMainWindow):
         self.source_label.setText('Đang đọc ca mới…')
         self.geometry_label.setText('Đang kiểm tra HU và geometry…')
         self.result_label.setText('Chưa có kết quả cho ca mới.')
+        if hasattr(self, 'triage_banner'):
+            self.triage_banner.setStyleSheet('background:#f8f9fa; color:#56717f; border:1px solid #dcdcdc; border-radius:4px; padding:6px; font-size:11px;')
+            self.triage_banner.setText('Chưa có dữ liệu đo thân đốt. Chọn đốt và bấm "Đo thân đốt" để kích hoạt chẩn đoán AO Spine 3 Trụ cột.')
         self.redraw()
         self._sync()
 
@@ -598,6 +606,150 @@ class DemoWindow(QMainWindow):
                 self.saved_results = saved
                 self.refresh_saved_results()
 
+    def _get_region_state_text(self, kind, level):
+        saved = self.region_paths.get((kind, level))
+        if not saved:
+            return 'Chưa kiểm tra'
+        folder = Path(saved)
+        if not folder.exists():
+            return 'Chưa kiểm tra'
+
+        meas_file = folder / 'measurements.json'
+        reg_file = folder / 'region.json'
+
+        reviewed = False
+        doc_cls = None
+        if reg_file.is_file():
+            try:
+                reg_doc = json.loads(reg_file.read_text(encoding='utf-8'))
+                reviewed = bool(reg_doc.get('reviewed', False))
+                doc_cls = reg_doc.get('doctor_confirmed_class')
+            except Exception:
+                pass
+
+        if meas_file.is_file():
+            try:
+                meas_doc = json.loads(meas_file.read_text(encoding='utf-8'))
+                aospine = meas_doc.get('aospine') or {}
+                if not doc_cls:
+                    doc_cls = aospine.get('doctor_confirmed_class')
+                cls_name = aospine.get('predicted_class', '')
+                sec = f"+{aospine['secondary_subtype']}" if aospine.get('secondary_subtype') else ''
+                conf = aospine.get('confidence')
+
+                if doc_cls:
+                    tag = f"Bác sĩ xác nhận: {doc_cls}"
+                elif cls_name:
+                    conf_str = f" ({float(conf):.0%})" if conf is not None else ""
+                    tag = f"AO Spine: {cls_name}{sec}{conf_str}"
+                else:
+                    tag = 'Đã đo'
+                rev_str = 'Đã xác nhận' if reviewed else 'Vùng nháp'
+                return f"Đã lưu · {rev_str} · {tag}"
+            except Exception:
+                pass
+
+        rev_str = 'Đã xác nhận' if reviewed else 'Vùng nháp'
+        return f"Đã lưu · {rev_str}"
+
+    def _update_triage_banner(self):
+        if not getattr(self, 'triage_banner', None):
+            return
+        if not self.study:
+            self.triage_banner.setStyleSheet('background:#f8f9fa; color:#56717f; border:1px solid #dcdcdc; border-radius:4px; padding:6px; font-size:11px;')
+            self.triage_banner.setText('Chưa có dữ liệu đo thân đốt. Chọn đốt và bấm "Đo thân đốt" để kích hoạt chẩn đoán AO Spine 3 Trụ cột.')
+            return
+
+        slug = (self.study.get('patient') or {}).get('slug') or 'benh_nhan'
+        current_kind = self.mode.currentText()
+        candidate_summary_paths = [
+            ROOT / 'data/output' / slug / 'do_than_dot' / current_kind / 'spine_patient_summary.json',
+            ROOT / 'data/output' / slug / 'do_than_dot' / 'spine_patient_summary.json',
+        ]
+        summary_doc = None
+        for p in candidate_summary_paths:
+            if p.is_file():
+                try:
+                    summary_doc = json.loads(p.read_text(encoding='utf-8'))
+                    break
+                except Exception:
+                    pass
+
+        primary_lvl = None
+        primary_cls = None
+        primary_conf = 0.0
+        top2_levels = []
+        has_instability = False
+        total_measured = 0
+        all_normal = True
+
+        if summary_doc and summary_doc.get('patient_summary'):
+            psum = summary_doc['patient_summary']
+            primary_lvl = psum.get('primary_lesion_level')
+            primary_cls = psum.get('primary_aospine_class')
+            primary_conf = float(psum.get('confidence', 0.0))
+            top2_levels = psum.get('top2_levels') or []
+            has_instability = bool(psum.get('has_surgical_instability', False))
+            total_measured = len(summary_doc.get('ranked_vertebrae', []))
+            all_normal = (primary_cls == 'Normal')
+        else:
+            vertebrae_diagnoses = []
+            for (kind, lvl), path_str in self.region_paths.items():
+                if kind != current_kind and current_kind in ('Baseline', 'Consensus'):
+                    continue
+                p = Path(path_str)
+                meas_file = p / 'measurements.json'
+                if meas_file.is_file():
+                    try:
+                        meas = json.loads(meas_file.read_text(encoding='utf-8'))
+                        ao = meas.get('aospine') or {}
+                        cls_name = ao.get('predicted_class', '')
+                        conf = float(ao.get('confidence', 0.0))
+                        surg = bool(ao.get('requires_surgical_evaluation', False) or cls_name in ('B2', 'B3', 'C', 'A4', 'A3'))
+                        sev = float(ao.get('lesion_severity_score', 0.0))
+                        if cls_name:
+                            vertebrae_diagnoses.append({
+                                'level': lvl,
+                                'class': cls_name,
+                                'confidence': conf,
+                                'surg': surg,
+                                'severity': sev,
+                            })
+                    except Exception:
+                        pass
+            if vertebrae_diagnoses:
+                total_measured = len(vertebrae_diagnoses)
+                vertebrae_diagnoses.sort(key=lambda x: (-1 if x['surg'] else 0, -x['severity'], -x['confidence']))
+                primary = vertebrae_diagnoses[0]
+                primary_lvl = primary['level']
+                primary_cls = primary['class']
+                primary_conf = primary['confidence']
+                has_instability = any(v['surg'] for v in vertebrae_diagnoses)
+                top2_levels = [v['level'] for v in vertebrae_diagnoses[:2]]
+                all_normal = all(v['class'] == 'Normal' for v in vertebrae_diagnoses)
+
+        if total_measured == 0:
+            self.triage_banner.setStyleSheet('background:#f8f9fa; color:#56717f; border:1px solid #dcdcdc; border-radius:4px; padding:6px; font-size:11px;')
+            self.triage_banner.setText('Chưa có dữ liệu đo thân đốt. Chọn đốt và bấm "Đo thân đốt" để kích hoạt chẩn đoán AO Spine 3 Trụ cột.')
+        elif has_instability:
+            self.triage_banner.setStyleSheet('background:#fee2e2; color:#991b1b; border:1px solid #f87171; border-radius:4px; padding:6px; font-size:12px; font-weight:bold;')
+            self.triage_banner.setText(
+                f"⚠️ CẢNH BÁO MẤT VỮNG CỘT SỐNG CẦN HỘI CHẨN NGOẠI KHOA | Tổn thương chính (Top-1): {primary_lvl} ({primary_cls}, {primary_conf:.0%}) | Top-2: {', '.join(top2_levels)} | Đã đo: {total_measured} đốt"
+            )
+        elif primary_cls and primary_cls != 'Normal':
+            self.triage_banner.setStyleSheet('background:#fef3c7; color:#92400e; border:1px solid #fcd34d; border-radius:4px; padding:6px; font-size:12px;')
+            self.triage_banner.setText(
+                f"⚡ PHÁT HIỆN TỔN THƯƠNG AO SPINE | Đốt tổn thương: {primary_lvl} ({primary_cls}, {primary_conf:.0%}) | Top-2: {', '.join(top2_levels)} | Đã đo: {total_measured} đốt | Cần bác sĩ đối chiếu lâm sàng"
+            )
+        elif all_normal:
+            self.triage_banner.setStyleSheet('background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; border-radius:4px; padding:6px; font-size:12px;')
+            self.triage_banner.setText(
+                f"✅ TOÀN BỘ CÁC ĐỐT ĐÃ ĐO ĐỀU BÌNH THƯỜNG (Normal) | {total_measured} đốt khảo sát không có dấu hiệu gãy hoặc mất vững"
+            )
+        else:
+            self.triage_banner.setStyleSheet('background:#f8f9fa; color:#56717f; border:1px solid #dcdcdc; border-radius:4px; padding:6px; font-size:11px;')
+            self.triage_banner.setText(f"Đã đo {total_measured} đốt sống. Tiếp tục kiểm tra các tầng còn lại.")
+
     def open_body_measurements_folder(self):
         slug = (self.study.get('patient') or {}).get('slug') if self.study else None
         target = None
@@ -630,8 +782,9 @@ class DemoWindow(QMainWindow):
             self.rename_patient_button.setEnabled(True)
             self.saved_results = study.get('saved_results', [])
             self.region_paths = study.get('saved_regions', {})
-            self.region_states = {key: 'Có bản lưu · Chưa mở kiểm tra' for key in self.region_paths}
+            self.region_states = {key: self._get_region_state_text(key[0], key[1]) for key in self.region_paths}
             self.refresh_saved_results()
+            self._update_triage_banner()
             if study.get('unreadable_results'):
                 self.log.appendPlainText('Một số báo cáo cũ không đọc được; có thể mở thư mục kết quả riêng.')
             self.source_label.setText(str(path))
@@ -879,6 +1032,7 @@ class DemoWindow(QMainWindow):
         self.table.blockSignals(False)
         if self.table.rowCount():
             self.table.selectRow(0)
+        self._update_triage_banner()
         self.redraw()
         self._sync()
 
@@ -908,11 +1062,10 @@ class DemoWindow(QMainWindow):
                 dialog.exec()
                 if isinstance(dialog.last_saved_path, Path):
                     self.region_paths[(kind, level)] = dialog.last_saved_path
-                state = ('Đã lưu · '+('Đã xác nhận' if dialog.last_saved_reviewed else 'Vùng nháp')
-                         if isinstance(dialog.last_saved_path, Path) else 'Chưa kiểm tra')
-                if isinstance(state, str):
-                    self.region_states[(kind, level)] = state
-                    self.table.setItem(row, 4, QTableWidgetItem(state))
+                state = self._get_region_state_text(kind, level)
+                self.region_states[(kind, level)] = state
+                self.table.setItem(row, 4, QTableWidgetItem(state))
+                self._update_triage_banner()
         self._task(lambda: sitk.ReadImage(str(path)), accepted, f'Mở công cụ đo thân đốt {level}…')
 
     def select_level(self):
