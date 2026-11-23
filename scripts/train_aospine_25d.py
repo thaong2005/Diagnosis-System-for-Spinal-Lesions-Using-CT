@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+import torchvision.transforms.functional as TF
 
 from scripts.prepare_aospine_dataset import map_aospine_to_concepts
 from spinal_ct.aospine_model import (
@@ -126,7 +127,7 @@ def generate_anatomical_dual_roi_sample(
     elif cls_upper == 'B2':
         # Posterior tension band disruption: wide interspinous separation
         ha_hp = float(rng.uniform(0.75, 0.95))
-        isp_ratio = float(rng.uniform(1.35, 1.70))
+        isp_ratio = float(rng.uniform(1.48, 1.80))
         delta_pw = float(rng.uniform(0.2, 1.8))
         body_roi[:3, r_top:r_bot, c_ant:c_post] += 0.50
         body_mask[r_top:r_bot, c_ant:c_post] = True
@@ -199,11 +200,13 @@ class AOSpineDualROIDataset(Dataset):
         self,
         records: list[dict[str, Any]],
         data_dir: Path | str | None = None,
-        bootstrap_realistic: bool = True,
+        augment: bool = False,
+        bootstrap_realistic: bool = False,
         seed: int = 42,
     ):
         self.records = records
         self.data_dir = Path(data_dir) if data_dir else None
+        self.augment = augment
         self.bootstrap_realistic = bootstrap_realistic
         self.seed = seed
 
@@ -215,22 +218,45 @@ class AOSpineDualROIDataset(Dataset):
         cls_name = rec.get('aospine_class', 'Normal')
         q_seg = float(rec.get('q_seg', 0.85))
 
-        # Check if actual pre-extracted numpy arrays exist
         sample_id = rec.get('sample_id', f"sample_{idx}")
-        b_file = self.data_dir / f"{sample_id}_body.npy" if self.data_dir else None
-        a_file = self.data_dir / f"{sample_id}_arch.npy" if self.data_dir else None
+        b_path = Path(rec['body_roi_path']) if rec.get('body_roi_path') else None
+        a_path = Path(rec['arch_roi_path']) if rec.get('arch_roi_path') else None
 
-        if b_file and b_file.is_file() and a_file and a_file.is_file():
-            body_roi = np.load(b_file).astype(np.float32)
-            arch_roi = np.load(a_file).astype(np.float32)
-            metrics = rec.get('morph_metrics', {})
-        else:
+        if (b_path is None or not b_path.is_file()) and self.data_dir:
+            b_path = self.data_dir / f"{sample_id}_body.npy"
+            a_path = self.data_dir / f"{sample_id}_arch.npy"
+
+        if b_path and b_path.is_file() and a_path and a_path.is_file():
+            body_roi = np.load(b_path).astype(np.float32)
+            arch_roi = np.load(a_path).astype(np.float32)
+            metrics = rec.get('morph_metrics', rec)
+        elif self.bootstrap_realistic:
             # Bootstrap anatomically realistic Dual-ROI tensor
             body_roi, arch_roi, metrics = generate_anatomical_dual_roi_sample(
                 cls_name=cls_name,
                 q_seg=q_seg,
                 seed=(self.seed + idx * 7) % 1_000_000,
             )
+        else:
+            raise FileNotFoundError(f"ROI files for {sample_id} not found and bootstrap_realistic=False")
+
+        body_t = torch.from_numpy(body_roi)
+        arch_t = torch.from_numpy(arch_roi)
+
+        if self.augment:
+            # Synchronous 2D affine augmentation: angle +-8 deg, translate +-5% (6.4 px)
+            angle = float(torch.empty(1).uniform_(-8.0, 8.0).item())
+            tx = float(torch.empty(1).uniform_(-6.4, 6.4).item())
+            ty = float(torch.empty(1).uniform_(-6.4, 6.4).item())
+
+            body_t = TF.affine(body_t, angle=angle, translate=[tx, ty], scale=1.0, shear=0.0)
+            arch_t = TF.affine(arch_t, angle=angle, translate=[tx, ty], scale=1.0, shear=0.0)
+
+            # CT intensity Gaussian noise sigma = 0.02 on CT channels (0, 1, 2)
+            noise_b = torch.randn_like(body_t[:3]) * 0.02
+            noise_a = torch.randn_like(arch_t[:3]) * 0.02
+            body_t[:3] = torch.clamp(body_t[:3] + noise_b, 0.0, 1.0)
+            arch_t[:3] = torch.clamp(arch_t[:3] + noise_a, 0.0, 1.0)
 
         # Concept mapping
         target = map_aospine_to_concepts(cls_name, morph_metrics=metrics)
@@ -239,12 +265,13 @@ class AOSpineDualROIDataset(Dataset):
         is_fractured = torch.tensor(target['is_fractured'], dtype=torch.float32)
 
         return {
-            'body_roi': torch.from_numpy(body_roi),
-            'arch_roi': torch.from_numpy(arch_roi),
+            'body_roi': body_t,
+            'arch_roi': arch_t,
             'y_concepts': y_concepts,
             'concept_mask': concept_mask,
             'is_fractured': is_fractured,
             'cls_name': cls_name,
+            'sample_id': sample_id,
         }
 
 
@@ -368,38 +395,45 @@ def train_aospine_dualstream(
     train_sids = set(fold['train_sample_ids'])
     val_sids = set(fold['val_sample_ids'])
 
-    # Build records list from ground truth or fold samples
-    gt_file = Path('data/raw/data ngay 27.09.2026.xlsx')
-    records: list[dict[str, Any]] = []
-
-    if gt_file.is_file():
-        from scripts.evaluate_aospine_baseline import load_ground_truth, parse_levels, strip_accents
-        gt = load_ground_truth(gt_file)
-        unique_cases = [v for k, v in gt.items() if k.startswith('case_')]
-        for c in unique_cases:
-            pid = c.get('patient_id') or strip_accents(c.get('name', '')) or f"case_{c.get('stt')}"
-            parsed = parse_levels(c.get('true_level', 'L1'))
-            lvl = parsed[0] if parsed else 'L1'
-            cls_name = c.get('true_class', 'Normal')
-            sid = f"{pid}_{lvl}"
-            records.append({
-                'sample_id': sid,
-                'patient_id': pid,
-                'level': lvl,
-                'aospine_class': cls_name,
-            })
+    # Build records list from manifest or ground truth fallback
+    manifest_file = Path('data/processed/aospine_rois/manifest.json')
+    if manifest_file.is_file():
+        manifest_data = json.loads(manifest_file.read_text(encoding='utf-8'))
+        sample_dict = {s['sample_id']: s for s in manifest_data.get('samples', [])}
+        train_records = [sample_dict[sid] for sid in fold['train_sample_ids'] if sid in sample_dict]
+        val_records = [sample_dict[sid] for sid in fold['val_sample_ids'] if sid in sample_dict]
     else:
-        # Fallback records
-        for sid in train_sids | val_sids:
-            records.append({
-                'sample_id': sid,
-                'patient_id': sid.split('_')[0],
-                'level': sid.split('_')[-1],
-                'aospine_class': 'A4' if 'A4' in sid else 'Normal',
-            })
+        gt_file = Path('data/raw/data ngay 27.09.2026.xlsx')
+        records: list[dict[str, Any]] = []
 
-    train_records = [r for r in records if r['sample_id'] in train_sids]
-    val_records = [r for r in records if r['sample_id'] in val_sids]
+        if gt_file.is_file():
+            from scripts.evaluate_aospine_baseline import load_ground_truth, parse_levels, strip_accents
+            gt = load_ground_truth(gt_file)
+            unique_cases = [v for k, v in gt.items() if k.startswith('case_')]
+            for c in unique_cases:
+                pid = c.get('patient_id') or strip_accents(c.get('name', '')) or f"case_{c.get('stt')}"
+                parsed = parse_levels(c.get('true_level', 'L1'))
+                lvl = parsed[0] if parsed else 'L1'
+                cls_name = c.get('true_class', 'Normal')
+                sid = f"{pid}_{lvl}"
+                records.append({
+                    'sample_id': sid,
+                    'patient_id': pid,
+                    'level': lvl,
+                    'aospine_class': cls_name,
+                })
+        else:
+            # Fallback records
+            for sid in train_sids | val_sids:
+                records.append({
+                    'sample_id': sid,
+                    'patient_id': sid.split('_')[0],
+                    'level': sid.split('_')[-1],
+                    'aospine_class': 'A4' if 'A4' in sid else 'Normal',
+                })
+
+        train_records = [r for r in records if r['sample_id'] in train_sids]
+        val_records = [r for r in records if r['sample_id'] in val_sids]
 
     # Verify zero leakage of rare classes into train set
     rare_challenge = set(splits_data.get('rare_class_challenge_set', []))
@@ -413,8 +447,18 @@ def train_aospine_dualstream(
         epochs = 2
         batch_size = 4
 
-    train_ds = AOSpineDualROIDataset(train_records, bootstrap_realistic=True, seed=seed)
-    val_ds = AOSpineDualROIDataset(val_records, bootstrap_realistic=True, seed=seed + 100)
+    train_ds = AOSpineDualROIDataset(
+        train_records,
+        augment=not smoke_test,
+        bootstrap_realistic=smoke_test,
+        seed=seed + fold_idx * 17,
+    )
+    val_ds = AOSpineDualROIDataset(
+        val_records,
+        augment=False,
+        bootstrap_realistic=smoke_test,
+        seed=seed + 100 + fold_idx * 17,
+    )
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
@@ -427,8 +471,31 @@ def train_aospine_dualstream(
 
     print(f"Training DualStreamAOSpineNet on Fold {fold_idx} ({len(train_records)} train, {len(val_records)} val) using {device}...")
 
+    # Multi-task loss positive class weighting for concept imbalance
+    n_frac_pos = sum(1 for r in train_records if r.get('is_fractured', 0) == 1 or r.get('aospine_class') != 'Normal')
+    n_frac_neg = len(train_records) - n_frac_pos
+    pos_weight_frac = float(np.clip(n_frac_neg / max(n_frac_pos, 1), 1.0, 10.0))
+
+    pw_c = []
+    for c_idx in range(4):
+        n_pos, n_neg = 0, 0
+        for r in train_records:
+            tgt = map_aospine_to_concepts(r.get('aospine_class', 'Normal'), morph_metrics=r)
+            if tgt['concept_mask'][c_idx] == 1:
+                if tgt['y_concepts'][c_idx] == 1:
+                    n_pos += 1
+                else:
+                    n_neg += 1
+        w = n_neg / max(n_pos, 1)
+        pw_c.append(float(np.clip(w, 1.0, 10.0)))
+    pos_weight_concepts = torch.tensor(pw_c, dtype=torch.float32)
+
     model = DualStreamAOSpineNet(in_channels=5, feature_dim=128).to(device)
-    criterion = MaskedMultiConceptLoss(fracture_weight=0.5)
+    criterion = MaskedMultiConceptLoss(
+        fracture_weight=0.5,
+        pos_weight_concepts=pos_weight_concepts,
+        pos_weight_frac=pos_weight_frac,
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
@@ -464,13 +531,16 @@ def train_aospine_dualstream(
     out_pt.parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), str(out_pt))
 
-    # Export clean ONNX model
-    out_onnx = Path(output_onnx_path)
-    export_to_onnx(model.cpu(), out_onnx, batch_size=8)
+    # Export clean ONNX model if path given
+    if output_onnx_path:
+        out_onnx = Path(output_onnx_path)
+        out_onnx.parent.mkdir(parents=True, exist_ok=True)
+        export_to_onnx(model.cpu(), out_onnx, batch_size=8)
+        onnx_str = str(out_onnx)
+    else:
+        onnx_str = ""
 
-    print(f"Training complete in {total_time:.1f}s.")
-    print(f"Best model saved to: {out_pt} (is_trained_checkpoint=True)")
-    print(f"ONNX exported to:     {out_onnx}")
+    print(f"Fold {fold_idx} complete in {total_time:.1f}s. Model: {out_pt}")
 
     return {
         'fold_idx': fold_idx,
@@ -478,10 +548,82 @@ def train_aospine_dualstream(
         'best_val_loss': best_val_loss,
         'total_time_seconds': round(total_time, 2),
         'model_path': str(out_pt),
-        'onnx_path': str(out_onnx),
+        'onnx_path': onnx_str,
         'epoch_losses': epoch_losses,
         'is_trained_checkpoint': True,
     }
+
+
+def train_all_folds(
+    splits_file: str | Path = 'data/processed/aospine_splits.json',
+    models_dir: str | Path = 'models',
+    epochs: int = 25,
+    batch_size: int = 8,
+    lr: float = 5e-4,
+    weight_decay: float = 1e-4,
+    device_name: str = 'auto',
+    smoke_test: bool = False,
+    seed: int = 42,
+) -> dict[str, Any]:
+    """Train DualStreamAOSpineNet across all 5 folds with zero patient leakage."""
+    import shutil
+    splits_path = Path(splits_file)
+    splits_data = json.loads(splits_path.read_text(encoding='utf-8'))
+    folds = splits_data['folds']
+    models_dir = Path(models_dir)
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    summaries = []
+    best_overall_val_loss = float('inf')
+    best_fold_idx = 0
+
+    for fid in range(len(folds)):
+        fold_model_path = models_dir / f"aospine_dualstream_fold{fid}.pt"
+        fold_onnx_path = models_dir / f"aospine_dualstream_fold{fid}.onnx"
+        print(f"\n=================== FOLD {fid + 1}/{len(folds)} ===================")
+        summary = train_aospine_dualstream(
+            splits_file=splits_file,
+            output_model_path=fold_model_path,
+            output_onnx_path=fold_onnx_path,
+            fold_idx=fid,
+            epochs=epochs,
+            batch_size=batch_size,
+            lr=lr,
+            weight_decay=weight_decay,
+            device_name=device_name,
+            smoke_test=smoke_test,
+            seed=seed + fid * 100,
+        )
+        summaries.append(summary)
+
+        if summary['best_val_loss'] < best_overall_val_loss:
+            best_overall_val_loss = summary['best_val_loss']
+            best_fold_idx = fid
+
+    # Copy best fold weights to best.pt and export best.onnx
+    best_fold_model = models_dir / f"aospine_dualstream_fold{best_fold_idx}.pt"
+    best_model_pt = models_dir / "aospine_dualstream_best.pt"
+    best_model_onnx = models_dir / "aospine_dualstream_best.onnx"
+    shutil.copyfile(best_fold_model, best_model_pt)
+
+    # Re-export clean ONNX for best model
+    best_net = DualStreamAOSpineNet(in_channels=5, feature_dim=128)
+    best_net.load_checkpoint(best_model_pt)
+    export_to_onnx(best_net.cpu(), best_model_onnx, batch_size=8)
+
+    full_summary = {
+        'total_folds': len(folds),
+        'best_fold_idx': best_fold_idx,
+        'best_overall_val_loss': best_overall_val_loss,
+        'best_model_path': str(best_model_pt),
+        'best_onnx_path': str(best_model_onnx),
+        'fold_summaries': summaries,
+    }
+    summary_path = models_dir / "training_5fold_summary.json"
+    summary_path.write_text(json.dumps(full_summary, indent=2, ensure_ascii=False), encoding='utf-8')
+    print(f"\n5-Fold Training Complete! Best Fold: {best_fold_idx} (Val Loss: {best_overall_val_loss:.4f})")
+    print(f"Summary written to: {summary_path}")
+    return full_summary
 
 
 def main() -> int:
@@ -489,27 +631,40 @@ def main() -> int:
     parser.add_argument('--splits', type=str, default='data/processed/aospine_splits.json', help="Splits file.")
     parser.add_argument('--output-model', type=str, default='models/aospine_dualstream_best.pt', help="Output weights.")
     parser.add_argument('--output-onnx', type=str, default='models/aospine_dualstream_best.onnx', help="Output ONNX.")
+    parser.add_argument('--all-folds', action='store_true', help="Train all 5 folds sequentially.")
     parser.add_argument('--fold', type=int, default=0, help="Fold index (0 to 4).")
-    parser.add_argument('--epochs', type=int, default=15, help="Epoch count.")
+    parser.add_argument('--epochs', type=int, default=25, help="Epoch count.")
     parser.add_argument('--batch-size', type=int, default=8, help="Batch size.")
-    parser.add_argument('--lr', type=float, default=1e-3, help="Learning rate.")
+    parser.add_argument('--lr', type=float, default=5e-4, help="Learning rate.")
     parser.add_argument('--smoke-test', action='store_true', help="Run rapid smoke test.")
     parser.add_argument('--device', type=str, default='auto', help="'auto', 'cpu', or 'cuda'.")
     parser.add_argument('--seed', type=int, default=42, help="Seed.")
     args = parser.parse_args()
 
-    train_aospine_dualstream(
-        splits_file=args.splits,
-        output_model_path=args.output_model,
-        output_onnx_path=args.output_onnx,
-        fold_idx=args.fold,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        device_name=args.device,
-        smoke_test=args.smoke_test,
-        seed=args.seed,
-    )
+    if args.all_folds:
+        train_all_folds(
+            splits_file=args.splits,
+            models_dir=Path(args.output_model).parent,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            device_name=args.device,
+            smoke_test=args.smoke_test,
+            seed=args.seed,
+        )
+    else:
+        train_aospine_dualstream(
+            splits_file=args.splits,
+            output_model_path=args.output_model,
+            output_onnx_path=args.output_onnx,
+            fold_idx=args.fold,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            device_name=args.device,
+            smoke_test=args.smoke_test,
+            seed=args.seed,
+        )
     return 0
 
 

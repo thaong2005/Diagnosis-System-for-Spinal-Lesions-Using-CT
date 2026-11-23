@@ -27,7 +27,11 @@ dist/
 /Expected_output/
 
 # Workspace theo phiên làm việc: bản nháp, ảnh, log và báo cáo cục bộ.
-# Chỉ đưa báo cáo đã chọn lọc vào docs/reports/.
 /20??-??-??/
 /outputs/
 Bao_cao_*.md
+docs/reports/
+docs/archive/reports/
+
+# Checkpoint fold trung gian trong huấn luyện (chỉ lưu trữ checkpoint tối ưu best trong git)
+models/aospine_dualstream_fold*

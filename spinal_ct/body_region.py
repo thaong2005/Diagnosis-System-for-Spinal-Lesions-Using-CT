@@ -65,6 +65,12 @@ class BodyPlane:
         return (np.asarray(self.origin_lps_mm) + xy_mm[0]*np.asarray(self.u_lps)
                 + xy_mm[1]*np.asarray(self.v_lps)).tolist()
 
+    def offset(self, offset_mm: float) -> 'BodyPlane':
+        """Return a parallel BodyPlane shifted along its normal vector by offset_mm."""
+        normal = np.cross(self.u_lps, self.v_lps)
+        new_origin = tuple(np.asarray(self.origin_lps_mm) + float(offset_mm) * normal)
+        return BodyPlane(new_origin, self.u_lps, self.v_lps, self.spacing_xy_mm, self.size_xy)
+
 
 def propose_plane(source, labels, label_id, *, offset_mm=0., yaw_deg=0., tilt_deg=0., margin_mm=5.):
     """Propose from whole-vertebra bounds; the user must confirm the body plane."""
@@ -113,6 +119,16 @@ def sample_plane(source, plane, labels=None, label_id=None):
         sampled = sitk.Resample(labels, reference, sitk.Transform(), sitk.sitkNearestNeighbor, 0)
         hint = sitk.GetArrayFromImage(sampled)[0] == label_id
     return ct, valid, hint
+
+
+def sample_parasagittal_slices(source, plane, offsets_mm=(-4.0, 4.0)):
+    """Sample parasagittal 2D slices at given offset distances (mm) along plane normal."""
+    slices = []
+    for offset in offsets_mm:
+        offset_plane = plane.offset(offset)
+        ct_slice, _, _ = sample_plane(source, offset_plane)
+        slices.append(ct_slice)
+    return slices
 
 
 def plane_parameters(source, labels, label_id, plane):

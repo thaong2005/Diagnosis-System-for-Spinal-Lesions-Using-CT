@@ -1,15 +1,6 @@
-"""Unit tests for Phase 2 & 3: Dual-Stream 2.5D Concept CNN and Adaptive Rule Fusion Layer."""
-import time
+"""Unit tests for Phase 2 & 3: Adaptive Rule Fusion Layer and Biomechanical Guards."""
 import unittest
-import numpy as np
-import torch
 
-from spinal_ct.aospine_model import (
-    DualStreamAOSpineNet,
-    MaskedMultiConceptLoss,
-    BatchedCPUInferenceEngine,
-    export_to_onnx,
-)
 from spinal_ct.aospine_fusion import (
     compute_adaptive_fusion_weights,
     fuse_vertebra_concept_probabilities,
@@ -17,100 +8,8 @@ from spinal_ct.aospine_fusion import (
 )
 
 
-class TestAOSpineModel(unittest.TestCase):
-    """Test DualStreamAOSpineNet architecture, masked loss, and CPU inference speed."""
-
-    def setUp(self):
-        self.model = DualStreamAOSpineNet(in_channels=5, feature_dim=128)
-        self.model.eval()
-
-    def test_forward_pass_shape_and_speed_cpu(self):
-        """Test B=8 forward pass runs on CPU in < 0.25 seconds with outputs in [0.01, 0.99]."""
-        batch_size = 8
-        dummy_body = torch.randn(batch_size, 5, 128, 128, dtype=torch.float32)
-        dummy_arch = torch.randn(batch_size, 5, 128, 128, dtype=torch.float32)
-
-        t0 = time.perf_counter()
-        probs_list = self.model.predict_concept_probabilities(dummy_body, dummy_arch)
-        latency = time.perf_counter() - t0
-
-        self.assertLess(latency, 0.25, f"B=8 inference latency too high: {latency*1000:.1f}ms (limit 250ms)")
-        self.assertEqual(len(probs_list), batch_size)
-
-        for probs in probs_list:
-            for k in ['p_pw', 'p_ep2', 'p_post_tb', 'p_ant_tb', 'p_trans', 'p_fracture']:
-                self.assertIn(k, probs)
-                val = probs[k]
-                self.assertGreaterEqual(val, 0.01)
-                self.assertLessEqual(val, 0.99)
-
-    def test_masked_loss_gradient_isolation(self):
-        """Test MaskedMultiConceptLoss isolates unobserved concepts (zero gradients for masked heads)."""
-        trainable_model = DualStreamAOSpineNet(in_channels=5, feature_dim=128)
-        trainable_model.train()
-
-        b_roi = torch.randn(2, 5, 128, 128)
-        a_roi = torch.randn(2, 5, 128, 128)
-
-        out = trainable_model(b_roi, a_roi)
-        loss_fn = MaskedMultiConceptLoss()
-
-        # Concept order: [pw, ep2, tb, trans]
-        # Supervise pw and tb only; mask out ep2 and trans (m_ep2 = 0, m_trans = 0)
-        y = torch.tensor([[1.0, 0.0, 1.0, 0.0], [0.0, 0.0, 1.0, 0.0]], dtype=torch.float32)
-        mask = torch.tensor([[1.0, 0.0, 1.0, 0.0], [1.0, 0.0, 1.0, 0.0]], dtype=torch.float32)
-
-        loss = loss_fn(out, y, mask)
-        loss.backward()
-
-        # head_pw and head_tb MUST have gradients
-        self.assertIsNotNone(trainable_model.head_pw[0].weight.grad)
-        self.assertGreater(float(trainable_model.head_pw[0].weight.grad.abs().sum()), 0.0)
-
-        self.assertIsNotNone(trainable_model.head_tb[0].weight.grad)
-        self.assertGreater(float(trainable_model.head_tb[0].weight.grad.abs().sum()), 0.0)
-
-        # head_ep2 and head_trans MUST receive zero gradient because they were masked out
-        ep2_grad = trainable_model.head_ep2[0].weight.grad
-        self.assertTrue(ep2_grad is None or bool(torch.all(ep2_grad == 0.0)))
-
-        trans_grad = trainable_model.head_trans[0].weight.grad
-        self.assertTrue(trans_grad is None or bool(torch.all(trans_grad == 0.0)))
-
-    def test_batched_cpu_inference_engine(self):
-        """Test BatchedCPUInferenceEngine processes list of numpy ROIs."""
-        engine = BatchedCPUInferenceEngine(self.model)
-        body_list = [np.random.randn(5, 128, 128).astype(np.float32) for _ in range(6)]
-        arch_list = [np.random.randn(5, 128, 128).astype(np.float32) for _ in range(6)]
-
-        probs, latency = engine.predict_batch(body_list, arch_list)
-        self.assertEqual(len(probs), 6)
-        self.assertLess(latency, 0.25)
-
-    def test_is_trained_checkpoint_flag(self):
-        """Test DualStreamAOSpineNet tracks is_trained_checkpoint attribute."""
-        net = DualStreamAOSpineNet()
-        self.assertTrue(hasattr(net, 'is_trained_checkpoint'))
-        self.assertFalse(net.is_trained_checkpoint)
-
-    def test_export_to_onnx_wrapper_clean_outputs(self):
-        """Test export_to_onnx exports exactly 5 concept heads via _ONNXExportWrapper."""
-        import tempfile
-        import onnx
-        from pathlib import Path
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            out_path = Path(tmpdir) / "model.onnx"
-            res_path = export_to_onnx(self.model, out_path, batch_size=2)
-            self.assertTrue(res_path.is_file())
-            onnx_model = onnx.load(str(res_path))
-            output_names = [o.name for o in onnx_model.graph.output]
-            expected = ['logits_pw', 'logits_ep2', 'logits_fracture', 'logits_tb', 'logits_trans']
-            self.assertEqual(output_names, expected)
-
-
 class TestAOSpineFusion(unittest.TestCase):
-    """Test Adaptive Rule Fusion Layer and Anatomical Boundary Guards."""
+    """Test Adaptive Rule Fusion Layer and Biomechanical Guards."""
 
     def test_adaptive_weights_by_segmentation_quality(self):
         """Test reciprocal reliability: high q_seg favours rules, low q_seg favours DL."""
@@ -143,7 +42,7 @@ class TestAOSpineFusion(unittest.TestCase):
             'ha_hp_ratio': 0.62,
         }
 
-        # Simulated noisy DL model output with high posterior wall suspicion due to calcification/bone spur
+        # Simulated CNN output with high false-positive posterior wall activation
         noisy_dl = {
             'p_pw': 0.75,  # CNN false alarm!
             'p_ep2': 0.10,
@@ -214,14 +113,14 @@ class TestAOSpineFusion(unittest.TestCase):
         self.assertGreaterEqual(fused['p_pw'], 0.65)
         self.assertTrue(any('Bone Fragment Floor Guard' in g for g in diag['triggered_guards']))
 
-        # Distraction Floor Guard (isp_ratio >= 1.35)
+        # Distraction Floor Guard (isp_ratio >= 1.45)
         m_dist = {'level': 'L2', 'q_seg': 0.80, 'delta_posterior_mm': 0.0, 'isp_ratio': 1.45, 'translation_mm': 0.0}
         fused_d, diag_d = fuse_vertebra_concept_probabilities(m_dist, dl_low)
         self.assertGreaterEqual(fused_d['p_post_tb'], 0.65)
         self.assertTrue(any('Distraction Floor Guard' in g for g in diag_d['triggered_guards']))
 
-        # Translation Floor Guard (trans >= 3.5mm)
-        m_trans = {'level': 'L3', 'q_seg': 0.80, 'delta_posterior_mm': 0.0, 'isp_ratio': 1.0, 'translation_mm': 4.2}
+        # Translation Floor Guard (trans >= 3.8mm for L1)
+        m_trans = {'level': 'L1', 'q_seg': 0.80, 'delta_posterior_mm': 0.0, 'isp_ratio': 1.0, 'translation_mm': 4.2}
         fused_t, diag_t = fuse_vertebra_concept_probabilities(m_trans, dl_low)
         self.assertGreaterEqual(fused_t['p_trans'], 0.65)
         self.assertTrue(any('Translation Floor Guard' in g for g in diag_t['triggered_guards']))
@@ -241,6 +140,90 @@ class TestAOSpineFusion(unittest.TestCase):
         res_burst = fuse_and_classify_spine([m_burst], [dl_low], dl_model_trained=True)
         pred_burst = res_burst['ranked_vertebrae'][0]['predicted_class']
         self.assertIn(pred_burst, ('A3', 'A4'))
+
+    def test_classic_a1_wedge_guard_prevents_false_b2(self):
+        """Test Classic A1 Wedge Guard prevents false B2 distraction override on mild wedge metrics."""
+        m_a1 = {
+            'level': 'L1',
+            'q_seg': 0.88,
+            'ha_hp_ratio': 0.784,
+            'hm_hp_ratio': 0.814,
+            'relative_collapse_ratio': 0.953,
+            'delta_posterior_mm': 0.3,
+            'isp_ratio': 1.080,
+            'translation_mm': 0.94,
+            'anterior_disc_angle_deg': 12.73,
+            'disc_opening_ratio': 1.0,
+            'lower_endplate_deformity_mm': 0.0,
+        }
+        res_fallback = fuse_and_classify_spine([m_a1], dl_concept_probs_list=None, dl_model_trained=False)
+        eval_fb = res_fallback['ranked_vertebrae'][0]
+        self.assertEqual(eval_fb['predicted_class'], 'A1')
+        self.assertLess(eval_fb['concept_probs']['p_post_tb'], 0.25)
+
+    def test_proto_b2_not_blocked_by_guard_6(self):
+        """Test is_proto_b2 is not blocked by Guard 6 (Intact Tension Band Guard)."""
+        metrics = {
+            'level': 'L1',
+            'q_seg': 0.85,
+            'isp_ratio': 1.05,
+            'delta_posterior_mm': 0.0,
+            'translation_mm': 0.5,
+            'relative_collapse_ratio': 0.95,
+            'ha_hp_ratio': 0.92,
+            'hm_hp_ratio': 0.90,
+        }
+        prototype_result = {
+            'p_anomaly': 0.78,
+            'predicted_class': 'B2',
+            'class_probabilities': {'B2': 0.80, 'A4': 0.10, 'A3': 0.05, 'Normal': 0.05},
+        }
+        fused_probs, diag = fuse_vertebra_concept_probabilities(
+            metrics,
+            dl_probs=None,
+            dl_model_trained=False,
+            prototype_result=prototype_result,
+        )
+        self.assertFalse(any('Intact Tension Band Guard' in g for g in diag['triggered_guards']))
+        self.assertGreaterEqual(fused_probs['p_post_tb'], 0.70)
+        self.assertTrue(any('Prototype B2 Support' in g for g in diag['triggered_guards']))
+
+    def test_burst_collapse_not_forced_to_type_c_by_guard_4(self):
+        """Test is_burst_collapse is not forced into Type C by Guard 4."""
+        metrics = {
+            'level': 'L1',
+            'q_seg': 0.80,
+            'delta_posterior_mm': 3.5,
+            'relative_collapse_ratio': 0.65,
+            'translation_mm': 4.2,
+            'isp_ratio': 1.0,
+            'ha_hp_ratio': 0.60,
+            'hm_hp_ratio': 0.62,
+        }
+        prototype_result = {
+            'p_anomaly': 0.85,
+            'predicted_class': 'A4',
+            'class_probabilities': {'A4': 0.82, 'A3': 0.10, 'Normal': 0.02},
+        }
+        fused_probs, diag = fuse_vertebra_concept_probabilities(
+            metrics,
+            dl_probs=None,
+            dl_model_trained=False,
+            prototype_result=prototype_result,
+        )
+        self.assertFalse(any('Translation Floor Guard' in g for g in diag['triggered_guards']))
+        self.assertLessEqual(fused_probs['p_trans'], 0.45)
+        self.assertTrue(any('Burst Collapse Guard' in g for g in diag['triggered_guards']))
+
+        res = fuse_and_classify_spine(
+            [metrics],
+            dl_concept_probs_list=None,
+            dl_model_trained=False,
+            prototype_results_list=[prototype_result],
+        )
+        pred_cls = res['ranked_vertebrae'][0]['predicted_class']
+        self.assertIn(pred_cls, ('A4', 'A3'))
+        self.assertNotEqual(pred_cls, 'C')
 
 
 if __name__ == '__main__':

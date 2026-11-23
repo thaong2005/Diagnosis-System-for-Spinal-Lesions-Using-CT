@@ -11,13 +11,13 @@ import SimpleITK as sitk
 from PySide6.QtCore import Qt, QRegularExpression, QTimer
 from PySide6.QtGui import QFont, QRegularExpressionValidator
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
-    QFormLayout, QHeaderView, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
-    QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+    QFormLayout, QFrame, QHeaderView, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
+    QSizePolicy, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from matplotlib.widgets import PolygonSelector
 
-from spinal_ct.localization import LEVELS
+from spinal_ct.localization import LEVELS, AOSPINE_TARGET_LEVELS
 from spinal_ct.body_region import propose_plane, sample_plane, polygon_mask, plane_parameters
 from spinal_ct.blob_detection import detect_blobs
 from spinal_ct.morphometry import BodySession, load_session, save_session, LANDMARK_NAMES
@@ -179,13 +179,29 @@ class BodyReviewDialog(QDialog):
 
         # 2.5 AO Spine Recommendation Card
         self.aospine_group = QWidget()
+        self.aospine_group.setObjectName('aospine_group')
         aospine_layout = QVBoxLayout(self.aospine_group)
         aospine_layout.setContentsMargins(8, 8, 8, 8)
-        self.aospine_group.setStyleSheet('QWidget {background:white; border:1px solid #c5d5df; border-radius:6px;}')
+        self.aospine_group.setStyleSheet('''
+            #aospine_group {
+                background: white;
+                border: 1px solid #c5d5df;
+                border-radius: 6px;
+            }
+            #aospine_group QLabel {
+                border: none;
+                background: transparent;
+            }
+        ''')
 
-        lbl_ao_title = QLabel('Phân loại tổn thương AO Spine')
-        lbl_ao_title.setStyleSheet('font-weight:bold; color:#136979; border:none;')
+        lbl_ao_title = QLabel('Phân loại tổn thương AO Spine (AI 3 Trụ cột)')
+        lbl_ao_title.setStyleSheet('font-weight:bold; color:#136979; font-size:12px;')
         aospine_layout.addWidget(lbl_ao_title)
+
+        self.aospine_triage_banner = QLabel('Triage toàn cột sống: Chưa có cảnh báo')
+        self.aospine_triage_banner.setWordWrap(True)
+        self.aospine_triage_banner.setStyleSheet('background:#f1f5f9; color:#334155; border:1px solid #cbd5e1; border-radius:4px; padding:6px; font-size:11px;')
+        aospine_layout.addWidget(self.aospine_triage_banner)
 
         self.aospine_badge = QLabel('Normal · 100%')
         self.aospine_badge.setAlignment(Qt.AlignCenter)
@@ -193,12 +209,12 @@ class BodyReviewDialog(QDialog):
         aospine_layout.addWidget(self.aospine_badge)
 
         self.aospine_rank = QLabel('Hạng tổn thương: #1 / 1')
-        self.aospine_rank.setStyleSheet('color:#555; font-size:11px; border:none;')
+        self.aospine_rank.setStyleSheet('color:#555; font-size:11px;')
         aospine_layout.addWidget(self.aospine_rank)
 
         doc_layout = QHBoxLayout()
         lbl_doc = QLabel('Bác sĩ xác nhận:')
-        lbl_doc.setStyleSheet('font-weight:bold; font-size:11px; border:none;')
+        lbl_doc.setStyleSheet('font-weight:bold; font-size:11px;')
         self.doctor_override_combo = QComboBox()
         self.doctor_override_combo.addItems([
             'Theo gợi ý AI', 'Normal', 'A1', 'A2', 'A3', 'A4', 'B2', 'B3', 'C'
@@ -208,27 +224,70 @@ class BodyReviewDialog(QDialog):
         doc_layout.addWidget(self.doctor_override_combo)
         aospine_layout.addLayout(doc_layout)
 
-        ao_form = QFormLayout()
-        ao_form.setContentsMargins(0, 4, 0, 4)
-        ao_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.ao_form = QFormLayout()
+        self.ao_form.setContentsMargins(0, 4, 0, 4)
+        self.ao_form.setVerticalSpacing(8)
+        self.ao_form.setLabelAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.ao_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
         self.lbl_delta_pw = QLabel('0.0 mm')
         self.lbl_delta_pw.setWordWrap(True)
-        self.lbl_delta_pw.setStyleSheet('font-weight:bold; border:none;')
+        self.lbl_delta_pw.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_delta_pw.setStyleSheet('font-weight:bold; font-size:11px;')
+
         self.lbl_isp = QLabel('1.00')
         self.lbl_isp.setWordWrap(True)
-        self.lbl_isp.setStyleSheet('font-weight:bold; border:none;')
+        self.lbl_isp.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_isp.setStyleSheet('font-weight:bold; font-size:11px;')
+
         self.lbl_trans = QLabel('0.0 mm')
         self.lbl_trans.setWordWrap(True)
-        self.lbl_trans.setStyleSheet('font-weight:bold; border:none;')
+        self.lbl_trans.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_trans.setStyleSheet('font-weight:bold; font-size:11px;')
+
         self.lbl_collapse = QLabel('1.00')
         self.lbl_collapse.setWordWrap(True)
-        self.lbl_collapse.setStyleSheet('font-weight:bold; border:none;')
+        self.lbl_collapse.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_collapse.setStyleSheet('font-weight:bold; font-size:11px;')
 
-        ao_form.addRow('Độ lồi tường sau (Δ_post):', self.lbl_delta_pw)
-        ao_form.addRow('Tỷ lệ liên gai sau (ISP):', self.lbl_isp)
-        ao_form.addRow('Độ di lệch trượt:', self.lbl_trans)
-        ao_form.addRow('Mức độ xẹp lún:', self.lbl_collapse)
-        aospine_layout.addLayout(ao_form)
+        self.lbl_proto = QLabel('—')
+        self.lbl_proto.setWordWrap(True)
+        self.lbl_proto.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_proto.setStyleSheet('font-weight:bold; font-size:11px;')
+
+        self.lbl_dl = QLabel('—')
+        self.lbl_dl.setWordWrap(True)
+        self.lbl_dl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_dl.setStyleSheet('font-weight:bold; font-size:11px;')
+
+        self.lbl_guards = QLabel('—')
+        self.lbl_guards.setWordWrap(True)
+        self.lbl_guards.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.lbl_guards.setStyleSheet('font-weight:bold; font-size:11px;')
+
+        lbl_delta_title = QLabel('Độ lồi tường sau (Δ_post):')
+        lbl_delta_title.setStyleSheet('color:#233c4b; font-size:11px;')
+        lbl_isp_title = QLabel('Tỷ lệ liên gai sau (ISP):')
+        lbl_isp_title.setStyleSheet('color:#233c4b; font-size:11px;')
+        lbl_trans_title = QLabel('Độ di lệch trượt:')
+        lbl_trans_title.setStyleSheet('color:#233c4b; font-size:11px;')
+        lbl_collapse_title = QLabel('Mức độ xẹp lún:')
+        lbl_collapse_title.setStyleSheet('color:#233c4b; font-size:11px;')
+        lbl_proto_title = QLabel('Ngân hàng mẫu (T2):')
+        lbl_proto_title.setStyleSheet('color:#233c4b; font-size:11px;')
+        lbl_dl_title = QLabel('Khái niệm CNN (T3):')
+        lbl_dl_title.setStyleSheet('color:#233c4b; font-size:11px;')
+        lbl_guards_title = QLabel('Chốt bảo vệ (Guards):')
+        lbl_guards_title.setStyleSheet('color:#233c4b; font-size:11px;')
+
+        self.ao_form.addRow(lbl_delta_title, self.lbl_delta_pw)
+        self.ao_form.addRow(lbl_isp_title, self.lbl_isp)
+        self.ao_form.addRow(lbl_trans_title, self.lbl_trans)
+        self.ao_form.addRow(lbl_collapse_title, self.lbl_collapse)
+        self.ao_form.addRow(lbl_proto_title, self.lbl_proto)
+        self.ao_form.addRow(lbl_dl_title, self.lbl_dl)
+        self.ao_form.addRow(lbl_guards_title, self.lbl_guards)
+        aospine_layout.addLayout(self.ao_form)
 
         self.aospine_warning = QLabel()
         self.aospine_warning.setWordWrap(True)
@@ -368,14 +427,76 @@ class BodyReviewDialog(QDialog):
         lbl_nav.setStyleSheet('font-weight:bold; color:#136979; font-size:12px;')
         nav_layout.addWidget(lbl_nav)
 
+        self.btn_prev_level = QPushButton('◀')
+        self.btn_prev_level.setToolTip('Chuyển sang đốt sống trước đó')
+        self.btn_prev_level.setFixedSize(26, 26)
+        self.btn_prev_level.setStyleSheet('font-size:10px; padding:0px;')
+        self.btn_prev_level.setCursor(Qt.PointingHandCursor)
+        self.btn_prev_level.clicked.connect(self.prev_level)
+        nav_layout.addWidget(self.btn_prev_level)
+
+        self.btn_next_level = QPushButton('▶')
+        self.btn_next_level.setToolTip('Chuyển sang đốt sống tiếp theo')
+        self.btn_next_level.setFixedSize(26, 26)
+        self.btn_next_level.setStyleSheet('font-size:10px; padding:0px;')
+        self.btn_next_level.setCursor(Qt.PointingHandCursor)
+        self.btn_next_level.clicked.connect(self.next_level)
+        nav_layout.addWidget(self.btn_next_level)
+
+        self.nav_scroll = QScrollArea()
+        self.nav_scroll.setWidgetResizable(True)
+        self.nav_scroll.setFixedHeight(34)
+        self.nav_scroll.setFrameShape(QFrame.NoFrame)
+        self.nav_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.nav_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.nav_scroll.setStyleSheet('''
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:horizontal {
+                height: 4px;
+                background: transparent;
+                margin: 0px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #b0c4de;
+                border-radius: 2px;
+                min-width: 20px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #136979;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+                background: none;
+            }
+        ''')
+
+        def scroll_wheel_event(event):
+            delta = event.angleDelta().y() or event.angleDelta().x()
+            self.nav_scroll.horizontalScrollBar().setValue(
+                self.nav_scroll.horizontalScrollBar().value() - delta
+            )
+            event.accept()
+
+        self.nav_scroll.wheelEvent = scroll_wheel_event
+
+        self.nav_buttons_container = QWidget()
+        self.nav_buttons_container.setStyleSheet('background: transparent;')
+        nav_buttons_layout = QHBoxLayout(self.nav_buttons_container)
+        nav_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        nav_buttons_layout.setSpacing(3)
+
         self.level_buttons = {}
         for lvl in self.available_levels:
             btn = QPushButton(lvl)
             btn.setCursor(Qt.PointingHandCursor)
+            btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+            btn.setMinimumWidth(44)
             btn.clicked.connect(lambda checked=False, l=lvl: self.switch_to_level(l))
-            nav_layout.addWidget(btn)
+            nav_buttons_layout.addWidget(btn)
             self.level_buttons[lvl] = btn
-        nav_layout.addStretch()
+        nav_buttons_layout.addStretch()
+        self.nav_scroll.setWidget(self.nav_buttons_container)
+        nav_layout.addWidget(self.nav_scroll, 1)
         layout.addWidget(self.nav_widget)
 
         # Overlay Toolbar
@@ -403,6 +524,12 @@ class BodyReviewDialog(QDialog):
         self.toggle_clean_quick.setToolTip('Nhấn giữ hoặc bấm để ẩn nhanh toàn bộ lớp phủ, xem CT gốc')
         self.toggle_clean_quick.toggled.connect(self.toggle_quick_clean)
         toolbar_layout.addWidget(self.toggle_clean_quick)
+
+        self.toggle_norm_view = QPushButton('📐 Xem chuẩn hóa 256×256')
+        self.toggle_norm_view.setCheckable(True)
+        self.toggle_norm_view.setToolTip('Chuyển đổi khung giữa giữa CT gốc tham chiếu và vùng thân đốt chuẩn hóa 256×256')
+        self.toggle_norm_view.toggled.connect(self.redraw)
+        toolbar_layout.addWidget(self.toggle_norm_view)
         toolbar_layout.addStretch()
         layout.addWidget(toolbar_widget)
 
@@ -425,6 +552,7 @@ class BodyReviewDialog(QDialog):
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
         split.setSizes([400, 980])
+        split.splitterMoved.connect(lambda *_: self._refresh_metric_label_heights())
         self.canvas.mpl_connect('button_press_event', self.click)
         self.canvas.mpl_connect('motion_notify_event', self.motion)
         self.canvas.mpl_connect('button_release_event', self.release)
@@ -554,13 +682,20 @@ class BodyReviewDialog(QDialog):
 
     def _rebuild_plane(self):
         try:
-            from spinal_ct.localization import LEVELS
+            from spinal_ct.localization import LEVELS, AOSPINE_TARGET_LEVELS
             label_id = LEVELS.index(self.level)+1
             plane = propose_plane(self.source, self.labels, label_id, offset_mm=self.offset.value(),
                                   yaw_deg=self.yaw.value(), tilt_deg=self.tilt.value())
             ct, valid, hint = sample_plane(self.source, plane, self.labels, label_id)
+            parasagittal_slices = None
+            if hasattr(self.source, 'GetSpacing'):
+                try:
+                    from spinal_ct.body_region import sample_parasagittal_slices
+                    parasagittal_slices = sample_parasagittal_slices(self.source, plane)
+                except Exception:
+                    parasagittal_slices = None
             session = BodySession(self.fingerprint, self.level, self.source_kind, plane, ct, valid, hint,
-                                  age_group=self.age.currentData())
+                                  age_group=self.age.currentData(), parasagittal_slices=parasagittal_slices)
             self.stop_editing()
             self.session = session
             self.pending_plane = False
@@ -721,7 +856,7 @@ class BodyReviewDialog(QDialog):
         if not self.session:
             return
         chosen = self.doctor_override_combo.currentText()
-        if chosen == 'Theo gợi ý AI':
+        if chosen in ('Theo gợi ý AI', 'Model gợi ý'):
             self.session.doctor_confirmed_class = None
         else:
             self.session.doctor_confirmed_class = chosen
@@ -792,8 +927,15 @@ class BodyReviewDialog(QDialog):
             label_id = LEVELS.index(lvl) + 1
             plane = propose_plane(self.source, self.labels, label_id, offset_mm=0.0, yaw_deg=0.0, tilt_deg=0.0)
             ct, valid, hint = sample_plane(self.source, plane, self.labels, label_id)
+            parasagittal_slices = None
+            if hasattr(self.source, 'GetSpacing'):
+                try:
+                    from spinal_ct.body_region import sample_parasagittal_slices
+                    parasagittal_slices = sample_parasagittal_slices(self.source, plane)
+                except Exception:
+                    parasagittal_slices = None
             sess = BodySession(self.fingerprint, lvl, self.source_kind, plane, ct, valid, hint,
-                               age_group=self.age.currentData())
+                               age_group=self.age.currentData(), parasagittal_slices=parasagittal_slices)
             try:
                 sess.auto_populate(approve=False)
             except Exception:
@@ -827,13 +969,21 @@ class BodyReviewDialog(QDialog):
             if sess is None and lvl in self.level_cache:
                 sess = self.level_cache[lvl].get('session')
 
-            if sess and sess.aospine:
+            cls_desc = 'Bình thường'
+            is_outside = (lvl not in AOSPINE_TARGET_LEVELS and lvl != 'S1')
+            has_ov = bool(sess and getattr(sess, 'doctor_confirmed_class', None))
+            if is_outside and not has_ov:
+                severity_icon = '⚪ '
+                badge_color = '#7f8c8d'
+                cls_desc = f'Ngoài phạm vi AI (T10–L5) · Chỉ đo hình thái'
+                btn.setToolTip(f"Đốt sống {lvl} · {cls_desc}")
+            elif sess and sess.aospine:
                 has_lm = (sess.landmarks is not None and len(sess.landmarks) == 6)
-                has_ov = bool(getattr(sess, 'doctor_confirmed_class', None))
                 is_trunc = bool(sess.aospine.get('is_indeterminate') or sess.aospine.get('is_fov_truncated')
                                 or sess.aospine.get('predicted_class') == 'Ngoài vùng khảo sát (Chạm biên CT)')
                 if (has_lm or has_ov) and not is_trunc:
                     eff_cls = getattr(sess, 'doctor_confirmed_class', None) or sess.aospine.get('predicted_class', 'Normal')
+                    cls_desc = f"Phân loại: {eff_cls}"
                     if eff_cls in ('C', 'A4', 'B1', 'B2', 'B3'):
                         severity_icon = '🔴 '
                         badge_color = '#ff4d4d'
@@ -852,18 +1002,53 @@ class BodyReviewDialog(QDialog):
                 else:
                     severity_icon = '⚪ '
                     badge_color = '#7f8c8d'
+                    cls_desc = 'Chạm biên CT' if is_trunc else 'Chưa đo 6 mốc'
+                btn.setToolTip(f"Đốt sống {lvl} · {cls_desc}")
             else:
                 severity_icon = ''
                 badge_color = '#7f8c8d'
+                cls_desc = 'Chưa phân tích'
+                btn.setToolTip(f"Đốt sống {lvl} · {cls_desc}")
 
             if is_current:
                 btn.setText(f"{severity_icon}{lvl}")
                 btn.setStyleSheet(f'background:#2a2b3d; color:{badge_color}; font-weight:bold; '
-                                  f'border:2px solid {badge_color}; border-radius:5px; padding:4px 8px;')
+                                  f'border:2px solid {badge_color}; border-radius:5px; padding:3px 6px; min-width:44px;')
             else:
                 btn.setText(f"{severity_icon}{lvl}" if severity_icon else lvl)
                 btn.setStyleSheet('background:white; color:#233c4b; font-weight:normal; '
-                                  'border:1px solid #c5d5df; border-radius:5px; padding:4px 8px;')
+                                  'border:1px solid #c5d5df; border-radius:5px; padding:3px 6px; min-width:44px;')
+
+        if hasattr(self, 'btn_prev_level') and hasattr(self, 'btn_next_level'):
+            try:
+                curr_idx = self.available_levels.index(self.level)
+                self.btn_prev_level.setEnabled(curr_idx > 0)
+                self.btn_next_level.setEnabled(curr_idx < len(self.available_levels) - 1)
+            except (ValueError, IndexError, AttributeError):
+                pass
+
+        if hasattr(self, 'nav_scroll') and self.level in self.level_buttons:
+            self.nav_scroll.ensureWidgetVisible(self.level_buttons[self.level], 40, 0)
+
+    def prev_level(self):
+        if not self.available_levels or self.worker is not None:
+            return
+        try:
+            curr_idx = self.available_levels.index(self.level)
+            if curr_idx > 0:
+                self.switch_to_level(self.available_levels[curr_idx - 1])
+        except (ValueError, IndexError):
+            pass
+
+    def next_level(self):
+        if not self.available_levels or self.worker is not None:
+            return
+        try:
+            curr_idx = self.available_levels.index(self.level)
+            if curr_idx < len(self.available_levels) - 1:
+                self.switch_to_level(self.available_levels[curr_idx + 1])
+        except (ValueError, IndexError):
+            pass
 
     def switch_to_level(self, new_level: str):
         if new_level == self.level or self.worker is not None:
@@ -1101,7 +1286,7 @@ class BodyReviewDialog(QDialog):
         session = load_session(folder, self.source, fingerprint=self.fingerprint)
         if session.level != self.level or session.source_kind != self.source_kind:
             raise ValueError('Vùng đã lưu thuộc đốt hoặc nguồn mask khác. Hãy chọn đúng đốt và Baseline/Consensus trong demo.')
-        from spinal_ct.localization import LEVELS
+        from spinal_ct.localization import LEVELS, AOSPINE_TARGET_LEVELS
         _, _, session.hint = sample_plane(self.source, session.plane, self.labels, LEVELS.index(self.level)+1)
         try:
             parameters = plane_parameters(self.source, self.labels, LEVELS.index(self.level)+1, session.plane)
@@ -1187,31 +1372,46 @@ class BodyReviewDialog(QDialog):
 
             placeholder = "— (Cần đặt 6 mốc chiều cao hoặc bấm Tự động tách vùng)"
             self.lbl_delta_pw.setText(placeholder)
-            self.lbl_delta_pw.setStyleSheet('color:#7f8c8d; font-style:italic; border:none;')
+            self.lbl_delta_pw.setStyleSheet('color:#7f8c8d; font-style:italic; font-size:11px;')
 
             self.lbl_isp.setText(placeholder)
-            self.lbl_isp.setStyleSheet('color:#7f8c8d; font-style:italic; border:none;')
+            self.lbl_isp.setStyleSheet('color:#7f8c8d; font-style:italic; font-size:11px;')
 
             self.lbl_trans.setText(placeholder)
-            self.lbl_trans.setStyleSheet('color:#7f8c8d; font-style:italic; border:none;')
+            self.lbl_trans.setStyleSheet('color:#7f8c8d; font-style:italic; font-size:11px;')
 
             self.lbl_collapse.setText(placeholder)
-            self.lbl_collapse.setStyleSheet('color:#7f8c8d; font-style:italic; border:none;')
+            self.lbl_collapse.setStyleSheet('color:#7f8c8d; font-style:italic; font-size:11px;')
+
+            self.lbl_proto.setText(placeholder)
+            self.lbl_proto.setStyleSheet('color:#7f8c8d; font-style:italic; font-size:11px;')
+
+            self.lbl_dl.setText(placeholder)
+            self.lbl_dl.setStyleSheet('color:#7f8c8d; font-style:italic; font-size:11px;')
+
+            self.lbl_guards.setText(placeholder)
+            self.lbl_guards.setStyleSheet('color:#7f8c8d; font-style:italic; font-size:11px;')
 
             self.aospine_warning.hide()
             self.aospine_rationale.setText(
                 f"{self.level} - Bấm 'Tự động tách vùng và đặt 6 mốc' hoặc tự chấm 6 mốc để hệ thống tính toán tổn thương."
             )
+            self._refresh_metric_label_heights()
             return
 
         eff_cls = self.session.doctor_confirmed_class or cls_name
-        if eff_cls == 'Ngoài vùng khảo sát (Chạm biên CT)' or ao.get('is_fov_truncated'):
-            color = '#7f8c8d'
+        is_out_of_scope = (
+            self.session.level not in AOSPINE_TARGET_LEVELS
+            and self.session.level != 'S1'
+            and not self.session.doctor_confirmed_class
+        )
         is_trunc = eff_cls == 'Ngoài vùng khảo sát (Chạm biên CT)' or ao.get('is_fov_truncated')
         is_s1_ref = eff_cls == 'S1 (Tham chiếu)' or self.session.level == 'S1'
         is_unmarked = eff_cls == 'Chưa đặt đủ 6 mốc' or len(getattr(self.session, 'landmarks', [])) != 6
 
-        if is_trunc or is_s1_ref or is_unmarked:
+        if is_out_of_scope:
+            color = '#64748b'
+        elif is_trunc or is_s1_ref or is_unmarked:
             color = '#7f8c8d'
         elif eff_cls in ('C', 'A4', 'B1', 'B2', 'B3'):
             color = '#c0392b'
@@ -1224,6 +1424,8 @@ class BodyReviewDialog(QDialog):
 
         if self.session.doctor_confirmed_class:
             self.aospine_badge.setText(f"[BS: {self.session.doctor_confirmed_class}] · AI: {cls_name} ({conf:.1%})")
+        elif is_out_of_scope:
+            self.aospine_badge.setText("Ngoài miền AI (T10–L5) · Chỉ đo hình thái")
         elif is_trunc:
             self.aospine_badge.setText("Ngoài vùng khảo sát (Chạm biên CT)")
         elif is_s1_ref:
@@ -1234,7 +1436,9 @@ class BodyReviewDialog(QDialog):
             self.aospine_badge.setText(f"{cls_name}{sec} · {conf:.1%}")
         self.aospine_badge.setStyleSheet(f'background:{color}; color:white; font-weight:bold; font-size:13px; border-radius:4px; padding:4px;')
         total_ranked = ao.get('total_ranked', len(self._sessions_by_level) or 1)
-        if is_trunc:
+        if is_out_of_scope:
+            self.aospine_rank.setText("Trạng thái: Đốt sống ngoài phạm vi AI T10–L5 (Chỉ đo hình thái học)")
+        elif is_trunc:
             self.aospine_rank.setText("Trạng thái: Đốt sống bị cắt cụt do chạm mép biên trường chụp")
         elif is_s1_ref:
             self.aospine_rank.setText("Trạng thái: Xương cùng làm mốc tham chiếu giải phẫu")
@@ -1251,6 +1455,14 @@ class BodyReviewDialog(QDialog):
         trans = float(raw_m.get('translation_mm', c_probs.get('translation_mm', 0.0)))
         collapse = float(raw_m.get('relative_collapse_ratio', c_probs.get('relative_collapse_ratio', 1.0)))
 
+        level_str = str(self.level or '').upper()
+        if any(lvl in level_str for lvl in ('L4', 'L5')):
+            trans_thresh = 5.5
+        elif 'L3' in level_str:
+            trans_thresh = 4.5
+        else:
+            trans_thresh = 3.8
+
         if is_trunc or is_s1_ref or is_unmarked:
             delta_pw = 0.0
             isp = 1.0
@@ -1259,44 +1471,127 @@ class BodyReviewDialog(QDialog):
         elif eff_cls == 'Normal':
             delta_pw = 0.0
             isp = min(isp, 1.0)
-            if trans < 3.5:
+            if trans < trans_thresh:
                 trans = 0.0
 
         if delta_pw > 2.0:
             self.lbl_delta_pw.setText(f"🔴 {delta_pw:.1f} mm (Cảnh báo lồi > 2.0 mm)")
-            self.lbl_delta_pw.setStyleSheet('color:#c0392b; font-weight:bold; border:none;')
+            self.lbl_delta_pw.setStyleSheet('color:#c0392b; font-weight:bold; font-size:11px;')
         else:
             self.lbl_delta_pw.setText(f"🟢 {delta_pw:.1f} mm (Bình thường < 2.0 mm)")
-            self.lbl_delta_pw.setStyleSheet('color:#27ae60; font-weight:bold; border:none;')
+            self.lbl_delta_pw.setStyleSheet('color:#27ae60; font-weight:bold; font-size:11px;')
 
-        if isp > 1.30:
-            self.lbl_isp.setText(f"🔴 {isp:.2f} (Toác dải căng sau > 1.30)")
-            self.lbl_isp.setStyleSheet('color:#c0392b; font-weight:bold; border:none;')
+        if isp >= 1.45:
+            self.lbl_isp.setText(f"🔴 {isp:.2f} (Toác dải căng sau ≥ 1.45)")
+            self.lbl_isp.setStyleSheet('color:#c0392b; font-weight:bold; font-size:11px;')
         elif isp > 1.15:
-            self.lbl_isp.setText(f"🟡 {isp:.2f} (Nghi ngờ tổn thương M1 > 1.15)")
-            self.lbl_isp.setStyleSheet('color:#f39c12; font-weight:bold; border:none;')
+            self.lbl_isp.setText(f"🟡 {isp:.2f} (Nghi ngờ M1)")
+            self.lbl_isp.setStyleSheet('color:#f39c12; font-weight:bold; font-size:11px;')
         else:
             self.lbl_isp.setText(f"🟢 {isp:.2f} (Bình thường ≤ 1.15)")
-            self.lbl_isp.setStyleSheet('color:#27ae60; font-weight:bold; border:none;')
+            self.lbl_isp.setStyleSheet('color:#27ae60; font-weight:bold; font-size:11px;')
 
-        if trans >= 3.5:
-            self.lbl_trans.setText(f"🔴 {trans:.1f} mm (Trượt/mất vững Type C ≥ 3.5 mm)")
-            self.lbl_trans.setStyleSheet('color:#c0392b; font-weight:bold; border:none;')
+        if trans >= trans_thresh:
+            self.lbl_trans.setText(f"🔴 {trans:.1f} mm (Trượt/mất vững Type C ≥ {trans_thresh:.1f} mm)")
+            self.lbl_trans.setStyleSheet('color:#c0392b; font-weight:bold; font-size:11px;')
         else:
-            self.lbl_trans.setText(f"🟢 {trans:.1f} mm (Bình thường < 3.5 mm)")
-            self.lbl_trans.setStyleSheet('color:#27ae60; font-weight:bold; border:none;')
+            self.lbl_trans.setText(f"🟢 {trans:.1f} mm (Bình thường < {trans_thresh:.1f} mm)")
+            self.lbl_trans.setStyleSheet('color:#27ae60; font-weight:bold; font-size:11px;')
 
         pct_loss = max(0.0, (1.0 - collapse) * 100.0)
         pct_kept = min(100.0, collapse * 100.0)
         if collapse <= 0.78:
             self.lbl_collapse.setText(f"🔴 Xẹp -{pct_loss:.0f}% (Bảo tồn {pct_kept:.0f}% - Vỡ nặng ≤ 78%)")
-            self.lbl_collapse.setStyleSheet('color:#c0392b; font-weight:bold; border:none;')
+            self.lbl_collapse.setStyleSheet('color:#c0392b; font-weight:bold; font-size:11px;')
         elif collapse <= 0.85:
             self.lbl_collapse.setText(f"🟡 Xẹp -{pct_loss:.0f}% (Bảo tồn {pct_kept:.0f}% - Giảm nhẹ)")
-            self.lbl_collapse.setStyleSheet('color:#f39c12; font-weight:bold; border:none;')
+            self.lbl_collapse.setStyleSheet('color:#f39c12; font-weight:bold; font-size:11px;')
         else:
             self.lbl_collapse.setText(f"🟢 Bảo tồn {pct_kept:.0f}% chiều cao")
-            self.lbl_collapse.setStyleSheet('color:#27ae60; font-weight:bold; border:none;')
+            self.lbl_collapse.setStyleSheet('color:#27ae60; font-weight:bold; font-size:11px;')
+
+        # Cập nhật Triage Banner toàn cột sống
+        p_sum = ao.get('patient_summary') or {}
+        if not p_sum and hasattr(self, '_sessions_by_level'):
+            for s in self._sessions_by_level.values():
+                if s.aospine and s.aospine.get('patient_summary'):
+                    p_sum = s.aospine['patient_summary']
+                    break
+
+        if p_sum:
+            top1_lvl = p_sum.get('primary_lesion_level', '—')
+            top1_cls = p_sum.get('primary_aospine_class', 'Normal')
+            top2_list = p_sum.get('top2_levels', [])
+            has_surg = p_sum.get('has_surgical_instability', False)
+            top2_str = ', '.join(top2_list) if top2_list else '—'
+
+            if has_surg:
+                self.aospine_triage_banner.setText(
+                    f"⚠️ CẢNH BÁO MẤT VỮNG PHẪU THUẬT\n"
+                    f"• Top-1 tổn thương: {top1_lvl} [{top1_cls}]\n"
+                    f"• Vùng nghi ngờ: {top2_str}"
+                )
+                self.aospine_triage_banner.setStyleSheet(
+                    'background:#fde8e8; color:#9b1c1c; border:1px solid #f8b4b4; border-radius:4px; padding:6px; font-weight:bold; font-size:11px;'
+                )
+            else:
+                self.aospine_triage_banner.setText(
+                    f"✓ Triage Toàn Cột Sống (Ổn định)\n"
+                    f"• Top-1: {top1_lvl} [{top1_cls}] · Top-2: {top2_str}"
+                )
+                self.aospine_triage_banner.setStyleSheet(
+                    'background:#e8f5e9; color:#1b5e20; border:1px solid #c8e6c9; border-radius:4px; padding:6px; font-size:11px;'
+                )
+        else:
+            self.aospine_triage_banner.setText("Triage toàn cột sống: Chưa có dữ liệu")
+            self.aospine_triage_banner.setStyleSheet(
+                'background:#f1f5f9; color:#334155; border:1px solid #cbd5e1; border-radius:4px; padding:6px; font-size:11px;'
+            )
+
+        # Cập nhật Trụ cột 2 (Ngân hàng mẫu) & Trụ cột 3 (CNN) & Guards
+        if is_out_of_scope:
+            self.lbl_proto.setText("— (Ngoài miền AI T10–L5)")
+            self.lbl_proto.setStyleSheet('color:#7f8c8d; font-style:italic; font-size:11px;')
+            self.lbl_dl.setText("— (Ngoài miền AI T10–L5)")
+            self.lbl_dl.setStyleSheet('color:#7f8c8d; font-style:italic; font-size:11px;')
+            self.lbl_guards.setText("— (Không áp dụng guard ngoài miền T10–L5)")
+            self.lbl_guards.setStyleSheet('color:#7f8c8d; font-style:italic; font-size:11px;')
+        else:
+            fusion_diag = ao.get('fusion_diagnostics') or {}
+            proto_res = fusion_diag.get('prototype_result') or {}
+            p_anom = proto_res.get('p_anomaly')
+            if p_anom is not None:
+                p_anom_float = float(p_anom)
+                p_cls = proto_res.get('predicted_class', 'Normal')
+                p_ref = proto_res.get('reference_level', self.level)
+                if p_anom_float >= 0.50:
+                    self.lbl_proto.setText(f"🔴 Bất thường {p_anom_float*100:.1f}% · Lớp {p_cls} (so {p_ref})")
+                    self.lbl_proto.setStyleSheet('color:#c0392b; font-weight:bold; font-size:11px;')
+                else:
+                    self.lbl_proto.setText(f"🟢 Bình thường {p_anom_float*100:.1f}% (so {p_ref})")
+                    self.lbl_proto.setStyleSheet('color:#27ae60; font-weight:bold; font-size:11px;')
+            else:
+                self.lbl_proto.setText("— (Ngân hàng mẫu chạy Fallback)")
+                self.lbl_proto.setStyleSheet('color:#7f8c8d; font-style:italic; font-size:11px;')
+
+            dl_probs = fusion_diag.get('raw_p_dl') or fusion_diag.get('dl_probs') or {}
+            if dl_probs:
+                self.lbl_dl.setText(
+                    f"P_frac={dl_probs.get('p_fracture', 0.0):.2f} · P_pw={dl_probs.get('p_pw', 0.0):.2f} · "
+                    f"P_tb={dl_probs.get('p_post_tb', 0.0):.2f} · P_trans={dl_probs.get('p_trans', 0.0):.2f}"
+                )
+                self.lbl_dl.setStyleSheet('color:#2c3e50; font-size:11px;')
+            else:
+                self.lbl_dl.setText("— (Chạy Fallback: Chưa nạp checkpoint CNN)")
+                self.lbl_dl.setStyleSheet('color:#7f8c8d; font-style:italic; font-size:11px;')
+
+            guards = fusion_diag.get('triggered_guards') or []
+            if guards:
+                self.lbl_guards.setText('⚠ ' + '; '.join(guards))
+                self.lbl_guards.setStyleSheet('color:#c0392b; font-weight:bold; font-size:11px;')
+            else:
+                self.lbl_guards.setText("✓ An toàn (Không kích hoạt guard)")
+                self.lbl_guards.setStyleSheet('color:#27ae60; font-weight:bold; font-size:11px;')
 
         warnings_list = list(ao.get('modifiers', []))
         if ao.get('is_indeterminate'):
@@ -1308,7 +1603,32 @@ class BodyReviewDialog(QDialog):
         else:
             self.aospine_warning.hide()
 
-        self.aospine_rationale.setText(ao.get('clinical_rationale_vi', ''))
+        if is_out_of_scope:
+            self.aospine_rationale.setText(
+                f"{self.level} - Đốt sống ngoài phạm vi AI T10–L5. Hệ thống chỉ hỗ trợ đo đạc hình thái học và thể tích."
+            )
+        else:
+            self.aospine_rationale.setText(ao.get('clinical_rationale_vi', ''))
+        self._refresh_metric_label_heights()
+
+    def _refresh_metric_label_heights(self):
+        if not hasattr(self, 'ao_form'):
+            return
+        for lbl in (self.lbl_delta_pw, self.lbl_isp, self.lbl_trans, self.lbl_collapse, self.lbl_proto, self.lbl_dl, self.lbl_guards):
+            if lbl is not None:
+                lbl.setMinimumHeight(0)
+                avail_w = max(100, lbl.width())
+                needed_h = lbl.heightForWidth(avail_w)
+                lbl.setMinimumHeight(max(18, needed_h))
+        self.ao_form.invalidate()
+        if hasattr(self, 'aospine_group'):
+            self.aospine_group.updateGeometry()
+        if hasattr(self, 'controls_panel'):
+            self.controls_panel.updateGeometry()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_metric_label_heights()
 
     def redraw(self, *_):
         # A polygon selector owns its axes until completion; don't replace them.
@@ -1319,8 +1639,13 @@ class BodyReviewDialog(QDialog):
         self.figure.set_facecolor('#1e1e2e')
         gs = self.figure.add_gridspec(1, 3)
         self.body_ax = self.figure.add_subplot(gs[0, 0])
-        self.clean_ax = self.figure.add_subplot(gs[0, 1], sharex=self.body_ax, sharey=self.body_ax)
-        self.normalized_ax = self.clean_ax
+        show_norm = getattr(self, 'toggle_norm_view', None) and self.toggle_norm_view.isChecked()
+        if show_norm:
+            self.clean_ax = self.figure.add_subplot(gs[0, 1])
+            self.normalized_ax = self.clean_ax
+        else:
+            self.clean_ax = self.figure.add_subplot(gs[0, 1], sharex=self.body_ax, sharey=self.body_ax)
+            self.normalized_ax = self.clean_ax
         self.convergence_ax = self.figure.add_subplot(gs[0, 2])
         self.table.setRowCount(0)
 
@@ -1340,7 +1665,10 @@ class BodyReviewDialog(QDialog):
                 show_landmarks=show_landmarks,
                 dark_theme=True,
             )
-            draw_clean_reference(self.clean_ax, self.session, dark_theme=True)
+            if show_norm:
+                draw_normalized(self.normalized_ax, self.session, dark_theme=True)
+            else:
+                draw_clean_reference(self.clean_ax, self.session, dark_theme=True)
             candidates = (self.session.candidates or {}).get('candidates', [])
             index = self.blob_choices.currentIndex()
             if self.show_blobs.isChecked() and not self.hide_overlays_temp and 0 <= index < len(candidates):

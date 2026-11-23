@@ -2,7 +2,7 @@
 from typing import Any
 import numpy as np
 
-from spinal_ct.localization import LEVELS
+from spinal_ct.localization import LEVELS, AOSPINE_TARGET_LEVELS
 
 # Standard international AO Spine classes and severity weights
 AOSPINE_CLASSES = ('C', 'B3', 'B2', 'A4', 'A3', 'A2', 'A1', 'A0', 'Normal')
@@ -53,6 +53,40 @@ def fuzzy_sigmoid(x: float, threshold: float, temperature: float, invert: bool =
     return float(np.clip(p, 0.01, 0.99))
 
 
+def is_classic_wedge_fracture(metrics: dict[str, Any], s_ep2: float = 0.0) -> bool:
+    """Biomechanical consistency check for isolated anterior wedge compression fracture (A1).
+    
+    Clinical criteria:
+    - Anterior height loss (Ha/Hp < 0.82)
+    - Asymmetric anterior vs middle/posterior (Ha/Hp <= Hm/Hp + 0.05)
+    - Preserved overall body height (RelColl >= 0.78)
+    - Intact inferior endplate (lower_endplate_deformity < 1.5 mm)
+    - Intact posterior wall (delta_posterior_mm < 1.0 mm)
+    - No sagittal translation (translation_mm < 1.5 mm)
+    - No hyperextension gaping (anterior_disc_angle_deg < 15.0 deg)
+    - No comminuted endplate fracture (s_ep2 < 0.40)
+    """
+    h_info = metrics.get('heights') or {}
+    ha_hp = float(metrics.get('ha_hp_ratio', h_info.get('anterior_posterior_ratio', 1.0)))
+    hm_hp = float(metrics.get('hm_hp_ratio', h_info.get('middle_posterior_ratio', 1.0)))
+    rel_coll = float(metrics.get('relative_collapse_ratio', 1.0))
+    delta_pw = float(metrics.get('delta_posterior_mm', 0.0))
+    trans_mm = float(metrics.get('translation_mm', 0.0))
+    disc_deg = float(metrics.get('anterior_disc_angle_deg', 0.0))
+    lo_def = float(metrics.get('lower_endplate_deformity_mm', 0.0))
+
+    return bool(
+        ha_hp < 0.82
+        and ha_hp <= hm_hp + 0.05
+        and rel_coll >= 0.78
+        and s_ep2 < 0.40
+        and delta_pw < 1.5
+        and trans_mm < 1.5
+        and disc_deg < 15.0
+        and lo_def < 1.5
+    )
+
+
 def compute_anatomical_rule_probabilities(metrics: dict[str, Any]) -> dict[str, float]:
     """Compute calibrated probabilities for 6 core anatomical concepts from physical metrics.
 
@@ -99,22 +133,43 @@ def compute_anatomical_rule_probabilities(metrics: dict[str, Any]) -> dict[str, 
 
     # 1. Translation / dislocation (Type C)
     translation_mm = float(metrics.get('translation_mm', 0.0))
-    p_trans = fuzzy_sigmoid(translation_mm, threshold=3.5, temperature=0.8)
-    if is_morphologically_intact and translation_mm < 3.5:
-        p_trans = min(p_trans, 0.01)
+    level_name_up = str(metrics.get('level', '')).upper()
+    if level_name_up in ('L4', 'L5'):
+        trans_thresh = 5.5
+    elif level_name_up == 'L3':
+        trans_thresh = 4.5
+    else:
+        # T10 - L2 (and any other thoracic/cervical)
+        trans_thresh = 3.8
+    p_trans = fuzzy_sigmoid(translation_mm, threshold=trans_thresh, temperature=0.8)
+    if is_morphologically_intact and translation_mm < trans_thresh + 1.0:
+        p_trans = min(p_trans, 0.05)
 
     # 2. Anterior tension band (Type B3): geometric mean of opening angle and height ratio
+    # Physiological lumbar lordotic disc angle is naturally 10°-14°, increasing to 15°-20° at L4-L5.
     anterior_disc_angle_deg = float(metrics.get('anterior_disc_angle_deg', 0.0))
     disc_opening_ratio = float(metrics.get('disc_opening_ratio', 1.0))
-    p_angle = fuzzy_sigmoid(anterior_disc_angle_deg, threshold=17.5, temperature=1.5)
-    p_open = fuzzy_sigmoid(disc_opening_ratio, threshold=2.0, temperature=0.35)
-    p_ant_tb = float(np.clip(np.sqrt(p_angle * p_open), 0.01, 0.99))
-    if is_morphologically_intact and anterior_disc_angle_deg < 15.0:
-        p_ant_tb = min(p_ant_tb, 0.01)
+    if level_name_up in ('L2', 'L3', 'L4', 'L5'):
+        angle_thresh, opening_thresh = 23.0, 2.0
+    else:
+        # T10 - L1: thoracic and thoracolumbar junction (straight / mild kyphosis)
+        angle_thresh, opening_thresh = 15.0, 1.6
+
+    if anterior_disc_angle_deg < angle_thresh or disc_opening_ratio < opening_thresh:
+        p_ant_tb = 0.01
+    else:
+        p_angle = fuzzy_sigmoid(anterior_disc_angle_deg, threshold=angle_thresh + 2.5, temperature=1.5)
+        p_open = fuzzy_sigmoid(disc_opening_ratio, threshold=opening_thresh + 0.4, temperature=0.35)
+        p_ant_tb = float(np.clip(np.sqrt(p_angle * p_open), 0.01, 0.99))
+
+    if is_morphologically_intact:
+        intact_angle_thresh = 25.0 if level_name_up in ('L2', 'L3', 'L4', 'L5') else 15.0
+        if anterior_disc_angle_deg < intact_angle_thresh:
+            p_ant_tb = min(p_ant_tb, 0.05)
 
     # 3. Posterior tension band (Type B2): interspinous distance ratio (ISP Ratio)
     isp_ratio = float(metrics.get('isp_ratio', 1.0))
-    p_post_tb = fuzzy_sigmoid(isp_ratio, threshold=1.30, temperature=0.08)
+    p_post_tb = fuzzy_sigmoid(isp_ratio, threshold=1.45, temperature=0.08)
 
     # 4. Posterior wall retropulsion (Type A3/A4)
     delta_posterior_mm = float(metrics.get('delta_posterior_mm', 0.0))
@@ -122,6 +177,10 @@ def compute_anatomical_rule_probabilities(metrics: dict[str, Any]) -> dict[str, 
         p_pw = 0.01
     else:
         p_pw = fuzzy_sigmoid(delta_posterior_mm, threshold=2.0, temperature=0.5)
+
+    # Guard against false A3/A4 on non-collapsed vertebra
+    if relative_collapse_ratio >= 0.88 and min(ha_hp, hm_hp) >= 0.82 and max(up_def_val, lo_def_val) < 2.0:
+        p_pw = min(p_pw, 0.15)
 
     # 5. Both endplates / symmetric collapse (A4 vs A3/A1)
     p_collapse = fuzzy_sigmoid(relative_collapse_ratio, threshold=0.78, temperature=0.06, invert=True)
@@ -179,9 +238,23 @@ def compute_anatomical_rule_probabilities(metrics: dict[str, Any]) -> dict[str, 
         p_ep_max = fuzzy_sigmoid(max(up_def_val, lo_def_val), threshold=2.0, temperature=0.4)
         p_fracture = float(np.clip(max(p_genant, p_rel_frac, p_pw, p_split, p_ep_max), 0.01, 0.99))
 
-    # Isolated B2 suppression: an intact vertebral body without translation cannot have isolated B2 disruption
+        # Genant Grade 1-2 standard: height loss >= 20% (ha_hp <= 0.80 or hm_hp <= 0.80)
+        # represents an unambiguous structural fracture with high clinical certainty.
+        if (ha_hp <= 0.80 or hm_hp <= 0.80) and relative_collapse_ratio >= 0.70:
+            p_fracture = max(p_fracture, 0.95)
+
+    # Classic A1 Wedge Guard: isolated wedge compression fracture with intact posterior wall,
+    # intact alignment, single endplate (rel_coll >= 0.78, p_ep2 < 0.40, lo_def < 1.5)
+    is_classic_a1_wedge = is_classic_wedge_fracture(metrics, s_ep2=p_ep2)
+
+    # Isolated B2 suppression: an intact vertebral body without translation cannot have isolated B2 disruption.
+    # Similarly, a classic A1 wedge fracture with intact walls cannot be overridden into B2 unless substantial widening (>= 1.35)
     if is_morphologically_intact or (p_fracture < 0.40 and translation_mm < 2.0):
-        p_post_tb = min(p_post_tb, 0.20)
+        p_post_tb = min(p_post_tb, 0.05)
+    elif is_classic_a1_wedge and isp_ratio < 1.30:
+        p_post_tb = min(p_post_tb, 0.02)
+    elif is_classic_a1_wedge and isp_ratio < 1.35:
+        p_post_tb = min(p_post_tb, 0.10)
 
     return dict(
         p_trans=round(p_trans, 4),
@@ -284,12 +357,14 @@ def evaluate_aospine_decision_tree(
     s_split = probs.get('p_split', 0.0)
 
     # Priority routing C > B > A > Normal
-    s_bc = max(s_trans, s_ant_tb, s_post_tb)
+    # Type C requires confirmed translation/dislocation (s_trans >= 0.50)
+    s_c = s_trans if s_trans >= 0.50 else 0.0
+    s_bc = max(s_c, s_ant_tb, s_post_tb)
 
     raw_scores = {
-        'C': s_trans,
-        'B3': (1.0 - s_trans) * s_ant_tb,
-        'B2': (1.0 - s_trans) * (1.0 - s_ant_tb) * s_post_tb if (s_frac >= 0.40 or s_trans >= 0.40) else 0.0,
+        'C': s_c,
+        'B3': (1.0 - s_c) * s_ant_tb,
+        'B2': (1.0 - s_c) * (1.0 - s_ant_tb) * s_post_tb if (s_frac >= 0.40 or s_c >= 0.40) else 0.0,
         'A4': (1.0 - s_bc) * s_frac * s_pw * s_ep2,
         'A3': (1.0 - s_bc) * s_frac * s_pw * (1.0 - s_ep2),
         'A0': (1.0 - s_bc) * (1.0 - s_frac) * 0.05,
@@ -310,11 +385,17 @@ def evaluate_aospine_decision_tree(
     predicted_class = max(class_probs, key=class_probs.get)
     confidence = float(class_probs[predicted_class])
 
+    # Check for Classic A1 Wedge Guard
+    is_classic_a1_wedge = is_classic_wedge_fracture(metrics, s_ep2=s_ep2)
+    isp_ratio = float(metrics.get('isp_ratio', 1.0))
+
     # Combined Morphology Rule for B2
     # If posterior tension band is disrupted and vertebral body has fracture:
     # AO Spine dictates primary class B2 with secondary A subtype
     secondary_subtype = None
-    if s_trans < 0.50 and s_frac >= 0.40 and (s_post_tb >= 0.55 or (predicted_class == 'B2' and s_frac >= 0.50)):
+    if s_trans < 0.50 and s_frac >= 0.40 and (
+        (s_post_tb >= 0.65 and isp_ratio >= 1.45) or s_post_tb >= 0.68
+    ):
         predicted_class = 'B2'
         confidence = float(max(confidence, class_probs.get('B2', 0.50)))
         if s_pw >= 0.50 and s_ep2 >= 0.50:
@@ -327,13 +408,12 @@ def evaluate_aospine_decision_tree(
             secondary_subtype = 'A1'
 
     # Modifiers
-    isp_ratio = float(metrics.get('isp_ratio', 1.0))
-    modifier_m1 = bool(1.15 < isp_ratio <= 1.30 and predicted_class not in ('B2', 'C', 'Normal'))
+    modifier_m1 = bool((1.15 < isp_ratio < 1.45 or (is_classic_a1_wedge and 1.15 < isp_ratio < 1.60)) and predicted_class not in ('B2', 'C', 'Normal'))
     modifier_m2 = bool(predicted_class == 'B3' or metrics.get('modifier_m2', False))
 
     modifiers: list[str] = []
     if modifier_m1:
-        modifiers.append('M1: Nghi ngờ tổn thương dải căng sau trên CT (ISP ratio nằm trong vùng nghi ngờ 1.15-1.30)')
+        modifiers.append('M1: Nghi ngờ tổn thương dải căng sau trên CT (ISP ratio nằm trong vùng nghi ngờ 1.15-1.45)')
     if modifier_m2:
         modifiers.append('M2: Cột sống cứng khớp / Bệnh lý DISH đi kèm')
 
@@ -342,11 +422,12 @@ def evaluate_aospine_decision_tree(
     if isinstance(metrics.get('spinous_tip'), dict):
         q_seg = float(metrics['spinous_tip'].get('q_seg', q_seg))
 
+    p_abnormal = float(1.0 - class_probs.get('Normal', 0.0))
     rejection_reasons: list[str] = []
     if q_seg < 0.40:
         rejection_reasons.append(f'Chất lượng phân đoạn mask thấp (q_seg={q_seg:.2f} < 0.40)')
-    if confidence < 0.45:
-        rejection_reasons.append(f'Độ tin cậy phân loại chưa đủ cao (confidence={confidence:.2f} < 0.45)')
+    if confidence < 0.45 and p_abnormal < 0.70:
+        rejection_reasons.append(f'Độ tin cậy phân loại chưa đủ cao (confidence={confidence:.2f} < 0.45, p_abnormal={p_abnormal:.2f} < 0.70)')
 
     is_indeterminate = len(rejection_reasons) > 0
 
@@ -360,19 +441,34 @@ def evaluate_aospine_decision_tree(
     h_info = metrics.get('heights') or {}
     ha_hp = float(metrics.get('ha_hp_ratio', h_info.get('anterior_posterior_ratio', 1.0)))
 
+    lvl_up = level_name.upper()
+    if lvl_up in ('L4', 'L5'):
+        trans_thresh = 5.5
+    elif lvl_up == 'L3':
+        trans_thresh = 4.5
+    else:
+        trans_thresh = 3.8
+
     if predicted_class == 'C':
         rationale = (f"{level_name} - Gãy trật cột sống loại C: Trượt/di lệch thân đốt {trans_mm:.1f} mm "
-                     f"(vượt ngưỡng an toàn 3.5 mm), mất vững hoàn toàn 3 cột.")
+                     f"(vượt ngưỡng an toàn {trans_thresh:.1f} mm), mất vững hoàn toàn 3 cột.")
     elif predicted_class == 'B3':
+        ang_th = 23.0 if lvl_up in ('L2', 'L3', 'L4', 'L5') else 15.0
+        rat_th = 2.0 if lvl_up in ('L2', 'L3', 'L4', 'L5') else 1.6
         rationale = (f"{level_name} - Tổn thương dải căng trước loại B3 (Hyperextension): "
-                     f"Toác góc đĩa đệm trước {disc_deg:.1f}° (ngưỡng 15°) và tỷ số mở rộng đĩa đệm {disc_ratio:.2f} lần.")
+                     f"Toác góc đĩa đệm trước {disc_deg:.1f}° (ngưỡng {ang_th:.0f}°) và tỷ số mở rộng đĩa đệm {disc_ratio:.2f} lần (ngưỡng {rat_th:.1f}).")
     elif predicted_class == 'B2':
-        if secondary_subtype:
-            rationale = (f"{level_name} - Tổn thương dải căng sau B2 (kèm gãy thân đốt kiểu {secondary_subtype}): "
-                         f"Toác khoảng liên gai sau (tỷ lệ {isp_ratio:.2f} lần, vượt ngưỡng 1.30) kèm tổn thương thân đốt.")
+        sub_note = f" (kèm gãy thân đốt kiểu {secondary_subtype})" if secondary_subtype else ""
+        if isp_ratio >= 1.45:
+            rationale = (
+                f"{level_name} - Tổn thương dải căng sau B2{sub_note}: "
+                f"Toác khoảng liên gai sau (tỷ lệ {isp_ratio:.2f} lần, vượt ngưỡng 1.45)."
+            )
         else:
-            rationale = (f"{level_name} - Tổn thương dải căng sau B2: Toác khoảng liên gai sau "
-                         f"(tỷ lệ {isp_ratio:.2f} lần, vượt ngưỡng 1.30).")
+            rationale = (
+                f"{level_name} - Tổn thương dải căng sau B2{sub_note}: "
+                f"Phát hiện bất thường cung sau/dây chằng qua hợp nhất đa phương thức (ISP={isp_ratio:.2f})."
+            )
     elif predicted_class == 'A4':
         pct_coll = max(0.0, (1.0 - rel_coll) * 100.0)
         pct_kept = min(100.0, rel_coll * 100.0)
@@ -400,7 +496,7 @@ def evaluate_aospine_decision_tree(
     if predicted_class == 'Normal':
         delta_pw = 0.0
         isp_ratio = min(isp_ratio, 1.0)
-        if trans_mm < 3.5:
+        if trans_mm < trans_thresh:
             trans_mm = 0.0
 
     raw_metrics = dict(
@@ -496,11 +592,25 @@ def rank_and_classify_spine(
                                 f"{neigh_eval['level']} - Đốt lành tiếp giáp khe tổn thương dải căng của {curr_eval['level']}."
                             )
 
+    # Check if sequence contains any valid T10-L5 levels
+    has_target_levels = any(
+        m.get('level') in AOSPINE_TARGET_LEVELS
+        for m in vertebrae_metrics
+    )
+
     # Calculate lesion severity score
     for idx, ev in enumerate(evaluations):
         cls_name = ev['predicted_class']
-        if cls_name in ('Normal', 'A0', 'Ngoài vùng khảo sát (Chạm biên CT)', 'S1 (Tham chiếu)') or ev.get('is_indeterminate'):
+        lvl = ev.get('level', '')
+        is_outside = (lvl not in AOSPINE_TARGET_LEVELS and lvl != 'S1')
+        if (
+            cls_name in ('Normal', 'A0', 'Ngoài vùng khảo sát (Chạm biên CT)', 'S1 (Tham chiếu)')
+            or ev.get('is_indeterminate')
+            or (has_target_levels and is_outside)
+        ):
             ev['lesion_severity_score'] = 0.0
+            if has_target_levels and is_outside:
+                ev['is_out_of_aospine_scope'] = True
             continue
         base_w = SEVERITY_WEIGHTS.get(cls_name, 0.05)
         p_abnormal = 1.0 - ev['class_probabilities'].get('Normal', 0.0)
@@ -509,7 +619,15 @@ def rank_and_classify_spine(
         # Extra weight if bone fragment retropulsed into canal
         pw_bonus = min(0.15, float(vertebrae_metrics[idx].get('delta_posterior_mm', 0.0)) / 30.0)
 
-        score = base_w * p_abnormal * (0.50 + 0.50 * conf) + pw_bonus
+        # Collapse bonus to prioritize truly fractured/collapsed vertebrae over noisy uncollapsed ones
+        rel_coll = float(vertebrae_metrics[idx].get('relative_collapse_ratio', 1.0))
+        collapse_bonus = min(0.25, max(0.0, 0.85 - rel_coll) * 0.6)
+
+        # Prototype anomaly bonus: boosts ranking of vertebrae flagged anomalous by Step 1 normal prototype
+        p_anom = float(ev.get('concept_probs', {}).get('p_anomaly', 0.0))
+        anomaly_bonus = min(0.20, max(0.0, p_anom - 0.40) * 0.4)
+
+        score = base_w * p_abnormal * (0.50 + 0.50 * conf) + pw_bonus + collapse_bonus + anomaly_bonus
         ev['lesion_severity_score'] = round(float(np.clip(score, 0.0, 1.0)), 4)
 
     # Sort descending by severity score, placing excluded/reference levels at the end
@@ -519,10 +637,12 @@ def rank_and_classify_spine(
             cls in ('Ngoài vùng khảo sát (Chạm biên CT)', 'S1 (Tham chiếu)', 'Chưa đặt đủ 6 mốc')
             or ev.get('is_fov_truncated', False)
             or ev.get('is_indeterminate', False)
+            or ev.get('is_out_of_aospine_scope', False)
         )
+        is_outside = (ev.get('level') not in AOSPINE_TARGET_LEVELS) if has_target_levels else False
         lvl = ev.get('level', '')
         lvl_idx = LEVELS.index(lvl) if lvl in LEVELS else 999
-        return (1 if is_excluded else 0, -ev.get('lesion_severity_score', 0.0), lvl_idx)
+        return (1 if is_excluded else 0, 1 if is_outside else 0, -ev.get('lesion_severity_score', 0.0), lvl_idx)
 
     ranked = sorted(evaluations, key=_rank_sort_key)
 

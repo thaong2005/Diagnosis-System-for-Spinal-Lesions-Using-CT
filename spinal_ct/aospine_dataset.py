@@ -9,12 +9,18 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+import torch
+import torch.nn.functional as F
+
 # Standard Radiologic CT Window Presets
 BONE_WINDOW_LEVEL = 400.0
 BONE_WINDOW_WIDTH = 1800.0
 
 SOFT_TISSUE_WINDOW_LEVEL = 50.0
 SOFT_TISSUE_WINDOW_WIDTH = 350.0
+
+# Standard Fixed Physical FOV for AO Spine ROI Extraction (0.625 mm/pixel at 128x128)
+DEFAULT_PHYSICAL_FOV_MM = 80.0
 
 
 def apply_ct_window(hu_array: np.ndarray, wl: float, ww: float) -> np.ndarray:
@@ -44,8 +50,85 @@ def apply_ct_window(hu_array: np.ndarray, wl: float, ww: float) -> np.ndarray:
     return np.asarray(norm, dtype=np.float32)
 
 
+def resample_fixed_fov_2d(
+    arr_2d: np.ndarray,
+    center_rc: tuple[float, float],
+    fov_mm: float,
+    spacing_zy_mm: tuple[float, float],
+    target_size: tuple[int, int] = (128, 128),
+    pad_value: float = -1024.0,
+    is_mask: bool = False,
+) -> np.ndarray:
+    """Resample an arbitrary 2D array around center_rc to a fixed physical square FOV (fov_mm x fov_mm).
+
+    Preserves 100% of physical size and anatomical aspect ratio (isotropic resolution fov_mm / target_size).
+    Out-of-bound pixels are cleanly padded with pad_value (-1024.0 HU for CT, 0.0 for masks).
+
+    Parameters
+    ----------
+    arr_2d : np.ndarray
+        2D source array of shape (H, W).
+    center_rc : tuple of float
+        (center_row, center_col) in source pixel coordinates.
+    fov_mm : float
+        Physical width/height of the square FOV in millimeters.
+    spacing_zy_mm : tuple of float
+        (spacing_row_mm, spacing_col_mm) physical spacing per pixel.
+    target_size : tuple of int
+        Output shape (rows, cols), default (128, 128).
+    pad_value : float
+        Fill value for out-of-bounds coordinates (default -1024.0 HU).
+    is_mask : bool
+        If True, use nearest neighbor interpolation to preserve sharp mask labels;
+        otherwise use bilinear interpolation.
+
+    Returns
+    -------
+    np.ndarray
+        Array of shape target_size in float32.
+    """
+    H, W = arr_2d.shape
+    target_h, target_w = target_size
+    sr, sc = float(spacing_zy_mm[0]), float(spacing_zy_mm[1])
+    cr, cc = float(center_rc[0]), float(center_rc[1])
+
+    grid_r = torch.linspace(
+        -fov_mm / 2.0 + (fov_mm / (2.0 * target_h)),
+        fov_mm / 2.0 - (fov_mm / (2.0 * target_h)),
+        target_h,
+        dtype=torch.float32,
+    )
+    grid_c = torch.linspace(
+        -fov_mm / 2.0 + (fov_mm / (2.0 * target_w)),
+        fov_mm / 2.0 - (fov_mm / (2.0 * target_w)),
+        target_w,
+        dtype=torch.float32,
+    )
+    gr, gc = torch.meshgrid(grid_r, grid_c, indexing='ij')
+
+    r_src = cr + gr / max(sr, 1e-4)
+    c_src = cc + gc / max(sc, 1e-4)
+
+    norm_r = 2.0 * r_src / max(H - 1, 1) - 1.0 if H > 1 else torch.zeros_like(r_src)
+    norm_c = 2.0 * c_src / max(W - 1, 1) - 1.0 if W > 1 else torch.zeros_like(c_src)
+
+    grid = torch.stack([norm_c, norm_r], dim=-1).unsqueeze(0)  # (1, target_h, target_w, 2)
+
+    t_in = torch.from_numpy(arr_2d.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+    mode = 'nearest' if is_mask else 'bilinear'
+
+    if pad_value == 0.0:
+        sampled = F.grid_sample(t_in, grid, mode=mode, padding_mode='zeros', align_corners=True)
+    else:
+        shifted = t_in - pad_value
+        sampled = F.grid_sample(shifted, grid, mode=mode, padding_mode='zeros', align_corners=True) + pad_value
+
+    out = sampled.squeeze(0).squeeze(0).numpy().astype(np.float32)
+    return out
+
+
 def _resize_2d(arr: np.ndarray, target_size: tuple[int, int] = (128, 128), is_mask: bool = False) -> np.ndarray:
-    """Resize 2D float32 array to target_size (rows, cols) using PIL."""
+    """Resize 2D float32 array to target_size (rows, cols) using PIL (legacy helper)."""
     target_w, target_h = target_size[1], target_size[0]
     im = Image.fromarray(arr.astype(np.float32), mode='F')
     resample_mode = Image.Resampling.NEAREST if is_mask else Image.Resampling.BILINEAR
@@ -63,8 +146,11 @@ def extract_body_canal_roi_25d(
     target_size: tuple[int, int] = (128, 128),
     canal_depth_mm: float = 12.0,
     vertical_margin_mm: float = 6.0,
+    parasagittal_slices: list[np.ndarray] | tuple[np.ndarray, np.ndarray] | None = None,
+    fov_mm: float = DEFAULT_PHYSICAL_FOV_MM,
+    posterior_shift_mm: float = 6.0,
 ) -> np.ndarray:
-    """Extract 5-channel 2.5D Body + Canal ROI centered on vertebral body and spinal canal.
+    """Extract 5-channel 2.5D Body + Canal ROI with Fixed Physical FOV (Isotropic 0.625 mm/px).
 
     Channels:
     - Ch 0: Mid-sagittal slice with Bone Window (WL=400, WW=1800).
@@ -88,9 +174,15 @@ def extract_body_canal_roi_25d(
     target_size : tuple of int
         Output spatial shape (rows, cols), default (128, 128).
     canal_depth_mm : float
-        Distance (mm) to extend ROI posteriorly into the spinal canal (default 12.0 mm).
+        Distance (mm) to extend reference mask posteriorly into spinal canal (default 12.0 mm).
     vertical_margin_mm : float
-        Margin (mm) to expand superiorly and inferiorly (default 6.0 mm).
+        Backward compatibility argument.
+    parasagittal_slices : list or tuple of np.ndarray, optional
+        Precomputed parasagittal slices for 2D inputs.
+    fov_mm : float
+        Fixed physical field-of-view in millimeters (default 80.0 mm).
+    posterior_shift_mm : float
+        Shift of window center posteriorly toward the spinal canal (default 6.0 mm).
 
     Returns
     -------
@@ -118,68 +210,76 @@ def extract_body_canal_roi_25d(
         raise ValueError(f"body_mask shape {b_mask.shape} does not match sagittal slice shape {(h_img, w_img)}.")
 
     occupied_rows, occupied_cols = np.where(b_mask)
-    if len(occupied_rows) == 0:
-        # Fallback if empty mask
-        r_min, r_max = h_img // 4, 3 * h_img // 4
-        c_min, c_max = w_img // 4, 3 * w_img // 4
+    if len(occupied_rows) > 0:
+        r_c = 0.5 * float(occupied_rows.min() + occupied_rows.max())
+        c_c = 0.5 * float(occupied_cols.min() + occupied_cols.max())
+        # Posterior shift to cover both vertebral body and spinal canal
+        c_c += posterior_shift_mm / max(sy, 1e-4)
     else:
-        r_min, r_max = int(occupied_rows.min()), int(occupied_rows.max())
-        c_min, c_max = int(occupied_cols.min()), int(occupied_cols.max())
-
-    # Bounding Box calculations in (row, col) = (Z, Y):
-    # row = Z (inferior to superior), col = Y (anterior to posterior)
-    r_pad = max(2, int(round(vertical_margin_mm / max(sz, 0.1))))
-    c_pad_canal = max(4, int(round(canal_depth_mm / max(sy, 0.1))))
-    c_pad_ant = max(2, int(round(3.0 / max(sy, 0.1))))
-
-    r_start = max(0, r_min - r_pad)
-    r_end = min(h_img, r_max + r_pad + 1)
-    c_start = max(0, c_min - c_pad_ant)
-    c_end = min(w_img, c_max + c_pad_canal + 1)
+        r_c = h_img / 2.0
+        c_c = w_img / 2.0
 
     # 1. Ch 0: Mid-sagittal Bone Window
-    ch0_full = apply_ct_window(mid_sag_hu, BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
-    ch0 = _resize_2d(ch0_full[r_start:r_end, c_start:c_end], target_size, is_mask=False)
+    ch0_hu = resample_fixed_fov_2d(
+        mid_sag_hu, (r_c, c_c), fov_mm, (sz, sy), target_size, pad_value=-1024.0, is_mask=False
+    )
+    ch0 = apply_ct_window(ch0_hu, BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
 
     # 2 & 3. Ch 1 & Ch 2: Parasagittal slices (-4mm and +4mm)
     if is_3d:
         dx_vox = max(1, int(round(4.0 / max(sx, 0.1))))
         x_left = int(np.clip(mid_x - dx_vox, 0, x_dim - 1))
         x_right = int(np.clip(mid_x + dx_vox, 0, x_dim - 1))
-        ch1_full = apply_ct_window(ct_volume_or_slice[:, :, x_left], BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
-        ch2_full = apply_ct_window(ct_volume_or_slice[:, :, x_right], BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
-        ch1 = _resize_2d(ch1_full[r_start:r_end, c_start:c_end], target_size, is_mask=False)
-        ch2 = _resize_2d(ch2_full[r_start:r_end, c_start:c_end], target_size, is_mask=False)
+        ch1_hu = resample_fixed_fov_2d(
+            ct_volume_or_slice[:, :, x_left], (r_c, c_c), fov_mm, (sz, sy), target_size, pad_value=-1024.0, is_mask=False
+        )
+        ch2_hu = resample_fixed_fov_2d(
+            ct_volume_or_slice[:, :, x_right], (r_c, c_c), fov_mm, (sz, sy), target_size, pad_value=-1024.0, is_mask=False
+        )
+        ch1 = apply_ct_window(ch1_hu, BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
+        ch2 = apply_ct_window(ch2_hu, BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
+    elif parasagittal_slices is not None and len(parasagittal_slices) >= 2:
+        ch1_hu = resample_fixed_fov_2d(
+            parasagittal_slices[0], (r_c, c_c), fov_mm, (sz, sy), target_size, pad_value=-1024.0, is_mask=False
+        )
+        ch2_hu = resample_fixed_fov_2d(
+            parasagittal_slices[1], (r_c, c_c), fov_mm, (sz, sy), target_size, pad_value=-1024.0, is_mask=False
+        )
+        ch1 = apply_ct_window(ch1_hu, BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
+        ch2 = apply_ct_window(ch2_hu, BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
     else:
-        # Fallback for 2D: Sobel gradient edges
-        grad_r = np.abs(np.diff(ch0_full, axis=0, prepend=ch0_full[:1, :]))
-        grad_c = np.abs(np.diff(ch0_full, axis=1, prepend=ch0_full[:, :1]))
-        ch1 = _resize_2d(np.clip(grad_r * 5.0, 0.0, 1.0)[r_start:r_end, c_start:c_end], target_size, is_mask=False)
-        ch2 = _resize_2d(np.clip(grad_c * 5.0, 0.0, 1.0)[r_start:r_end, c_start:c_end], target_size, is_mask=False)
+        # Fallback for 2D: Sobel gradient edges on Ch 0
+        grad_r = np.abs(np.diff(ch0, axis=0, prepend=ch0[:1, :]))
+        grad_c = np.abs(np.diff(ch0, axis=1, prepend=ch0[:, :1]))
+        ch1 = np.clip(grad_r * 5.0, 0.0, 1.0).astype(np.float32)
+        ch2 = np.clip(grad_c * 5.0, 0.0, 1.0).astype(np.float32)
 
     # 4. Ch 3: Axial slice at upper 1/3 (or Soft-tissue window fallback)
-    if is_3d and r_max > r_min:
+    if is_3d and len(occupied_rows) > 0:
+        r_min, r_max = int(occupied_rows.min()), int(occupied_rows.max())
         z_axial = int(np.clip(round(r_min + 0.67 * (r_max - r_min)), 0, z_dim - 1))
         ax_hu = ct_volume_or_slice[z_axial, :, :].astype(np.float32)
-        ax_bone = apply_ct_window(ax_hu, BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
-        # Crop around vertebral body and canal in Y and X
-        x_start = max(0, mid_x - int(round(25.0 / max(sx, 0.1))))
-        x_end = min(x_dim, mid_x + int(round(25.0 / max(sx, 0.1))) + 1)
-        ax_crop = ax_bone[c_start:c_end, x_start:x_end]
-        ch3 = _resize_2d(ax_crop, target_size, is_mask=False)
+        # In axial view: row is Y (anterior-posterior, spacing sy), col is X (left-right, spacing sx)
+        ax_hu_res = resample_fixed_fov_2d(
+            ax_hu, (c_c, float(mid_x)), fov_mm, (sy, sx), target_size, pad_value=-1024.0, is_mask=False
+        )
+        ch3 = apply_ct_window(ax_hu_res, BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
     else:
-        # 2D fallback: Soft-tissue window of mid-sagittal slice
-        ch3_full = apply_ct_window(mid_sag_hu, SOFT_TISSUE_WINDOW_LEVEL, SOFT_TISSUE_WINDOW_WIDTH)
-        ch3 = _resize_2d(ch3_full[r_start:r_end, c_start:c_end], target_size, is_mask=False)
+        # 2D fallback: Soft-tissue window of mid-sagittal patch
+        ch3 = apply_ct_window(ch0_hu, SOFT_TISSUE_WINDOW_LEVEL, SOFT_TISSUE_WINDOW_WIDTH)
 
     # 5. Ch 4: Reference Mask: Body + Canal Reference Zone
     ref_mask = np.zeros((h_img, w_img), dtype=np.float32)
     ref_mask[b_mask] = 1.0
-    # Add canal reference zone (columns from c_max to c_end across occupied rows)
     if len(occupied_rows) > 0:
-        for r in range(r_min, r_max + 1):
-            ref_mask[r, c_max:c_end] = 0.5  # 0.5 designates the canal intrusion zone
-    ch4 = _resize_2d(ref_mask[r_start:r_end, c_start:c_end], target_size, is_mask=True)
+        c_max = int(occupied_cols.max())
+        c_end_canal = min(w_img, c_max + max(4, int(round(canal_depth_mm / max(sy, 0.1)))) + 1)
+        for r in range(int(occupied_rows.min()), int(occupied_rows.max()) + 1):
+            ref_mask[r, c_max:c_end_canal] = 0.5  # 0.5 designates the canal intrusion zone
+
+    ch4 = resample_fixed_fov_2d(
+        ref_mask, (r_c, c_c), fov_mm, (sz, sy), target_size, pad_value=0.0, is_mask=True
+    )
 
     roi_5d = np.stack([ch0, ch1, ch2, ch3, ch4], axis=0).astype(np.float32)
     return np.clip(roi_5d, 0.0, 1.0)
@@ -194,8 +294,10 @@ def extract_posterior_arch_roi_25d(
     slice_x_index: int | None = None,
     target_size: tuple[int, int] = (128, 128),
     margin_mm: float = 6.0,
+    parasagittal_slices: list[np.ndarray] | tuple[np.ndarray, np.ndarray] | None = None,
+    fov_mm: float = DEFAULT_PHYSICAL_FOV_MM,
 ) -> np.ndarray:
-    """Extract 5-channel 2.5D Posterior Arch ROI covering spinous processes and tension band.
+    """Extract 5-channel 2.5D Posterior Arch ROI with Fixed Physical FOV (Isotropic 0.625 mm/px).
 
     Channels:
     - Ch 0: Mid-sagittal slice with Bone Window (WL=400, WW=1800).
@@ -219,7 +321,11 @@ def extract_posterior_arch_roi_25d(
     target_size : tuple of int
         Output spatial shape (rows, cols), default (128, 128).
     margin_mm : float
-        Margin (mm) around bounding box (default 6.0 mm).
+        Backward compatibility argument.
+    parasagittal_slices : list or tuple of np.ndarray, optional
+        Precomputed parasagittal slices for 2D inputs.
+    fov_mm : float
+        Fixed physical field-of-view in millimeters (default 80.0 mm).
 
     Returns
     -------
@@ -248,52 +354,61 @@ def extract_posterior_arch_roi_25d(
 
     occupied_rows, occupied_cols = np.where(arch_mask)
     if len(occupied_rows) > 0:
-        r_min, r_max = int(occupied_rows.min()), int(occupied_rows.max())
-        c_min, c_max = int(occupied_cols.min()), int(occupied_cols.max())
+        r_c = 0.5 * float(occupied_rows.min() + occupied_rows.max())
+        c_c = 0.5 * float(occupied_cols.min() + occupied_cols.max())
     elif body_mask is not None and np.any(body_mask):
         b_rows, b_cols = np.where(body_mask)
-        r_min, r_max = int(b_rows.min()), int(b_rows.max())
-        b_width = b_cols.max() - b_cols.min()
-        c_min = int(b_cols.max())
-        c_max = min(w_img - 1, c_min + int(1.5 * b_width))
+        r_c = 0.5 * float(b_rows.min() + b_rows.max())
+        b_width_px = float(b_cols.max() - b_cols.min())
+        # Center in posterior arch region (~15-20mm posterior to body)
+        c_c = float(b_cols.max()) + 0.75 * b_width_px + (15.0 / max(sy, 1e-4))
     else:
-        r_min, r_max = h_img // 4, 3 * h_img // 4
-        c_min, c_max = w_img // 2, w_img - 1
-
-    r_pad = max(2, int(round(margin_mm / max(sz, 0.1))))
-    c_pad = max(2, int(round(margin_mm / max(sy, 0.1))))
-
-    r_start = max(0, r_min - r_pad)
-    r_end = min(h_img, r_max + r_pad + 1)
-    c_start = max(0, c_min - c_pad)
-    c_end = min(w_img, c_max + c_pad + 1)
+        r_c = h_img / 2.0
+        c_c = 0.75 * w_img
 
     # 1. Ch 0: Mid-sagittal Bone Window
-    ch0_full = apply_ct_window(mid_sag_hu, BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
-    ch0 = _resize_2d(ch0_full[r_start:r_end, c_start:c_end], target_size, is_mask=False)
+    ch0_hu = resample_fixed_fov_2d(
+        mid_sag_hu, (r_c, c_c), fov_mm, (sz, sy), target_size, pad_value=-1024.0, is_mask=False
+    )
+    ch0 = apply_ct_window(ch0_hu, BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
 
     # 2 & 3. Ch 1 & Ch 2: Parasagittal slices (-4mm and +4mm)
     if is_3d:
         dx_vox = max(1, int(round(4.0 / max(sx, 0.1))))
         x_left = int(np.clip(mid_x - dx_vox, 0, x_dim - 1))
         x_right = int(np.clip(mid_x + dx_vox, 0, x_dim - 1))
-        ch1_full = apply_ct_window(ct_volume_or_slice[:, :, x_left], BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
-        ch2_full = apply_ct_window(ct_volume_or_slice[:, :, x_right], BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
-        ch1 = _resize_2d(ch1_full[r_start:r_end, c_start:c_end], target_size, is_mask=False)
-        ch2 = _resize_2d(ch2_full[r_start:r_end, c_start:c_end], target_size, is_mask=False)
+        ch1_hu = resample_fixed_fov_2d(
+            ct_volume_or_slice[:, :, x_left], (r_c, c_c), fov_mm, (sz, sy), target_size, pad_value=-1024.0, is_mask=False
+        )
+        ch2_hu = resample_fixed_fov_2d(
+            ct_volume_or_slice[:, :, x_right], (r_c, c_c), fov_mm, (sz, sy), target_size, pad_value=-1024.0, is_mask=False
+        )
+        ch1 = apply_ct_window(ch1_hu, BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
+        ch2 = apply_ct_window(ch2_hu, BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
+    elif parasagittal_slices is not None and len(parasagittal_slices) >= 2:
+        ch1_hu = resample_fixed_fov_2d(
+            parasagittal_slices[0], (r_c, c_c), fov_mm, (sz, sy), target_size, pad_value=-1024.0, is_mask=False
+        )
+        ch2_hu = resample_fixed_fov_2d(
+            parasagittal_slices[1], (r_c, c_c), fov_mm, (sz, sy), target_size, pad_value=-1024.0, is_mask=False
+        )
+        ch1 = apply_ct_window(ch1_hu, BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
+        ch2 = apply_ct_window(ch2_hu, BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
     else:
-        grad_r = np.abs(np.diff(ch0_full, axis=0, prepend=ch0_full[:1, :]))
-        grad_c = np.abs(np.diff(ch0_full, axis=1, prepend=ch0_full[:, :1]))
-        ch1 = _resize_2d(np.clip(grad_r * 5.0, 0.0, 1.0)[r_start:r_end, c_start:c_end], target_size, is_mask=False)
-        ch2 = _resize_2d(np.clip(grad_c * 5.0, 0.0, 1.0)[r_start:r_end, c_start:c_end], target_size, is_mask=False)
+        # Fallback for 2D: Sobel gradient edges
+        grad_r = np.abs(np.diff(ch0, axis=0, prepend=ch0[:1, :]))
+        grad_c = np.abs(np.diff(ch0, axis=1, prepend=ch0[:, :1]))
+        ch1 = np.clip(grad_r * 5.0, 0.0, 1.0).astype(np.float32)
+        ch2 = np.clip(grad_c * 5.0, 0.0, 1.0).astype(np.float32)
 
     # 4. Ch 3: Mid-sagittal Soft-Tissue Window (for interspinous ligament & edema)
-    ch3_full = apply_ct_window(mid_sag_hu, SOFT_TISSUE_WINDOW_LEVEL, SOFT_TISSUE_WINDOW_WIDTH)
-    ch3 = _resize_2d(ch3_full[r_start:r_end, c_start:c_end], target_size, is_mask=False)
+    ch3 = apply_ct_window(ch0_hu, SOFT_TISSUE_WINDOW_LEVEL, SOFT_TISSUE_WINDOW_WIDTH)
 
     # 5. Ch 4: Posterior Arch Mask
     arch_float = arch_mask.astype(np.float32)
-    ch4 = _resize_2d(arch_float[r_start:r_end, c_start:c_end], target_size, is_mask=True)
+    ch4 = resample_fixed_fov_2d(
+        arch_float, (r_c, c_c), fov_mm, (sz, sy), target_size, pad_value=0.0, is_mask=True
+    )
 
     roi_5d = np.stack([ch0, ch1, ch2, ch3, ch4], axis=0).astype(np.float32)
     return np.clip(roi_5d, 0.0, 1.0)

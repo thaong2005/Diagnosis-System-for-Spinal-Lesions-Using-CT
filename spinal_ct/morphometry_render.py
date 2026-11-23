@@ -12,7 +12,7 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Circle, Ellipse, Polygon
 
 from spinal_ct.blob_analysis import analyze_blob, normalize_region
-from spinal_ct.localization import LEVELS
+from spinal_ct.localization import LEVELS, AOSPINE_TARGET_LEVELS
 from spinal_ct.overlays import _boundary_anchor, _label_positions
 
 
@@ -396,21 +396,30 @@ def draw_body(
         points = np.asarray(session.result['monte_carlo_area']['preview_points_xy_mm_hit'])
         ax.scatter(points[:, 0], points[:, 1], s=2, c=np.where(points[:, 2], '#3bf4b0', '#ff6060'), alpha=0.5)
 
-    aospine_title = ''
     has_landmarks = (session.landmarks is not None and len(session.landmarks) == 6)
     has_override = bool(getattr(session, 'doctor_confirmed_class', None))
-    if show_aospine and session.aospine and (has_landmarks or has_override):
+    is_out_of_scope = (
+        session.level not in AOSPINE_TARGET_LEVELS
+        and session.level != 'S1'
+        and not has_override
+    )
+
+    if is_out_of_scope:
+        title_text = f"{session.level} · Đo hình thái (Ngoài T10–L5)"
+    elif show_aospine and session.aospine and (has_landmarks or has_override):
         ao_cls = getattr(session, 'doctor_confirmed_class', None) or session.aospine.get('predicted_class', '')
         ao_conf = session.aospine.get('confidence', 0.0)
         ao_rank = session.aospine.get('rank', 1)
         ao_sec = f"+{session.aospine['secondary_subtype']}" if session.aospine.get('secondary_subtype') else ''
-        aospine_title = f" | AO: {ao_cls}{ao_sec} ({ao_conf:.0%}) #{ao_rank}"
+        cls_short = f"{ao_cls}{ao_sec}"
+        title_text = f"{session.level} · AO: {cls_short} ({ao_conf:.0%}) #{ao_rank}"
     elif show_aospine and session.aospine and not has_landmarks and not has_override:
-        aospine_title = " | AO: Chờ đo mốc"
+        title_text = f"{session.level} · Chờ đo mốc"
+    else:
+        title_text = f"{session.level} · {'Đã xác nhận' if session.reviewed else 'Vùng nháp'}"
 
-    title_text = f"{session.level} · {'Đã xác nhận' if session.reviewed else 'Vùng nháp'}{aospine_title}"
     title_color = '#e0e0e0' if dark_theme else '#233c4b'
-    ax.set_title(title_text, color=title_color, fontsize=10, fontweight='bold')
+    ax.set_title(title_text, color=title_color, fontsize=9, fontweight='bold', pad=6)
     ax.set_xlim([lower[0], upper[0]])
     ax.set_ylim([lower[1], upper[1]])
     ax.set_aspect('equal')
@@ -431,21 +440,65 @@ def draw_clean_reference(ax, session, *, dark_theme: bool = True) -> None:
 
     ax.imshow(session.ct, origin='lower', extent=extent, cmap='gray', vmin=-500, vmax=1500)
     title_col = '#e0e0e0' if dark_theme else '#233c4b'
-    ax.set_title('CT gốc tham chiếu (Clean Reference)', color=title_col, fontsize=10, fontweight='bold')
+    ax.set_title('CT gốc tham chiếu', color=title_col, fontsize=9, fontweight='bold', pad=6)
     ax.axis('off')
     ax.set_aspect('equal')
 
 
-def draw_normalized(ax, session) -> None:
-    """Retained for backward compatibility."""
-    if not session.mask.any():
-        ax.text(0.5, 0.5, 'Vẽ vùng thân đốt để chuẩn hóa', ha='center', va='center', transform=ax.transAxes)
-        ax.set_axis_off()
+def draw_normalized(ax, session, *, dark_theme: bool = True) -> None:
+    """Render canonical 256x256 normalized vertebra region with bone window, mask contour, centroid and landmarks."""
+    bg_color = '#1e1e2e' if dark_theme else '#252525'
+    text_color = '#e0e0e0' if dark_theme else '#233c4b'
+    ax.set_facecolor(bg_color)
+
+    if session is None or session.mask is None or not session.mask.any():
+        ax.text(0.5, 0.5, 'Vẽ vùng thân đốt để chuẩn hóa', ha='center', va='center',
+                transform=ax.transAxes, color=text_color, fontsize=10)
+        ax.axis('off')
         return
-    normalized = normalize_region(session.ct, session.mask, session.plane.spacing_xy_mm)
-    ax.imshow(normalized['ct'], origin='lower', cmap='gray', vmin=-500, vmax=1500)
-    ax.contour(normalized['mask'], levels=[0.5], colors=['#3bf4b0'], linewidths=1)
-    ax.set(title='256 × 256 · giữ tỷ lệ', xlabel='Pixel', ylabel='Pixel')
+
+    landmarks = getattr(session, 'landmarks', None)
+    normalized = normalize_region(session.ct, session.mask, session.plane.spacing_xy_mm, landmarks_xy_mm=landmarks)
+    norm_ct = normalized['ct']
+    norm_mask = normalized['mask']
+    transform_info = normalized['transform']
+
+    # Display normalized CT on standard bone window
+    ax.imshow(norm_ct, origin='lower', cmap='gray', vmin=-500, vmax=1500)
+
+    # Contour of normalized body mask
+    ax.contour(norm_mask, levels=[0.5], colors=['#3bf4b0'], linewidths=1.5)
+
+    # Centroid at center of normalized grid
+    ax.plot([127.5], [127.5], '+', color='#ffd166', markersize=10, markeredgewidth=2, label='Tâm khối')
+
+    # Draw orientation indicators
+    ax.annotate('', xy=(240, 16), xytext=(200, 16),
+                arrowprops=dict(arrowstyle="->", color='#06d6a0', lw=1.5))
+    ax.text(242, 16, 'Sau (P)', color='#06d6a0', fontsize=8, va='center', fontweight='bold')
+    ax.annotate('', xy=(16, 240), xytext=(16, 200),
+                arrowprops=dict(arrowstyle="->", color='#118ab2', lw=1.5))
+    ax.text(16, 246, 'Trên (S)', color='#118ab2', fontsize=8, ha='center', fontweight='bold')
+
+    # Draw normalized 6 landmarks if present
+    norm_lm = transform_info.get('normalized_landmarks_px') or []
+    lm_colors = ['#06d6a0', '#118ab2', '#ffd166', '#f78c6b', '#ef476f', '#b5179e']
+    lm_labels = ['AS', 'AI', 'MS', 'MI', 'PS', 'PI']
+    if len(norm_lm) == 6:
+        for idx, (pt, col, lbl) in enumerate(zip(norm_lm, lm_colors, lm_labels)):
+            ax.plot(pt[0], pt[1], 'o', color=col, markersize=5, markeredgewidth=1, markeredgecolor='white')
+            dx = 5 if 'P' in lbl else -15
+            dy = 5 if 'S' in lbl else -12
+            ax.text(pt[0] + dx, pt[1] + dy, lbl, color=col, fontsize=7, fontweight='bold')
+
+    step_mm = transform_info.get('spacing_mm', 1.0)
+    title_str = "Chuẩn hóa 256×256"
+    ax.set_title(title_str, color=text_color, fontsize=9, fontweight='bold', pad=6)
+    ax.set_xlabel('Pixel (Trước ➔ Sau)', color=text_color, fontsize=8)
+    ax.set_ylabel('Pixel (Dưới ➔ Trên)', color=text_color, fontsize=8)
+    ax.tick_params(colors=text_color, labelsize=7)
+    for spine in ax.spines.values():
+        spine.set_color('#444466')
     ax.set_aspect('equal')
 
 
