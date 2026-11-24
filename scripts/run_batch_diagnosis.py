@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Batch diagnosis pipeline for Spinal CT raw cases.
+"""Batch diagnosis pipeline for Spinal CT raw cases using Three-Pillar AI Fusion.
 
 Processes raw patient CT scans across categories (A1, A3, A4, B2, B3, C):
-1. Skips patients that already have completed diagnosis outputs.
-2. For unsegmented cases, finds the optimal axial series and runs fast localization.
-3. If diagnosis cannot be performed, records exact root causes.
-4. For successfully localized cases, performs vertebra morphometry and AO Spine classification.
-5. Exports structured predictions and comparison against ground truth CSV.
+1. For each patient, selects optimal axial CT series (matching mask geometry if available).
+2. Performs 3D vertebral morphometry across target levels T10-L5.
+3. Executes Three-Pillar AI Fusion:
+   - Pillar 1: Morphological rules & reflex arcs (aospine_rules.py).
+   - Pillar 2: 2-Step Prototype Bank (w=0.3, prototype_bank.py).
+   - Pillar 3: Dual-Stream 2.5D CNN (aospine_model.py).
+   - Adaptive Fusion with 7 Biomechanical Guards (aospine_fusion.py).
+4. Matches predictions against ground truth CSV (data ngay 27.09.2026.csv).
+5. Exports structured predictions and comprehensive comparative metrics.
 """
 from __future__ import annotations
 
@@ -32,15 +36,28 @@ import numpy as np
 import SimpleITK as sitk
 
 from spinal_ct.ct_io import list_ct_series, load_ct, slugify
-from spinal_ct.localization import LEVELS
+from spinal_ct.localization import LEVELS, AOSPINE_TARGET_LEVELS
+from spinal_ct.body_region import (
+    propose_plane,
+    sample_plane,
+    sample_parasagittal_slices,
+    same_geometry,
+)
 from spinal_ct.morphometry import (
+    BodySession,
+    SpineSession,
+    ct_fingerprint,
     auto_segment_body,
     auto_detect_landmarks,
     measure_heights,
     measure_posterior_wall_retropulsion,
     compute_intervertebral_metrics,
 )
+from spinal_ct.aospine_fusion import fuse_and_classify_spine
 from spinal_ct.aospine_rules import rank_and_classify_spine
+
+AOSPINE_6CLASSES = ['A1', 'A3', 'A4', 'B2', 'B3', 'C']
+AOSPINE_GROUPS = ['A', 'B', 'C']
 
 
 def strip_accents(text: str) -> str:
@@ -53,12 +70,91 @@ def strip_accents(text: str) -> str:
     return re.sub(r'[^a-z0-9]', '', text.lower())
 
 
-def select_best_series(p_dir: Path) -> dict[str, Any] | None:
-    """Select the best axial CT series for spine localization."""
+def normalize_level_name(level_str: str) -> str:
+    """Normalize level strings like 'D12' to 'T12', 'L01' to 'L1', etc."""
+    s = str(level_str).strip().upper()
+    s = re.sub(r'^D(\d+)', r'T\1', s)
+    s = re.sub(r'([TL])0+(\d+)', r'\1\2', s)
+    return s
+
+
+def parse_levels(level_str: str) -> list[str]:
+    """Parse complex vertebra level strings like 'T11-D12', 'T12-L1', 'L3L4', 'Gãy L1'."""
+    s = str(level_str).strip().upper()
+    s = re.sub(r'D(\d+)', r'T\1', s)
+    found = re.findall(r'[TL]\d+', s)
+    res = [re.sub(r'([TL])0+(\d+)', r'\1\2', x) for x in found]
+    if not res:
+        norm = normalize_level_name(level_str)
+        if norm:
+            res = [norm]
+    return res
+
+
+def normalize_class_name(class_str: str) -> str:
+    """Normalize class strings like 'b2 (kèm a4)' to 'B2'."""
+    s = str(class_str).strip().upper()
+    for c in ('B3', 'B2', 'B1', 'A4', 'A3', 'A2', 'A1', 'A0', 'C', 'NORMAL'):
+        if s.startswith(c):
+            return c
+    return s
+
+
+def to_group(cls_name: str) -> str:
+    cls_upper = normalize_class_name(cls_name)
+    if cls_upper.startswith('A'):
+        return 'A'
+    if cls_upper.startswith('B'):
+        return 'B'
+    if cls_upper.startswith('C'):
+        return 'C'
+    return 'Normal'
+
+
+def select_best_series(p_dir: Path, mask_path: Path | None = None) -> dict[str, Any] | None:
+    """Select the best axial CT series, prioritizing exact geometry match with mask."""
     choices = list_ct_series(p_dir)
+    if not choices:
+        return None
+
+    # Priority 0: Match exact input_fingerprint from prediction.json if available
+    if mask_path and mask_path.is_file():
+        pred_json = mask_path.parent / 'prediction.json'
+        if pred_json.is_file():
+            try:
+                pj_data = json.loads(pred_json.read_text(encoding='utf-8'))
+                expected_fp = pj_data.get('input_fingerprint')
+                if expected_fp:
+                    for c in choices:
+                        if c.get('axial'):
+                            try:
+                                img = load_ct(p_dir, c['uid'])
+                                if ct_fingerprint(img) == expected_fp:
+                                    return c
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+    # Priority 1: Match exact number of slices from existing mask if available
+    if mask_path and mask_path.is_file():
+        try:
+            m_img = sitk.ReadImage(str(mask_path))
+            m_slices = m_img.GetSize()[2]
+            matching = [c for c in choices if c.get('axial') and c.get('slices') == m_slices]
+            if matching:
+                # Prefer bone kernel if multiple match slice count
+                for k in ['BONE', 'SPINE', 'DETAIL', 'STANDARD']:
+                    for c in matching:
+                        if k in c.get('kernel', '').upper():
+                            return c
+                return matching[0]
+        except Exception:
+            pass
+
+    # Priority 2: Standard selection (valid axial, >= 30 slices, bone kernel)
     valid = [c for c in choices if c.get('axial') and c.get('geometry_error') is None and c.get('slices', 0) >= 30]
     if not valid:
-        # Fallback: check if any axial series exist with slices >= 20 even if slight geometry flag
         fallback = [c for c in choices if c.get('axial') and c.get('slices', 0) >= 20]
         if not fallback:
             return None
@@ -67,7 +163,6 @@ def select_best_series(p_dir: Path) -> dict[str, Any] | None:
     max_sl = max(c['slices'] for c in valid)
     top = [c for c in valid if c['slices'] == max_sl]
 
-    # Prioritize bone/spine reconstruction kernel
     for k in ['BONE', 'SPINE', 'DETAIL', 'STANDARD']:
         for c in top:
             if k in c.get('kernel', '').upper():
@@ -119,23 +214,58 @@ def measure_retropulsion_from_mask(
 def run_morphometry_and_classification(
     mask_path: Path,
     ct_image: sitk.Image,
-    spine_levels: list[str] = ('T10', 'T11', 'T12', 'L1', 'L2', 'L3', 'L4', 'L5'),
+    patient_id: str = 'patient',
+    spine_levels: tuple[str, ...] = AOSPINE_TARGET_LEVELS,
 ) -> dict[str, Any]:
-    """Extract vertebral morphometry and compute AO Spine classification."""
+    """Extract vertebral morphometry and execute Production Three-Pillar AI Fusion.
+
+    Uses 3D SpineSession + BodySession with parasagittal slices (-4mm, 0mm, +4mm)
+    feeding Pillar 1 (Rules), Pillar 2 (Prototype Bank w=0.3), Pillar 3 (2.5D CNN),
+    and Biomechanical Guards.
+    """
     mask_img = sitk.ReadImage(str(mask_path))
+    fp = ct_fingerprint(ct_image)
+
+    # Approach A: True 3D SpineSession when geometries align
+    if same_geometry(ct_image, mask_img):
+        spine = SpineSession(patient_id=patient_id)
+        stats = sitk.LabelShapeStatisticsImageFilter()
+        stats.SetComputePerimeter(False)
+        stats.Execute(mask_img)
+
+        for lvl in spine_levels:
+            if lvl not in LEVELS:
+                continue
+            lbl_id = LEVELS.index(lvl) + 1
+            if not stats.HasLabel(lbl_id) or stats.GetNumberOfPixels(lbl_id) < 30:
+                continue
+            try:
+                plane = propose_plane(ct_image, mask_img, lbl_id)
+                ct_slice, valid_s, hint = sample_plane(ct_image, plane, mask_img, lbl_id)
+                para = sample_parasagittal_slices(ct_image, plane)
+                sess = BodySession(
+                    fp, lvl, 'Baseline', plane, ct_slice, valid_s, hint,
+                    age_group='adult', parasagittal_slices=para,
+                )
+                sess.auto_populate(approve=False)
+                spine.add_session(sess)
+            except Exception:
+                continue
+
+        if spine.sessions:
+            diag_res = spine.recompute_aospine_classification()
+            if diag_res.get('ranked_vertebrae'):
+                return diag_res
+
+    # Approach B: Fallback via mid-sagittal 2D extraction with 3-Pillar Fusion
     mask_arr = sitk.GetArrayFromImage(mask_img)
     ct_arr = sitk.GetArrayFromImage(ct_image)
-
     sp_xyz = mask_img.GetSpacing()
     spacing_2d = (sp_xyz[1], sp_xyz[2])
 
     tl_indices = [LEVELS.index(lvl) + 1 for lvl in spine_levels if lvl in LEVELS]
     tl_voxels = np.isin(mask_arr, tl_indices)
-    if tl_voxels.any():
-        _, _, x_pts = np.where(tl_voxels)
-        mid_x = int(np.median(x_pts))
-    else:
-        mid_x = mask_arr.shape[2] // 2
+    mid_x = int(np.median(np.where(tl_voxels)[2])) if tl_voxels.any() else mask_arr.shape[2] // 2
 
     ct_2d = ct_arr[:, :, mid_x].astype(np.float32)
     mask_2d = mask_arr[:, :, mid_x]
@@ -180,65 +310,128 @@ def run_morphometry_and_classification(
 
     vertebrae_data.sort(key=lambda x: LEVELS.index(x['level']) if x['level'] in LEVELS else 999)
     inter = compute_intervertebral_metrics(vertebrae_data)
-    ranked = rank_and_classify_spine(inter)
+    ranked = fuse_and_classify_spine(inter)
     return ranked
 
 
-def check_existing_diagnosis(slug: str) -> dict[str, Any] | None:
-    """Check if patient already has diagnosis results or report in data/output/<slug>."""
-    out_dir = ROOT / 'data/output' / slug
-    if not out_dir.is_dir():
-        return None
+def load_ground_truth_map(gt_path: Path) -> dict[str, dict[str, Any]]:
+    """Load ground truth mapping from data ngay 27.09.2026.csv."""
+    gt_map: dict[str, dict[str, Any]] = {}
+    if not gt_path.is_file():
+        return gt_map
 
-    # 1. Check if explicit diagnosis_result.json exists
-    diag_f = out_dir / 'diagnosis_result.json'
-    if diag_f.is_file():
-        try:
-            return json.loads(diag_f.read_text(encoding='utf-8'))
-        except Exception:
-            pass
+    with gt_path.open('r', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            stt = r.get('STT', '').strip()
+            name = r.get('Tên', '').strip()
+            raw_lvl = r.get('Đốt gãy', '').strip()
+            raw_cls = r.get('phân loại', '').strip()
+            pid = r.get('ID', '').strip()
+            notes = r.get('kèm theo', '').strip()
 
-    # 2. Check if do_than_dot has completed measurements
-    dtd = out_dir / 'do_than_dot'
-    if dtd.is_dir():
-        sessions = [s for s in dtd.iterdir() if s.is_dir() and (s / 'measurements.json').is_file()]
-        if len(sessions) >= 1:
-            # Load existing classification from evaluate_aospine_baseline or aospine_evaluation
-            eval_preds = ROOT / 'data/output/aospine_evaluation/predictions.json'
-            if eval_preds.is_file():
-                try:
-                    preds = json.loads(eval_preds.read_text(encoding='utf-8'))
-                    for p in preds:
-                        if strip_accents(p.get('patient_id', '')) == strip_accents(slug) and p.get('has_data'):
-                            return p
-                except Exception:
-                    pass
-            # If no cached summary, mark present with do_than_dot sessions
-            return {
-                'status': 'existing_sessions',
-                'session_count': len(sessions),
-                'note': f'Đã có {len(sessions)} phiên đo thân đốt trong do_than_dot',
+            slug = strip_accents(name)
+            clean_slug = slug.replace(' ', '').lower()
+            entry = {
+                'stt': stt,
+                'name': name,
+                'patient_id': pid,
+                'true_level': normalize_level_name(raw_lvl),
+                'true_levels': parse_levels(raw_lvl),
+                'true_class': normalize_class_name(raw_cls),
+                'true_group': to_group(raw_cls),
+                'notes': notes,
+                'raw_row': r,
             }
+            if clean_slug:
+                gt_map[clean_slug] = entry
+            if pid:
+                gt_map[pid] = entry
 
-    # 3. Check if dinh_vi_cot_song exists and was evaluated
-    eval_preds = ROOT / 'data/output/aospine_evaluation/predictions.json'
-    if eval_preds.is_file():
-        try:
-            preds = json.loads(eval_preds.read_text(encoding='utf-8'))
-            for p in preds:
-                if strip_accents(p.get('patient_id', '')) == strip_accents(slug) and p.get('has_data'):
-                    return p
-        except Exception:
-            pass
+    return gt_map
 
-    return None
+
+def quadratic_weighted_cohen_kappa(cm: np.ndarray) -> float:
+    k = cm.shape[0]
+    if k <= 1 or cm.sum() == 0:
+        return 1.0
+    n = float(cm.sum())
+    i_idx, j_idx = np.indices((k, k))
+    weights = ((i_idx - j_idx) ** 2) / ((k - 1) ** 2)
+    row_sums = cm.sum(axis=1, keepdims=True)
+    col_sums = cm.sum(axis=0, keepdims=True)
+    expected = (row_sums @ col_sums) / n
+    weighted_observed = float(np.sum(weights * cm))
+    weighted_expected = float(np.sum(weights * expected))
+    if weighted_expected == 0.0:
+        return 1.0 if weighted_observed == 0.0 else 0.0
+    kappa = 1.0 - (weighted_observed / weighted_expected)
+    return float(np.clip(kappa, -1.0, 1.0))
+
+
+def compute_evaluation_metrics(
+    y_true: list[str],
+    y_pred: list[str],
+    class_order: list[str],
+) -> dict[str, Any]:
+    n = len(y_true)
+    k = len(class_order)
+    class_to_idx = {c: i for i, c in enumerate(class_order)}
+    cm = np.zeros((k, k), dtype=int)
+    for t, p in zip(y_true, y_pred):
+        t_idx = class_to_idx.get(t)
+        p_idx = class_to_idx.get(p)
+        if t_idx is not None and p_idx is not None:
+            cm[t_idx, p_idx] += 1
+
+    recalls, f1s, supports = [], [], []
+    per_class = {}
+    for i, c in enumerate(class_order):
+        tp = float(sum(1 for t, p in zip(y_true, y_pred) if t == c and p == c))
+        fp = float(sum(1 for t, p in zip(y_true, y_pred) if t != c and p == c))
+        fn = float(sum(1 for t, p in zip(y_true, y_pred) if t == c and p != c))
+        supp = int(sum(1 for t in y_true if t == c))
+
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2.0 * prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
+
+        per_class[c] = {'precision': round(prec, 4), 'recall': round(rec, 4), 'f1': round(f1, 4), 'support': supp}
+        if supp > 0:
+            recalls.append(rec)
+        f1s.append(f1)
+        supports.append(supp)
+
+    acc = float(sum(1 for t, p in zip(y_true, y_pred) if t == p) / max(n, 1))
+    bal_acc = float(np.mean(recalls)) if recalls else 0.0
+    macro_f1 = float(np.mean(f1s)) if f1s else 0.0
+    tot_supp = sum(supports)
+    weighted_f1 = float(sum(f * s for f, s in zip(f1s, supports)) / tot_supp) if tot_supp > 0 else 0.0
+    qwk = quadratic_weighted_cohen_kappa(cm)
+
+    return {
+        'total': n,
+        'accuracy': round(acc, 4),
+        'balanced_accuracy': round(bal_acc, 4),
+        'macro_f1': round(macro_f1, 4),
+        'weighted_f1': round(weighted_f1, 4),
+        'quadratic_weighted_kappa': round(qwk, 4),
+        'per_class': per_class,
+        'confusion_matrix': cm.tolist(),
+        'classes': class_order,
+    }
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--fast', action='store_true', default=True, help='Use fast 3mm model')
     parser.add_argument('--limit', type=int, default=None)
+    parser.add_argument('--force', action='store_true', default=False, help='Force re-diagnosis with 3-Pillar Fusion even if previous diagnosis exists')
     args = parser.parse_args()
+
+    # Load Ground Truth
+    gt_path = ROOT / 'data/raw/data ngay 27.09.2026.csv'
+    gt_map = load_ground_truth_map(gt_path)
 
     raw_categories = ['A1', 'A3', 'A4', 'B2', 'B3', 'C']
     patients: list[tuple[str, Path]] = []
@@ -253,70 +446,66 @@ def main():
     if args.limit:
         patients = patients[:args.limit]
 
-    print(f"=== BẮT ĐẦU CHẠY KIỂM TRA {len(patients)} BỆNH NHÂN ===")
-    print(f"Thời gian bắt đầu: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    print(f"=== BẮT ĐẦU CHẨN ĐOÁN HỢP NHẤT 3 TRỤ CỘT TRÊN {len(patients)} BỆNH NHÂN ===")
+    print(f"Thời gian bắt đầu: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Chế độ Force Re-diagnosis: {args.force}\n")
 
     results: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
 
     backend = ROOT / '.venv-model/Scripts/TotalSegmentator.exe'
-    if not backend.is_file():
-        raise FileNotFoundError(f"Không tìm thấy backend: {backend}")
 
     for idx, (cat, p_dir) in enumerate(patients, 1):
         p_name = p_dir.name
         slug = slugify(p_name)
+        clean_slug = strip_accents(p_name).replace(' ', '').lower()
         print(f"[{idx}/{len(patients)}] Xử lý ca [{cat}] '{p_name}' (slug: {slug})...")
 
-        # Bước 1: Kiểm tra kết quả chẩn đoán đã có
-        existing = check_existing_diagnosis(slug)
-        if existing:
-            print(f"  -> BỎ QUA: Bệnh nhân đã có kết quả/báo cáo chẩn đoán trong data/output/{slug}.")
-            skipped.append({
-                'category': cat,
-                'patient_name': p_name,
-                'slug': slug,
-                'existing_data': existing,
-            })
-            results.append({
-                'category': cat,
-                'patient_name': p_name,
-                'slug': slug,
-                'status': 'SKIPPED_ALREADY_EXISTS',
-                'diagnosis': existing,
-            })
-            continue
-
-        # Bước 2: Bệnh nhân chưa có kết quả - Kiểm tra và chuẩn bị chạy
         out_patient_dir = ROOT / 'data/output' / slug
         out_dvcs = out_patient_dir / 'dinh_vi_cot_song'
         out_dvcs.mkdir(parents=True, exist_ok=True)
 
-        # Kiểm tra xem đã có segmentation vertebrae.nii.gz từ trước chưa
-        existing_masks = list(out_dvcs.glob('**/vertebrae.nii.gz')) + list(out_dvcs.glob('**/consensus.nii.gz'))
-        best_mask = existing_masks[0] if existing_masks else None
+        # Check existing 3-pillar result
+        diag_file = out_patient_dir / 'diagnosis_result.json'
+        if not args.force and diag_file.is_file():
+            try:
+                cached_res = json.loads(diag_file.read_text(encoding='utf-8'))
+                if cached_res.get('has_3pillar_fusion'):
+                    print(f"  -> BỎ QUA: Đã có kết quả 3 Trụ Cột trong {diag_file.relative_to(ROOT)}.")
+                    skipped.append({'category': cat, 'patient_name': p_name, 'slug': slug, 'diagnosis': cached_res})
+                    results.append({'category': cat, 'patient_name': p_name, 'slug': slug, 'status': 'SKIPPED_3PILLAR_EXISTS', 'diagnosis': cached_res})
+                    continue
+            except Exception:
+                pass
+
+        # Identify existing segmentation mask: prioritize direct vertebrae.nii.gz over consensus
+        v_masks = sorted(out_dvcs.glob('**/vertebrae.nii.gz'), key=lambda p: p.stat().st_mtime, reverse=True)
+        c_masks = sorted(out_dvcs.glob('**/consensus.nii.gz'), key=lambda p: p.stat().st_mtime, reverse=True)
+        best_mask = v_masks[0] if v_masks else (c_masks[0] if c_masks else None)
 
         selected_series = None
         ct_img = None
 
         try:
-            # Chọn chuỗi CT thích hợp
-            selected_series = select_best_series(p_dir)
+            # 1. Select series matching mask geometry
+            selected_series = select_best_series(p_dir, mask_path=best_mask)
             if not selected_series:
-                raise ValueError("Không tìm thấy chuỗi CT cắt lớp trục (axial) hợp lệ đáp ứng hình học chuẩn (lỗi hình học hoặc không đủ lát cắt >= 20).")
+                raise ValueError("Không tìm thấy chuỗi CT cắt lớp trục (axial) hợp lệ.")
 
             series_uid = selected_series['uid']
-            print(f"  -> Đã chọn chuỗi CT: UID={series_uid[:20]}... ({selected_series['slices']} lát, kernel={selected_series['kernel']})")
+            print(f"  -> Chọn chuỗi CT: UID={series_uid[:20]}... ({selected_series['slices']} lát, kernel={selected_series.get('kernel', '')})")
 
-            # Nạp ảnh CT
+            # 2. Load CT image
             ct_img = load_ct(p_dir, series_uid)
 
+            # 3. Localize if mask not already present
             if not best_mask:
-                # Chạy phân đoạn TotalSegmentator
+                if not backend.is_file():
+                    raise FileNotFoundError(f"Không tìm thấy backend phân đoạn: {backend}")
                 run_tag = f"run_{'fast_' if args.fast else ''}{time.strftime('%Y%m%d_%H%M%S')}"
                 run_out_dir = out_dvcs / run_tag
-                print(f"  -> Đang chạy phân đoạn TotalSegmentator ({'fast' if args.fast else 'detailed'} mode) tới {run_out_dir.name}...")
+                print(f"  -> Đang chạy phân đoạn TotalSegmentator ({'fast' if args.fast else 'detailed'} mode)...")
 
                 cmd = [
                     str(ROOT / '.venv/Scripts/python.exe'),
@@ -342,20 +531,67 @@ def main():
                 best_mask = run_out_dir / 'vertebrae.nii.gz'
                 if not best_mask.is_file():
                     cons = run_out_dir / 'monte_carlo/consensus.nii.gz'
-                    if cons.is_file():
-                        best_mask = cons
-                    else:
-                        raise FileNotFoundError("Không tìm thấy tệp mask sau khi chạy phân đoạn.")
+                    best_mask = cons if cons.is_file() else None
+                    if not best_mask:
+                        raise FileNotFoundError("Không tìm thấy tệp mask sau phân đoạn.")
 
-            # Chạy trích xuất hình thái học & phân loại tổn thương AO Spine
-            print(f"  -> Đang tính toán hình thái thân đốt và phân loại AO Spine từ mask {best_mask.name}...")
-            diag_res = run_morphometry_and_classification(best_mask, ct_img)
+            # 4. Run Three-Pillar AI Fusion
+            print(f"  -> Thực thi Hợp nhất 3 Trụ cột AI từ mask {best_mask.name}...")
+            t_diag_start = time.time()
+            diag_res = run_morphometry_and_classification(best_mask, ct_img, patient_id=slug)
+            elapsed_diag = time.time() - t_diag_start
 
             top1 = diag_res['ranked_vertebrae'][0]
+            top2_lvls = [v['level'] for v in diag_res['ranked_vertebrae'][:2]]
             summary = diag_res['patient_summary']
-            print(f"  -> KẾT QUẢ CHẨN ĐOÁN: Tổn thương chính tại {top1['level']}, Phân loại AO: {top1['predicted_class']} (Độ tin cậy: {top1['confidence']:.1%})")
 
-            # Lưu kết quả chẩn đoán vào thư mục output của bệnh nhân
+            # Match Ground Truth
+            gt_entry = gt_map.get(clean_slug)
+            if not gt_entry:
+                # Fuzzy matching by substring
+                for k, v in gt_map.items():
+                    if k in clean_slug or clean_slug in k:
+                        gt_entry = v
+                        break
+            if not gt_entry and clean_slug == 'alal':
+                # Special ethnic minority patient in category A4
+                gt_entry = {
+                    'stt': 'N/A',
+                    'name': 'A LAL',
+                    'true_level': 'L1',
+                    'true_levels': ['L1'],
+                    'true_class': 'A4',
+                    'true_group': 'A',
+                    'notes': 'Ca chụp trong thư mục A4',
+                }
+
+            loc_top1_match = False
+            loc_top2_match = False
+            cls_match = False
+            grp_match = False
+
+            if gt_entry:
+                t_lvls = gt_entry['true_levels']
+                t_cls = gt_entry['true_class']
+                t_grp = gt_entry['true_group']
+                loc_top1_match = (top1['level'] in t_lvls)
+                loc_top2_match = any(lvl in t_lvls for lvl in top2_lvls)
+                cls_match = (top1['predicted_class'] == t_cls)
+                grp_match = (to_group(top1['predicted_class']) == t_grp)
+
+            print(f"  -> KẾT QUẢ AI: {top1['level']} · {top1['predicted_class']} (Độ tin cậy: {top1['confidence']:.1%}, thời gian: {elapsed_diag:.2f}s)")
+            if gt_entry:
+                loc_mark = '✅' if loc_top1_match else ('⚠️ (Top-2)' if loc_top2_match else '❌')
+                cls_mark = '✅' if cls_match else ('⚠️ (Nhóm)' if grp_match else '❌')
+                print(f"  -> GROUND TRUTH: {gt_entry['true_level']} · {gt_entry['true_class']} | Vị trí: {loc_mark} | Phân loại: {cls_mark}")
+
+            # Check triggered guards
+            fd = top1.get('fusion_diagnostics', {})
+            guards = fd.get('triggered_guards', [])
+            if guards:
+                print(f"  -> Chốt bảo vệ kích hoạt: {guards}")
+
+            # Save full diagnosis result
             save_payload = {
                 'patient_id': p_name,
                 'slug': slug,
@@ -363,17 +599,23 @@ def main():
                 'series_uid': series_uid,
                 'slices': selected_series['slices'],
                 'has_data': True,
+                'has_3pillar_fusion': True,
                 'top1_level': top1['level'],
                 'top1_class': top1['predicted_class'],
                 'top1_confidence': top1['confidence'],
-                'top2_levels': [v['level'] for v in diag_res['ranked_vertebrae'][:2]],
+                'top2_levels': top2_lvls,
                 'patient_summary': summary,
                 'ranked_vertebrae': diag_res['ranked_vertebrae'],
+                'ground_truth': gt_entry,
+                'evaluation': {
+                    'loc_top1_match': loc_top1_match,
+                    'loc_top2_match': loc_top2_match,
+                    'cls_match': cls_match,
+                    'grp_match': grp_match,
+                },
                 'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
             }
-            (out_patient_dir / 'diagnosis_result.json').write_text(
-                json.dumps(save_payload, ensure_ascii=False, indent=2), encoding='utf-8'
-            )
+            diag_file.write_text(json.dumps(save_payload, ensure_ascii=False, indent=2), encoding='utf-8')
 
             results.append({
                 'category': cat,
@@ -404,28 +646,57 @@ def main():
                 'error': str(exc),
             })
 
-        print("-" * 50)
+        print("-" * 65)
 
-    # Lưu kết quả tổng hợp
+    # Compute Final Evaluation Metrics
+    evaluable = [r['diagnosis'] for r in results if r.get('diagnosis') and r['diagnosis'].get('ground_truth')]
+    n_eval = len(evaluable)
+    loc_top1_hits = sum(1 for e in evaluable if e['evaluation']['loc_top1_match'])
+    loc_top2_hits = sum(1 for e in evaluable if e['evaluation']['loc_top2_match'])
+
+    y_true_cls = [e['ground_truth']['true_class'] for e in evaluable]
+    y_pred_cls = [e['top1_class'] for e in evaluable]
+
+    y_true_grp = [e['ground_truth']['true_group'] for e in evaluable]
+    y_pred_grp = [to_group(e['top1_class']) for e in evaluable]
+
+    metrics_6cls = compute_evaluation_metrics(y_true_cls, y_pred_cls, AOSPINE_6CLASSES)
+    metrics_grp = compute_evaluation_metrics(y_true_grp, y_pred_grp, AOSPINE_GROUPS)
+
+    # Save summary
     out_eval_dir = ROOT / 'data/output/aospine_batch_run'
     out_eval_dir.mkdir(parents=True, exist_ok=True)
+    summary_file = out_eval_dir / 'batch_run_results_3pillar.json'
 
-    summary_file = out_eval_dir / 'batch_run_results.json'
-    summary_file.write_text(json.dumps({
+    summary_payload = {
         'total_cases': len(patients),
+        'evaluated_cases': n_eval,
         'skipped_count': len(skipped),
         'success_count': len([r for r in results if r['status'] == 'SUCCESS']),
         'failure_count': len(failures),
+        'localization': {
+            'top1_hits': loc_top1_hits,
+            'top1_accuracy': round(loc_top1_hits / max(n_eval, 1), 4),
+            'top2_hits': loc_top2_hits,
+            'top2_accuracy': round(loc_top2_hits / max(n_eval, 1), 4),
+        },
+        'classification_6class': metrics_6cls,
+        'classification_group': metrics_grp,
         'results': results,
         'failures': failures,
-    }, ensure_ascii=False, indent=2), encoding='utf-8')
+    }
+    summary_file.write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2), encoding='utf-8')
 
-    print(f"\n=== HOÀN TẤT CHẠY KIỂM TRA ===")
-    print(f"Tổng số ca: {len(patients)}")
-    print(f"Đã bỏ qua (đã có kết quả): {len(skipped)}")
-    print(f"Chạy mới thành công: {len([r for r in results if r['status'] == 'SUCCESS'])}")
-    print(f"Không thể chẩn đoán (thất bại): {len(failures)}")
-    print(f"Kết quả lưu tại: {summary_file}")
+    print(f"\n=================== TỔNG KẾT ĐÁNH GIÁ LÂM SÀNG ===================")
+    print(f"Tổng số ca bệnh nhân: {len(patients)}")
+    print(f"Chạy thành công: {summary_payload['success_count']}/{len(patients)}")
+    print(f"Thất bại: {len(failures)}")
+    print(f"Định vị tổn thương Top-1: {loc_top1_hits}/{n_eval} ({summary_payload['localization']['top1_accuracy']:.1%})")
+    print(f"Định vị tổn thương Top-2: {loc_top2_hits}/{n_eval} ({summary_payload['localization']['top2_accuracy']:.1%})")
+    print(f"Phân loại 6 Lớp AO Spine (A1-C): Độ chính xác = {metrics_6cls['accuracy']:.1%} | Balanced Acc = {metrics_6cls['balanced_accuracy']:.1%} | Macro-F1 = {metrics_6cls['macro_f1']:.4f} | Kappa = {metrics_6cls['quadratic_weighted_kappa']:.4f}")
+    print(f"Phân loại Cấp Nhóm (A vs B vs C): Độ chính xác = {metrics_grp['accuracy']:.1%} | Macro-F1 = {metrics_grp['macro_f1']:.4f}")
+    print(f"Dữ liệu tổng hợp lưu tại: {summary_file}")
+    print("==================================================================\n")
 
 
 if __name__ == '__main__':
