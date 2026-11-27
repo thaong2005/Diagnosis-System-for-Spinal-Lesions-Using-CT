@@ -164,49 +164,20 @@ def fuse_vertebra_concept_probabilities(
     up_def = float(metrics.get('upper_endplate_deformity_mm', 0.0))
     lo_def = float(metrics.get('lower_endplate_deformity_mm', 0.0))
 
-    is_morphologically_intact = (
+    has_morph_evidence = any(
+        k in metrics for k in ('heights', 'ha_hp_ratio', 'hm_hp_ratio', 'relative_collapse_ratio')
+    )
+    is_body_intact = (
         ha_hp >= 0.80 and hm_hp >= 0.80 and rel_coll >= 0.85
-        and delta_pw < 1.0 and trans_mm < 2.0
         and up_def < 2.0 and lo_def < 2.0
+    )
+    is_morphologically_intact = (
+        is_body_intact and delta_pw < 1.0 and trans_mm < 2.0
     )
 
     is_classic_a1_wedge = is_classic_wedge_fracture(metrics, s_ep2=s_ep2)
 
-    # Guard 1: Intact Wall Guard (Rescues pure A1 from CNN false alarms)
-    if q_seg >= 0.70 and delta_pw < 1.0 and p_rule['p_pw'] < 0.15:
-        max_pw = 0.05 if is_classic_a1_wedge else 0.35
-        s_pw = min(s_pw, max_pw)
-        if (dl_probs_used.get('p_pw', 0.0) >= 0.40 or s_pw >= max_pw) and dl_probs_used:
-            triggered_guards.append(
-                f"Intact Wall Guard (q_seg={q_seg:.2f}, delta_pw={delta_pw:.1f}mm: S_pw constrained to {s_pw:.4f} <= {max_pw:.2f})"
-            )
-
-    # Guard 2: Bone Fragment Floor Guard (Burst fracture with clear retropulsion)
-    if delta_pw >= 2.8:
-        s_pw = max(s_pw, 0.65)
-        s_frac = max(s_frac, 0.70)
-        triggered_guards.append(
-            f"Bone Fragment Floor Guard (delta_pw={delta_pw:.1f}mm: S_pw and S_frac floored to >= 0.65)"
-        )
-
-    # Guard 3: Distraction Floor Guard (Interspinous widening B2 vs Classic A1 Wedge)
-    dl_tb = dl_probs_used.get('p_post_tb', 0.0) if dl_probs_used else 0.0
-    is_true_dl_distraction = (dl_tb >= 0.50)
-
-    if isp_ratio >= 1.45 or (isp_ratio >= 1.35 and is_true_dl_distraction):
-        s_post_tb = max(s_post_tb, 0.65)
-        s_frac = max(s_frac, 0.65)
-        triggered_guards.append(
-            f"Distraction Floor Guard (isp_ratio={isp_ratio:.2f}: S_post_tb and S_frac floored to 0.65)"
-        )
-    elif is_classic_a1_wedge and not is_true_dl_distraction and isp_ratio < 1.45:
-        max_tb = 0.02 if isp_ratio < 1.30 else 0.10
-        s_post_tb = min(s_post_tb, max_tb)
-        triggered_guards.append(
-            f"Classic A1 Wedge Guard (Ha/Hp={ha_hp:.2f}, delta_pw={delta_pw:.1f}mm: S_post_tb constrained to <= {max_tb:.2f})"
-        )
-
-    # --- Đọc sớm tín hiệu từ 2-Step Prototype Bank (đặt trước Guard 4 & Guard 6) ---
+    # --- Đọc sớm tín hiệu từ 2-Step Prototype Bank (đặt trước Guard 3, Guard 4 & Guard 6) ---
     p_anom_val = None
     p_anom = 0.5
     proto_cls = ''
@@ -221,17 +192,25 @@ def fuse_vertebra_concept_probabilities(
             or {}
         )
 
+    dl_tb = dl_probs_used.get('p_post_tb', 0.0) if dl_probs_used else 0.0
     p_b2 = float(proto_probs.get('B2', 0.0))
-    is_proto_b2 = (
-        prototype_result is not None
-        and (proto_cls == 'B2' or p_b2 >= 0.45)
-        and p_anom >= 0.55
-        and not is_classic_a1_wedge
-    )
+    p_a3 = float(proto_probs.get('A3', 0.0))
+    p_a4 = float(proto_probs.get('A4', 0.0))
+    b2_margin = p_b2 - max(p_a3, p_a4)
+    if prototype_result is not None and p_anom >= 0.55 and not is_classic_a1_wedge:
+        if delta_pw >= 2.8 and isp_ratio < 1.30:
+            is_proto_b2 = (b2_margin >= 0.15) and (dl_tb >= 0.55)
+        else:
+            is_proto_b2 = (b2_margin >= 0.12) or (
+                proto_cls == 'B2' and (isp_ratio >= 1.30 or dl_tb >= 0.55)
+            )
+    else:
+        is_proto_b2 = False
 
-    # Regional Level-Aware Thresholds
+    # Regional Level-Aware Thresholds (computed before guards for multimodal normal consensus)
     level_str = str(metrics.get('level', '')).upper()
-    if any(lvl in level_str for lvl in ('L4', 'L5')):
+    is_lower_lumbar = any(lvl in level_str for lvl in ('L4', 'L5'))
+    if is_lower_lumbar:
         trans_thresh = 5.5
     elif 'L3' in level_str:
         trans_thresh = 4.5
@@ -242,21 +221,137 @@ def fuse_vertebra_concept_probabilities(
     disc_angle_thresh = 23.0 if is_lumbar else 15.0
     disc_ratio_thresh = 2.0 if is_lumbar else 1.8
 
-    # Guard 4: Translation Floor Guard (phân tách Burst Collapse A3/A4 vs Dislocation C)
+    # Guard 4 pre-thresholds (burst collapse vs lower lumbar slip vs dislocation)
     is_burst_collapse = (rel_coll < 0.78 and delta_pw >= 2.5)
-    dl_trans_low = (dl_probs_used.get('p_trans', 0.5) < 0.50) if dl_probs_used else False
+    dl_trans_val = dl_probs_used.get('p_trans', 0.5) if dl_probs_used else 0.5
+    dl_trans_low = (dl_trans_val < 0.50) if dl_probs_used else False
+    dl_trans_high = (dl_trans_val >= 0.65) if dl_probs_used else False
     proto_is_burst = (proto_cls in ('A3', 'A4'))
-    effective_trans_thresh = (
-        trans_thresh + 1.5
-        if (is_burst_collapse and (proto_is_burst or dl_trans_low))
-        else trans_thresh
+    p_c_proto = float(proto_probs.get('C', 0.0))
+    proto_is_c = (
+        prototype_result is not None
+        and (proto_cls == 'C' or p_c_proto >= 0.45)
+        and p_anom >= 0.55
     )
 
+    if is_burst_collapse and (proto_is_burst or dl_trans_low):
+        effective_trans_thresh = trans_thresh + 1.5
+    elif (
+        has_morph_evidence
+        and is_body_intact
+        and is_lower_lumbar
+        and delta_pw < 1.5
+        and not (proto_is_c or dl_trans_high)
+    ):
+        effective_trans_thresh = max(trans_thresh, 7.5)
+    else:
+        effective_trans_thresh = trans_thresh
+
+    is_intact_lumbar_slip = (
+        has_morph_evidence
+        and is_body_intact
+        and is_lower_lumbar
+        and delta_pw < 1.5
+        and not (proto_is_c or dl_trans_high)
+    )
+
+    # Principle 1: Multi-modal Normal Consensus (uniform T10-L5, preserves true Type C / extreme instability)
+    cond_morph_normal = (
+        has_morph_evidence
+        and rel_coll >= 0.85
+        and (0.80 <= ha_hp <= 1.35)
+        and (0.80 <= hm_hp <= 1.35)
+    )
+    cond_proto_normal = (
+        prototype_result is not None
+        and (not bool(prototype_result.get('is_anomaly', False)))
+        and p_anom < 0.50
+    )
+    cond_cnn_normal = (
+        bool(dl_probs_used)
+        and dl_probs_used.get('p_fracture', 1.0) < 0.45
+        and dl_probs_used.get('p_pw', 1.0) < 0.45
+        and dl_probs_used.get('p_post_tb', 1.0) < 0.45
+        and dl_probs_used.get('p_trans', 1.0) < 0.45
+    )
+    cond_no_extreme = (trans_mm < effective_trans_thresh and isp_ratio < 1.65)
+    is_multimodal_normal = (
+        cond_morph_normal and cond_proto_normal and cond_cnn_normal and cond_no_extreme
+    )
+
+    # Guard 1: Intact Wall Guard (Rescues pure A1 from CNN false alarms)
+    if q_seg >= 0.70 and delta_pw < 1.0 and p_rule['p_pw'] < 0.15:
+        max_pw = 0.05 if is_classic_a1_wedge else 0.35
+        s_pw = min(s_pw, max_pw)
+        if (dl_probs_used.get('p_pw', 0.0) >= 0.40 or s_pw >= max_pw) and dl_probs_used:
+            triggered_guards.append(
+                f"Intact Wall Guard (q_seg={q_seg:.2f}, delta_pw={delta_pw:.1f}mm: S_pw constrained to {s_pw:.4f} <= {max_pw:.2f})"
+            )
+
+    # Guard 2: Bone Fragment Floor Guard (Burst fracture with clear retropulsion)
+    if delta_pw >= 2.8 and not is_multimodal_normal:
+        s_pw = max(s_pw, 0.65)
+        s_frac = max(s_frac, 0.70)
+        triggered_guards.append(
+            f"Bone Fragment Floor Guard (delta_pw={delta_pw:.1f}mm: S_pw and S_frac floored to >= 0.65)"
+        )
+
+    # Guard 3: Distraction Floor Guard (Interspinous widening B2 vs Burst A3/A4 vs Classic A1 Wedge / Intact Neighbor)
+    is_true_dl_distraction = (dl_tb >= 0.50)
+    intact_for_distraction = (
+        has_morph_evidence and is_body_intact and delta_pw < 1.5 and p_rule['p_fracture'] < 0.20
+    )
+
+    if not is_multimodal_normal:
+        if intact_for_distraction:
+            if isp_ratio >= 1.65 or (isp_ratio >= 1.45 and (is_proto_b2 or is_true_dl_distraction)):
+                s_post_tb = max(s_post_tb, 0.65)
+                s_frac = max(s_frac, 0.65)
+                if isp_ratio >= 1.65:
+                    triggered_guards.append(
+                        f"Distraction Floor Guard (intact body, isp_ratio={isp_ratio:.2f} >= 1.65: S_post_tb and S_frac floored to 0.65)"
+                    )
+                else:
+                    triggered_guards.append(
+                        f"Distraction Floor Guard (intact body + multimodal, isp_ratio={isp_ratio:.2f}: S_post_tb and S_frac floored to 0.65)"
+                    )
+        elif delta_pw >= 2.8 and prototype_result is not None:
+            # Principle 2: Separate clear burst fracture (A3/A4) from true B2 tension band disruption
+            if isp_ratio >= 1.65 or is_proto_b2:
+                s_post_tb = max(s_post_tb, 0.65)
+                s_frac = max(s_frac, 0.65)
+                triggered_guards.append(
+                    f"Distraction Floor Guard (isp_ratio={isp_ratio:.2f}: S_post_tb and S_frac floored to 0.65)"
+                )
+            elif proto_cls in ('A3', 'A4'):
+                s_post_tb = min(s_post_tb, 0.25)
+                triggered_guards.append(
+                    f"Burst vs B2 Consensus Guard (proto={proto_cls}, delta_pw={delta_pw:.1f}mm, isp_ratio={isp_ratio:.2f} < 1.65: S_post_tb <= 0.25)"
+                )
+        elif isp_ratio >= 1.45 or (isp_ratio >= 1.35 and is_true_dl_distraction):
+            s_post_tb = max(s_post_tb, 0.65)
+            s_frac = max(s_frac, 0.65)
+            triggered_guards.append(
+                f"Distraction Floor Guard (isp_ratio={isp_ratio:.2f}: S_post_tb and S_frac floored to 0.65)"
+            )
+        elif is_classic_a1_wedge and not is_true_dl_distraction and isp_ratio < 1.45:
+            max_tb = 0.02 if isp_ratio < 1.30 else 0.10
+            s_post_tb = min(s_post_tb, max_tb)
+            triggered_guards.append(
+                f"Classic A1 Wedge Guard (Ha/Hp={ha_hp:.2f}, delta_pw={delta_pw:.1f}mm: S_post_tb constrained to <= {max_tb:.2f})"
+            )
+
+    # Guard 4: Translation Floor Guard (phân tách Burst Collapse A3/A4 vs Dislocation C)
     if trans_mm >= effective_trans_thresh:
         s_trans = max(s_trans, 0.65)
         s_frac = max(s_frac, 0.65)
         triggered_guards.append(
             f"Translation Floor Guard (translation_mm={trans_mm:.1f}mm >= {effective_trans_thresh:.1f}mm: S_trans floored to 0.65)"
+        )
+    elif is_intact_lumbar_slip and trans_mm < effective_trans_thresh:
+        s_trans = min(s_trans, 0.45)
+        triggered_guards.append(
+            f"Lower Lumbar Degenerative Slip Guard (level={level_str}, trans={trans_mm:.1f}mm < {effective_trans_thresh:.1f}mm: S_trans capped <= 0.45)"
         )
     elif is_burst_collapse and (proto_is_burst or dl_trans_low) and trans_mm < effective_trans_thresh:
         s_trans = min(s_trans, 0.45)
@@ -265,11 +360,24 @@ def fuse_vertebra_concept_probabilities(
         )
 
     # Guard 5: Hyperextension / Anterior Tension Band Floor Guard (Type B3)
-    if (disc_deg >= disc_angle_thresh and disc_ratio >= disc_ratio_thresh) or p_rule['p_ant_tb'] >= 0.65:
-        s_ant_tb = max(s_ant_tb, 0.65)
-        s_frac = max(s_frac, 0.65)
+    is_severe_burst_or_collapse = is_burst_collapse or (rel_coll < 0.72) or (ha_hp < 0.72 and delta_pw >= 2.0)
+    allow_b3_on_burst = (disc_deg >= 25.0 and delta_pw < 2.0)
+    if is_severe_burst_or_collapse and not allow_b3_on_burst:
+        s_ant_tb = min(s_ant_tb, 0.25)
         triggered_guards.append(
-            f"Anterior Tension Band Floor Guard (angle={disc_deg:.1f}deg, ratio={disc_ratio:.2f}: S_ant_tb and S_frac floored to 0.65)"
+            f"Burst Kyphosis B3 Suppression (rel_coll={rel_coll:.2f}, delta_pw={delta_pw:.1f}mm: S_ant_tb capped <= 0.25)"
+        )
+    elif (not is_multimodal_normal) and (
+        (disc_deg >= disc_angle_thresh and disc_ratio >= disc_ratio_thresh) or p_rule['p_ant_tb'] >= 0.65
+    ):
+        s_ant_tb = max(s_ant_tb, 0.65)
+        intact_neighbor = (
+            has_morph_evidence and is_body_intact and delta_pw < 1.5 and p_rule['p_fracture'] < 0.20
+        )
+        if not intact_neighbor:
+            s_frac = max(s_frac, 0.65)
+        triggered_guards.append(
+            f"Anterior Tension Band Floor Guard (angle={disc_deg:.1f}deg, ratio={disc_ratio:.2f}: S_ant_tb floored to 0.65)"
         )
 
     # Guard 6: Intact Tension Band Guard (không triệt tiêu khi Prototype xác nhận B2)
@@ -279,6 +387,16 @@ def fuse_vertebra_concept_probabilities(
             triggered_guards.append(
                 f"Intact Tension Band Guard (q_seg={q_seg:.2f}, isp_ratio={isp_ratio:.2f}: S_post_tb constrained to {s_post_tb:.4f} <= 0.35)"
             )
+
+    if is_multimodal_normal:
+        s_pw = min(s_pw, 0.35)
+        s_trans = min(s_trans, 0.35)
+        s_post_tb = min(s_post_tb, 0.35)
+        s_ant_tb = min(s_ant_tb, 0.25)
+        s_frac = min(s_frac, 0.35)
+        triggered_guards.append(
+            f"Multimodal Normal Consensus (rel_coll={rel_coll:.2f}, ha={ha_hp:.2f}, hm={hm_hp:.2f}, p_anom={p_anom:.2f}: S_pw/S_trans/S_post_tb/S_ant_tb/S_frac <= 0.35)"
+        )
 
     # Guard 7 & 8: 2-Step Prototype Bank Gating & Support
     if prototype_result:

@@ -45,9 +45,10 @@ def strip_accents(text: str) -> str:
 
 
 def normalize_level_name(level_str: str) -> str:
-    """Normalize level strings like 'D12' to 'T12', 'L01' to 'L1', etc."""
-    s = str(level_str).strip().upper()
-    s = re.sub(r'^D(\d+)', r'T\1', s)
+    """Normalize level strings like 'D12' to 'T12', 'Gãy L1' to 'L1', 'L01' to 'L1'."""
+    s = str(level_str).replace('\xa0', ' ').strip().upper()
+    s = re.sub(r'^G[ÃA]Y\s+', '', s)
+    s = re.sub(r'D(\d+)', r'T\1', s)
     s = re.sub(r'([TL])0+(\d+)', r'\1\2', s)
     return s
 
@@ -148,11 +149,14 @@ def load_ground_truth(path: Path | str) -> dict[str, dict[str, Any]]:
         with path.open('r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                stt = row.get('STT') or row.get('stt') or ''
-                name = row.get('Tên') or row.get('Ten') or row.get('name') or ''
-                level = row.get('Đốt gãy') or row.get('Dot gay') or row.get('level') or row.get('true_level') or ''
-                cls_val = row.get('phân loại') or row.get('phan loai') or row.get('class') or row.get('true_class') or ''
-                pid = row.get('ID') or row.get('id') or row.get('patient_id') or ''
+                def _clean(val: Any) -> str:
+                    return re.sub(r'\s+', ' ', str(val or '').replace('\xa0', ' ')).strip()
+
+                stt = _clean(row.get('STT') or row.get('stt'))
+                name = _clean(row.get('Tên') or row.get('Ten') or row.get('name'))
+                level = _clean(row.get('Đốt gãy') or row.get('Dot gay') or row.get('level') or row.get('true_level'))
+                cls_val = _clean(row.get('phân loại') or row.get('phan loai') or row.get('class') or row.get('true_class'))
+                pid = _clean(row.get('ID') or row.get('id') or row.get('patient_id'))
                 if level and cls_val:
                     records.append({
                         'stt': stt,
@@ -334,12 +338,12 @@ def to_group_class(cls_name: str) -> str:
 def discover_patient_cases(data_dir: Path) -> list[Path]:
     """Find patient directories inside data_dir, supporting flat or category-nested layouts."""
     case_dirs: list[Path] = []
-    category_prefixes = ('A0', 'A1', 'A2', 'A3', 'A4', 'B1', 'B2', 'B3', 'C', 'NO')
+    category_names = {'A0', 'A1', 'A2', 'A3', 'A4', 'B1', 'B2', 'B3', 'C', 'NO FRACTURE', 'NO_FRACTURE', 'NORMAL'}
     for d in sorted(data_dir.iterdir()):
         if not d.is_dir() or d.name.startswith('.'):
             continue
         sub_dirs = [s for s in d.iterdir() if s.is_dir() and not s.name.startswith('.')]
-        is_category = any(d.name.upper().startswith(c) for c in category_prefixes)
+        is_category = d.name.strip().upper() in category_names
         if is_category and sub_dirs and not (d / 'exam').exists() and not (d / 'csc').exists():
             for s in sorted(sub_dirs):
                 case_dirs.append(s)

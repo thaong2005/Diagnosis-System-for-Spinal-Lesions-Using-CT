@@ -10,6 +10,7 @@ from spinal_ct.morphometry import (
     find_spinous_process_tip,
     measure_posterior_wall_retropulsion,
     compute_intervertebral_metrics,
+    is_vertebra_fov_truncated,
     auto_segment_body,
     auto_detect_landmarks,
     BodyAutoParams,
@@ -537,6 +538,274 @@ class TestAOSpineMorphometry(unittest.TestCase):
         ret = measure_posterior_wall_retropulsion(ct_clean, (1.0, 1.0), lm)
         self.assertLess(ret['delta_posterior_mm'], 1.5)
         self.assertEqual(ret['delta_posterior_mm'], 0.0)
+
+    def test_parasagittal_pedicle_suppression_on_flat_normal_vertebra(self):
+        """Hotfix 3.2 Task 2: lateral pedicles on +/-4mm parasagittal slices do not create false burst."""
+        shape = (80, 100)
+        ct_mid = np.full(shape, 50.0, dtype=np.float32)
+        body_mask = np.zeros(shape, dtype=bool)
+        body_mask[22:58, 15:46] = True
+        ct_mid[body_mask] = 400.0
+        # Adjacent vertebra sitting just 1.5mm below within safety_margin_mm=2.0
+        ct_mid[19:21, 15:52] = 400.0
+
+        # Parasagittal slices at +/-4mm show normal anatomical pedicles in upper 1/3 (rows 46..56)
+        para_ct = ct_mid.copy()
+        para_ct[46:56, 46:53] = 450.0
+
+        plane = BodyPlane((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (1.0, 1.0), (100, 80))
+        lm = auto_detect_landmarks(body_mask, plane)
+
+        ret = measure_posterior_wall_retropulsion(
+            ct_mid, (1.0, 1.0), lm,
+            body_mask=body_mask,
+            parasagittal_slices=[para_ct, para_ct],
+        )
+        self.assertLess(ret['delta_posterior_mm'], 1.5)
+
+    def test_is_vertebra_fov_truncated_boundary_and_sandwiched(self):
+        """Hotfix 3.2 Task 3: severe middle collapse with full valid FOV is NOT FOV truncated."""
+        plane = BodyPlane((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (1.0, 1.0), (80, 80))
+        ct = np.full((80, 80), 50.0, dtype=np.float32)
+
+        # 1. Severely collapsed small vertebra in interior of valid FOV (area = 150 mm2 < 200)
+        valid_full = np.ones((80, 80), dtype=bool)
+        mask_small = np.zeros((80, 80), dtype=bool)
+        mask_small[37:42, 20:50] = True  # 5x30 = 150 mm2 < 200, max_h ~ 5mm < 8mm
+        lm_small = [[20.0, 41.0], [20.0, 37.0], [35.0, 41.0], [35.0, 37.0], [49.0, 41.0], [49.0, 37.0]]
+        sess_mid = BodySession('fp', 'L1', 'Baseline', plane, ct, valid_full, mask_small.copy(),
+                               mask=mask_small.copy(), landmarks=lm_small, age_group='adult')
+        self.assertFalse(is_vertebra_fov_truncated(sess_mid))
+
+        # 2. Actually touching CT invalid boundary (~valid) -> IS FOV truncated
+        valid_clipped = np.ones((80, 80), dtype=bool)
+        valid_clipped[:5, :] = False
+        mask_edge = np.zeros((80, 80), dtype=bool)
+        mask_edge[5:10, 20:50] = True  # row 5 touches ~eroded_valid (row 4 is False)
+        lm_edge = [[20.0, 9.0], [20.0, 5.0], [35.0, 9.0], [35.0, 5.0], [49.0, 9.0], [49.0, 5.0]]
+        sess_edge = BodySession('fp', 'T10', 'Baseline', plane, ct, valid_clipped, mask_edge.copy(),
+                                mask=mask_edge.copy(), landmarks=lm_edge, age_group='adult')
+        self.assertTrue(is_vertebra_fov_truncated(sess_edge))
+
+        # 3. Sandwiched dict vertebra between valid neighbors is unflagged in compute_intervertebral_metrics
+        lm_norm = [[20.0, 55.0], [20.0, 25.0], [35.0, 55.0], [35.0, 25.0], [50.0, 55.0], [50.0, 25.0]]
+        inter = compute_intervertebral_metrics([
+            {'level': 'T10', 'landmarks': lm_norm, 'heights': {'anterior_mm': 30.0, 'middle_mm': 30.0, 'posterior_mm': 30.0}, 'area_mm2': 600.0},
+            {'level': 'T11', 'landmarks': lm_small, 'heights': {'anterior_mm': 5.0, 'middle_mm': 5.0, 'posterior_mm': 5.0}, 'area_mm2': 140.0},
+            {'level': 'T12', 'landmarks': lm_norm, 'heights': {'anterior_mm': 30.0, 'middle_mm': 30.0, 'posterior_mm': 30.0}, 'area_mm2': 600.0},
+        ])
+        self.assertFalse(inter[1].get('is_fov_truncated', False))
+
+    def test_hotfix33_endplate_stepoff_global_continuity_and_coronal_x(self):
+        """Hotfix 3.3 Task 1.2: superior-endplate step-off + global continuity clamp for kyphotic B2 + coronal X Type C."""
+        p_t11 = BodyPlane((0.0, 0.0, 120.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (1.0, 1.0), (80, 80))
+        p_t12 = BodyPlane((0.0, 0.0, 90.0),  (0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (1.0, 1.0), (80, 80))
+        p_l1  = BodyPlane((0.0, 0.0, 60.0),  (0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (1.0, 1.0), (80, 80))
+
+        lm_norm = [[15.0, 58.0], [15.0, 38.0], [30.0, 58.0], [30.0, 38.0], [45.0, 58.0], [45.0, 38.0]]
+        # T12 is severely collapsed anteriorly (Ha/Hp < 0.65, rel_coll < 0.72), but posterior wall of T11 & L1 aligns straight at Y=45
+        lm_wedged_b2 = [[15.0, 47.0], [15.0, 38.0], [30.0, 50.0], [30.0, 38.0], [48.0, 58.0], [48.0, 38.0]]
+        v_b2 = [
+            {'level': 'T11', 'landmarks': lm_norm, 'spinous_tip': [65.0, 48.0], 'plane': p_t11},
+            {'level': 'T12', 'landmarks': lm_wedged_b2, 'spinous_tip': [65.0, 48.0], 'plane': p_t12},
+            {'level': 'L1',  'landmarks': lm_norm, 'spinous_tip': [65.0, 30.0], 'plane': p_l1},
+        ]
+        res_b2 = compute_intervertebral_metrics(v_b2)
+        self.assertLess(res_b2[1]['relative_collapse_ratio'], 0.72)
+        self.assertLess(res_b2[1]['ha_hp_ratio'], 0.65)
+        self.assertLess(res_b2[1]['translation_mm'], 3.5)
+
+        # Coronal X shift >= 3.8 mm triggers translation_mm >= 3.8
+        p_t12_lat = BodyPlane((5.2, 0.0, 90.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (1.0, 1.0), (80, 80))
+        v_coronal_c = [
+            {'level': 'T11', 'landmarks': lm_norm, 'spinous_tip': [65.0, 48.0], 'plane': p_t11},
+            {'level': 'T12', 'landmarks': lm_norm, 'spinous_tip': [65.0, 48.0], 'plane': p_t12_lat},
+            {'level': 'L1',  'landmarks': lm_norm, 'spinous_tip': [65.0, 48.0], 'plane': p_l1},
+        ]
+        res_cor = compute_intervertebral_metrics(v_coronal_c)
+        self.assertGreaterEqual(res_cor[1]['coronal_step_mm'], 4.5)
+        self.assertGreaterEqual(res_cor[1]['translation_mm'], 4.5)
+
+        # Intact vertebra sitting above a severely tilted/wedged superior endplate on inferior vertebra must not trigger false step-off
+        lm_tilted_inf = [[15.0, 40.0], [15.0, 22.0], [30.0, 45.0], [30.0, 22.0], [45.0, 58.0], [45.0, 22.0]]
+        v_tilted_below = [
+            {'level': 'T11', 'landmarks': lm_norm, 'spinous_tip': [65.0, 48.0], 'plane': p_t11},
+            {'level': 'T12', 'landmarks': lm_norm, 'spinous_tip': [65.0, 48.0], 'plane': p_t12},
+            {'level': 'L1',  'landmarks': lm_tilted_inf, 'spinous_tip': [65.0, 48.0], 'plane': p_l1},
+        ]
+        res_tilted = compute_intervertebral_metrics(v_tilted_below)
+        self.assertLess(res_tilted[1]['translation_mm'], 1.0)
+
+    def test_hotfix33_l4_l5_hinge_suppression_and_oof_injection_isolation(self):
+        """Hotfix 3.3: intact L4/L5 hinge sets delta_posterior_mm=0 and explicit engine/bank bypasses singletons."""
+        import spinal_ct.morphometry as morph
+
+        plane = BodyPlane((0.0, 0.0, 60.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (1.0, 1.0), (80, 80))
+        ct = np.full((80, 80), 40.0, dtype=np.float32)
+        valid = np.ones((80, 80), dtype=bool)
+        mask = np.zeros((80, 80), dtype=bool)
+        mask[22:58, 15:46] = True
+        ct[mask] = 400.0
+        # Simulated osteophyte / bevel bulge posterior to L5 line while heights/endplates are well preserved
+        ct[38:44, 46:50] = 400.0
+        lm = [[15.0, 56.0], [15.0, 22.0], [30.0, 56.0], [30.0, 23.0], [45.0, 58.0], [45.0, 22.0]]
+
+        sess = BodySession('fp_l5', 'L5', 'Baseline', plane, ct, valid, mask.copy(),
+                           mask=mask.copy(), landmarks=lm, age_group='adult')
+        sess._ensure_retropulsion(force=True)
+        self.assertEqual(sess.retropulsion['delta_posterior_mm'], 0.0)
+
+        # Singleton isolation test: injected custom engine & bank must NOT touch global singletons or _cached_*
+        morph._INFERENCE_ENGINE = None
+        morph._PROTOTYPE_BANK = None
+
+        class _DummyEngine:
+            def __init__(self):
+                self.calls = 0
+            def predict_batch(self, body_rois, arch_rois):
+                self.calls += len(body_rois)
+                return ([{'p_pw': 0.91, 'p_ep2': 0.12, 'p_post_tb': 0.05, 'p_ant_tb': 0.02, 'p_trans': 0.03, 'p_fracture': 0.88}] * len(body_rois), 0.001)
+
+        class _DummyBank:
+            def __init__(self):
+                self.calls = 0
+            def predict(self, feats, level=None):
+                self.calls += 1
+                return {'predicted_class': 'A3', 'p_anomaly': 0.82, 'class_probabilities': {'A3': 0.75, 'Normal': 0.15}}
+
+        eng = _DummyEngine()
+        bk = _DummyBank()
+        from spinal_ct.morphometry import SpineSession
+        spine = SpineSession(patient_id='OOF_TEST')
+        spine.add_session(sess)
+        spine.recompute_aospine_classification(inference_engine=eng, prototype_bank=bk)
+
+        self.assertEqual(eng.calls, 1)
+        self.assertEqual(bk.calls, 1)
+        self.assertIsNone(morph._INFERENCE_ENGINE)
+        self.assertIsNone(morph._PROTOTYPE_BANK)
+        self.assertIsNone(sess._cached_dl_probs)
+        self.assertIsNone(sess._cached_proto_result)
+
+    def test_tilted_normal_vertebra_no_false_retropulsion(self):
+        """Tilted normal vertebra (~18 deg lordosis) must not trigger false retropulsion from top/bottom band swap."""
+        shape = (80, 80)
+        ct = np.full(shape, 40.0, dtype=np.float32)
+        mask = np.zeros(shape, dtype=bool)
+        for r in range(20, 56):
+            shift = (r - 20) * 0.33  # tan(18.26 deg) = 0.33
+            c0 = int(round(14.0 + shift))
+            c1 = int(round(42.0 + shift))
+            mask[r, c0:c1 + 1] = True
+            ct[r, c0:c1 + 1] = 400.0
+
+        # Landmarks inset slightly inside cortical margin so mask-corner clamp executes
+        lm_tilted = [
+            [26.0, 55.0],
+            [14.5, 20.0],
+            [39.0, 55.0],
+            [27.5, 20.0],
+            [52.0, 55.0],
+            [40.5, 20.0],
+        ]
+        res_clean = measure_posterior_wall_retropulsion(
+            ct, (1.0, 1.0), lm_tilted, body_mask=mask,
+        )
+        self.assertLess(res_clean['delta_posterior_mm'], 1.0)
+
+        # True central focal retropulsion (+5 mm behind tilted wall) still detected cleanly
+        ct_frag = ct.copy()
+        ct_frag[35:41, 49:55] = 450.0
+        res_frag = measure_posterior_wall_retropulsion(
+            ct_frag, (1.0, 1.0), lm_tilted, body_mask=mask,
+        )
+        self.assertGreaterEqual(res_frag['delta_posterior_mm'], 3.5)
+
+    def test_smooth_physiological_lordosis_no_phantom_type_c(self):
+        """25-deg smooth physiological lordosis curve (dev_curve > 7mm, step_raw ~ 0) stays < 1.0mm;
+        true 5mm translation still yields >= 4.5mm."""
+        R = 95.0
+        thetas = np.deg2rad([23.0, 0.0, -23.0])  # T12 (+23 deg), L1 (0 deg apex), L2 (-23 deg)
+        levels = ['T12', 'L1', 'L2']
+        curved_verts = []
+        for lvl, th in zip(levels, thetas):
+            # Body center on smooth circular lordotic arc: dc/dth = R * e_si -> tangent & normal align with zero step-off
+            cx = 30.0 + R * (np.cos(th) - 1.0)
+            cy = 50.0 + R * np.sin(th)
+            e_ap = np.array([np.cos(th), np.sin(th)])    # anterior -> posterior along tilted endplate
+            e_si = np.array([-np.sin(th), np.cos(th)])   # inferior -> superior tangent to curve
+
+            def _pt(ap_off: float, si_off: float) -> list[float]:
+                p = np.array([cx, cy]) + ap_off * e_ap + si_off * e_si
+                return [float(p[0]), float(p[1])]
+
+            lm = [
+                _pt(-14.0, +10.0), _pt(-14.0, -10.0),
+                _pt(0.0, +10.0),   _pt(0.0, -10.0),
+                _pt(+14.0, +10.0), _pt(+14.0, -10.0),
+            ]
+            curved_verts.append({
+                'level': lvl,
+                'landmarks': lm,
+                'spinous_tip': _pt(+34.0, 0.0),
+            })
+
+        res_curve = compute_intervertebral_metrics(curved_verts)
+        self.assertLess(res_curve[1]['translation_mm'], 1.0)
+
+        # True 9.0 mm posterior dislocation on curved spine yields >= 4.5 mm
+        dislocated_verts = [dict(v) for v in curved_verts]
+        dislocated_verts[1]['landmarks'] = [[p[0] + 9.0, p[1]] for p in curved_verts[1]['landmarks']]
+        dislocated_verts[1]['spinous_tip'] = [curved_verts[1]['spinous_tip'][0] + 9.0, curved_verts[1]['spinous_tip'][1]]
+        res_dis = compute_intervertebral_metrics(dislocated_verts)
+        self.assertGreaterEqual(res_dis[1]['translation_mm'], 4.5)
+
+    def test_coronal_sequence_tilt_compensation_endpoints(self):
+        """4-vertebra sequence tilted uniformly 10 deg in coronal X-Z must not fire false coronal_step_mm
+        at sequence endpoints; < 3 vertebra chain must not self-trigger coronal_step_mm."""
+        lm_norm = [[15.0, 58.0], [15.0, 22.0], [30.0, 58.0], [30.0, 22.0], [45.0, 58.0], [45.0, 22.0]]
+        slope = float(np.tan(np.deg2rad(10.0)))
+        verts = []
+        for lvl, z_val in [('T11', 150.0), ('T12', 120.0), ('L1', 90.0), ('L2', 60.0)]:
+            pl = BodyPlane((slope * z_val, 0.0, z_val), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (1.0, 1.0), (80, 80))
+            verts.append({'level': lvl, 'landmarks': lm_norm, 'spinous_tip': [65.0, 48.0], 'plane': pl})
+
+        res_tilted = compute_intervertebral_metrics(verts)
+        for item in res_tilted:
+            self.assertLess(item['coronal_step_mm'], 0.5)
+            self.assertLess(item['translation_mm'], 1.0)
+
+        # < 3 LPS vertebrae (only 2 levels): endpoint noise does not self-trigger coronal_step_mm
+        res_two = compute_intervertebral_metrics(verts[:2])
+        for item in res_two:
+            self.assertEqual(item['coronal_step_mm'], 0.0)
+
+    def test_auto_segment_trims_attached_pedicle_stub_even_with_separated_spinous(self):
+        """Hotfix 4.3b: off-center attached pedicle stub (rows 40:54, cols 46:60) must be trimmed
+        even when a spinous island (cols 72:88) triggers has_separated_posterior_arch."""
+        shape = (80, 100)
+        ct = np.full(shape, 40.0, dtype=np.float32)
+        valid = np.ones(shape, dtype=bool)
+        hint = np.zeros(shape, dtype=bool)
+
+        # Vertebral body: rows 20:56, cols 15:46 (height = 36 mm, center = 37.5)
+        hint[20:56, 15:46] = True
+        # Off-center pedicle stub attached to upper posterior border: rows 40:54 (14 mm), cols 46:60
+        hint[40:54, 46:60] = True
+        # Separated spinous process island across canal: cols 72:88
+        hint[25:45, 72:88] = True
+        ct[hint] = 400.0
+
+        res = auto_segment_body(ct, valid, hint, (1.0, 1.0), return_details=True)
+        body_mask = res['body_mask']
+        arch_mask = res['posterior_arch_mask']
+
+        self.assertIsNotNone(res['cut_col'])
+        max_col = int(np.nonzero(body_mask)[1].max())
+        self.assertLessEqual(max_col, 48)
+        # Spinous island preserved in posterior_arch_mask alongside trimmed pedicle tail
+        self.assertTrue(arch_mask[:, 72:88].any())
+        self.assertTrue(arch_mask[:, 46:60].any())
 
 
 if __name__ == '__main__':

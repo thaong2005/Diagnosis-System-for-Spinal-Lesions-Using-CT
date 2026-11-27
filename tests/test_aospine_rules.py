@@ -347,6 +347,106 @@ class TestAOSpineRules(unittest.TestCase):
         self.assertIn('Gãy lún chêm A1', res['clinical_rationale_vi'])
         self.assertLess(res['concept_probs']['p_post_tb'], 0.25)
 
+    def test_hotfix33_b2_vs_burst_gating_keeps_grey_isp_in_m1(self):
+        """Hotfix 3.3: clear burst (p_pw >= 0.50) with grey-zone ISP (< 1.45) stays A3/A4 + M1 when s_post_tb < 0.55."""
+        metrics = {
+            'level': 'L1',
+            'ha_hp_ratio': 0.88,
+            'hm_hp_ratio': 0.78,
+            'relative_collapse_ratio': 0.82,
+            'delta_posterior_mm': 3.2,
+            'isp_ratio': 1.38,  # grey zone (1.15 - 1.45)
+            'translation_mm': 0.6,
+            'q_seg': 0.90,
+        }
+        probs_grey_tb = {
+            'p_trans': 0.05,
+            'p_ant_tb': 0.05,
+            'p_post_tb': 0.51,  # < 0.55 threshold
+            'p_pw': 0.65,
+            'p_ep2': 0.25,
+            'p_fracture': 0.92,
+            'p_split': 0.0,
+        }
+        res = evaluate_aospine_decision_tree(metrics, fused_concept_probs=probs_grey_tb)
+        self.assertEqual(res['predicted_class'], 'A3')
+        self.assertTrue(res['modifier_m1'])
+
+        # When s_post_tb >= 0.55, B2 overtakes burst
+        probs_confirmed_tb = dict(probs_grey_tb, p_post_tb=0.60)
+        res_b2 = evaluate_aospine_decision_tree(metrics, fused_concept_probs=probs_confirmed_tb)
+        self.assertEqual(res_b2['predicted_class'], 'B2')
+
+    def test_hotfix33_p_ep2_separates_wedged_a4_from_single_endplate_a3(self):
+        """Hotfix 3.3: severe A4 with concomitant wedging (Ha/Hp < 0.75) yields high p_ep2;
+        mild/moderate single-endplate A3 (rel_coll >= 0.72) stays A3."""
+        # Wedged A4 with severe whole-body + middle collapse & large retropulsion
+        wedged_a4 = {
+            'level': 'L1',
+            'ha_hp_ratio': 0.57,
+            'hm_hp_ratio': 0.71,
+            'relative_collapse_ratio': 0.62,
+            'upper_endplate_deformity_mm': 0.0,
+            'lower_endplate_deformity_mm': 1.5,
+            'delta_posterior_mm': 5.5,
+            'isp_ratio': 1.12,
+            'translation_mm': 0.8,
+            'q_seg': 0.90,
+        }
+        res_a4 = evaluate_aospine_decision_tree(wedged_a4)
+        self.assertGreater(res_a4['concept_probs']['p_ep2'], 0.80)
+        self.assertEqual(res_a4['predicted_class'], 'A4')
+
+        # Bilateral moderate endplate deformities (>= 1.5mm each) also escalate p_ep2
+        bilateral_a4 = dict(wedged_a4, relative_collapse_ratio=0.73, hm_hp_ratio=0.78,
+                            upper_endplate_deformity_mm=1.6, lower_endplate_deformity_mm=1.7)
+        res_bi = evaluate_aospine_decision_tree(bilateral_a4)
+        self.assertGreater(res_bi['concept_probs']['p_ep2'], 0.65)
+        self.assertEqual(res_bi['predicted_class'], 'A4')
+
+        # Moderate single-endplate A3 (rel_coll >= 0.72, one endplate < 1.5mm) stays A3
+        single_ep_a3 = {
+            'level': 'L1',
+            'ha_hp_ratio': 0.70,
+            'hm_hp_ratio': 0.76,
+            'relative_collapse_ratio': 0.76,
+            'upper_endplate_deformity_mm': 2.6,
+            'lower_endplate_deformity_mm': 0.7,
+            'delta_posterior_mm': 3.6,
+            'isp_ratio': 1.05,
+            'translation_mm': 0.4,
+            'q_seg': 0.90,
+        }
+        res_a3 = evaluate_aospine_decision_tree(single_ep_a3)
+        self.assertLessEqual(res_a3['concept_probs']['p_ep2'], 0.25)
+        self.assertEqual(res_a3['predicted_class'], 'A3')
+
+    def test_hotfix43a_normal_sequence_tiebreak_prefers_higher_anomaly(self):
+        """Hotfix 4.3a: when all vertebrae are Normal (lesion_severity_score=0), ranking prioritizes
+        higher latent p_abnormal / p_anomaly instead of defaulting to T10."""
+        m_crisp = {
+            'level': 'T10',
+            'q_seg': 0.90,
+            'ha_hp_ratio': 0.99,
+            'hm_hp_ratio': 0.99,
+            'relative_collapse_ratio': 1.00,
+            'delta_posterior_mm': 0.0,
+            'isp_ratio': 1.00,
+            'translation_mm': 0.2,
+        }
+        m_sub = dict(m_crisp, level='T12', ha_hp_ratio=0.84, relative_collapse_ratio=0.87)
+        m_l1 = dict(m_crisp, level='L1')
+
+        p_crisp = {'p_trans': 0.05, 'p_ant_tb': 0.05, 'p_post_tb': 0.05, 'p_pw': 0.05, 'p_ep2': 0.05, 'p_fracture': 0.05, 'p_split': 0.0, 'p_anomaly': 0.08}
+        p_t12 = {'p_trans': 0.08, 'p_ant_tb': 0.06, 'p_post_tb': 0.10, 'p_pw': 0.12, 'p_ep2': 0.08, 'p_fracture': 0.25, 'p_split': 0.0, 'p_anomaly': 0.44}
+        p_l1 = dict(p_t12, p_anomaly=0.20, p_fracture=0.25)
+
+        res = rank_and_classify_spine([m_crisp, m_t12 := m_sub, m_l1], [p_crisp, p_t12, p_l1])
+        self.assertTrue(all(v['predicted_class'] == 'Normal' for v in res['ranked_vertebrae']))
+        self.assertTrue(all(v['lesion_severity_score'] == 0.0 for v in res['ranked_vertebrae']))
+        self.assertEqual(res['patient_summary']['primary_lesion_level'], 'T12')
+        self.assertEqual(res['ranked_vertebrae'][0]['level'], 'T12')
+        self.assertEqual(res['ranked_vertebrae'][1]['level'], 'L1')
 
 
 if __name__ == '__main__':

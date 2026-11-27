@@ -695,7 +695,8 @@ class BodyReviewDialog(QDialog):
                 except Exception:
                     parasagittal_slices = None
             session = BodySession(self.fingerprint, self.level, self.source_kind, plane, ct, valid, hint,
-                                  age_group=self.age.currentData(), parasagittal_slices=parasagittal_slices)
+                                  age_group=self.age.currentData(), parasagittal_slices=parasagittal_slices,
+                                  source_ct=self.source if hasattr(self.source, 'GetSpacing') else None)
             self.stop_editing()
             self.session = session
             self.pending_plane = False
@@ -935,7 +936,8 @@ class BodyReviewDialog(QDialog):
                 except Exception:
                     parasagittal_slices = None
             sess = BodySession(self.fingerprint, lvl, self.source_kind, plane, ct, valid, hint,
-                               age_group=self.age.currentData(), parasagittal_slices=parasagittal_slices)
+                               age_group=self.age.currentData(), parasagittal_slices=parasagittal_slices,
+                               source_ct=self.source if hasattr(self.source, 'GetSpacing') else None)
             try:
                 sess.auto_populate(approve=False)
             except Exception:
