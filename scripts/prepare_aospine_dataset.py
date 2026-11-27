@@ -29,6 +29,8 @@ from spinal_ct.prototype_bank import (
     AOSpinePrototypeBank,
 )
 from spinal_ct.morphometry import auto_segment_body, extract_posterior_arch_mask
+from spinal_ct.ct_io import load_ct
+from spinal_ct.review import same_geometry
 from scripts.evaluate_aospine_baseline import (
     load_ground_truth,
     normalize_level_name,
@@ -37,6 +39,7 @@ from scripts.evaluate_aospine_baseline import (
     discover_patient_cases,
     parse_levels,
 )
+from scripts.run_batch_diagnosis import select_best_series
 
 LEVELS = ['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7',
           'T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'T8', 'T9', 'T10', 'T11', 'T12',
@@ -488,8 +491,6 @@ def extract_real_aospine_rois(
 
     print(f"Extracting Real 2.5D Dual-ROIs (Fixed FOV {fov_mm}mm, Isotropic {fov_mm/target_size[0]:.4f}mm/px)...")
 
-    reader = sitk.ImageSeriesReader()
-
     for c_dir in case_dirs:
         pid = c_dir.name
         slug = strip_accents(pid)
@@ -506,82 +507,70 @@ def extract_real_aospine_rois(
             print(f"Skipping {pid} ({slug}): Ground-truth missing true_level or true_class.")
             continue
 
-        parsed_true_levels = parse_levels(true_lvl) if true_lvl else []
+        parsed_true_levels = parse_levels(true_lvl)
 
         cand_dirs = [c_dir]
         for od in out_dirs:
             if strip_accents(od.name) == slug:
                 cand_dirs.append(od)
 
-        # Flaw 1 Fix: Prioritize 3D CT volume + 3D Mask (vertebrae.nii.gz) directly
+        # Prioritize exact series matched with vertebrae.nii.gz via select_best_series + load_ct + same_geometry (LPS)
         ct_3d_arr = None
         matched_mask_arr = None
         sp_xyz = None
         mid_x = None
 
-        # 1. Search processed directories with ct_hu.npy + localization_mc/vertebrae.nii.gz
-        cand_p_dirs = [
-            pd for pd in proc_dirs
-            if pd.is_dir() and (slug in strip_accents(pd.name) or (slug == 'huynhtriet' and pd.name == 'case_053') or pid == pd.name)
-        ]
-        for pd in cand_p_dirs:
-            vol_f = pd / 'ct_hu.npy'
-            mask_f = pd / 'localization_mc/vertebrae.nii.gz'
-            if vol_f.is_file() and mask_f.is_file():
-                try:
-                    ct_vol = np.load(vol_f, mmap_mode='r')
-                    m_img = sitk.ReadImage(str(mask_f))
-                    m_arr = sitk.GetArrayFromImage(m_img)
-                    if ct_vol.shape == m_arr.shape:
-                        ct_3d_arr = ct_vol
-                        matched_mask_arr = m_arr
-                        sp_xyz = m_img.GetSpacing()
-                        draft_file = pd / 'annotation_sagittal_draft.json'
-                        if draft_file.is_file():
-                            try:
-                                d_info = json.loads(draft_file.read_text(encoding='utf-8'))
-                                mid_x = d_info.get('slice_x_index')
-                            except Exception:
-                                pass
-                        break
-                except Exception:
-                    pass
+        mask_files: list[Path] = []
+        for cd in cand_dirs:
+            mask_files.extend(list(cd.glob('dinh_vi_cot_song/**/vertebrae.nii.gz')))
+        mask_files.sort(key=lambda p: (p.stat().st_mtime, p.stat().st_size), reverse=True)
 
-        # 2. Search raw DICOM series matching vertebrae.nii.gz
+        for mf in mask_files:
+            try:
+                ser = select_best_series(c_dir, mask_path=mf)
+                if not ser:
+                    continue
+                ct_img = load_ct(c_dir, ser['uid'])
+                m_img = sitk.ReadImage(str(mf))
+                if not same_geometry(ct_img, m_img):
+                    continue
+                ct_lps = sitk.DICOMOrient(ct_img, 'LPS')
+                m_lps = sitk.DICOMOrient(m_img, 'LPS')
+                ct_3d_arr = sitk.GetArrayFromImage(ct_lps).astype(np.float32)
+                matched_mask_arr = sitk.GetArrayFromImage(m_lps)
+                sp_xyz = m_lps.GetSpacing()
+                break
+            except Exception:
+                continue
+
+        # Fallback to precomputed ct_hu.npy only when raw DICOM/mask pair is absent
         if ct_3d_arr is None:
-            mask_files: list[Path] = []
-            for cd in cand_dirs:
-                mask_files.extend(list(cd.glob('dinh_vi_cot_song/**/vertebrae.nii.gz')))
-            mask_files.sort(key=lambda p: (p.stat().st_mtime, p.stat().st_size), reverse=True)
-
-            dcm_candidates: list[list[str]] = []
-            for sub in c_dir.rglob('*'):
-                if sub.is_dir():
+            cand_p_dirs = [
+                pd for pd in proc_dirs
+                if pd.is_dir() and (slug in strip_accents(pd.name) or pid == pd.name)
+            ]
+            for pd in cand_p_dirs:
+                vol_f = pd / 'ct_hu.npy'
+                mask_f = pd / 'localization_mc/vertebrae.nii.gz'
+                if vol_f.is_file() and mask_f.is_file():
                     try:
-                        files = reader.GetGDCMSeriesFileNames(str(sub))
-                        if files:
-                            dcm_candidates.append(files)
-                    except Exception:
-                        pass
-            dcm_candidates.sort(key=lambda s: len(s), reverse=True)
-
-            for mf in mask_files:
-                try:
-                    m_img = sitk.ReadImage(str(mf))
-                    m_arr = sitk.GetArrayFromImage(m_img)
-                    sz = m_arr.shape[0]
-                    for dcm_series in dcm_candidates:
-                        if len(dcm_series) == sz:
-                            reader.SetFileNames(dcm_series)
-                            ct_img = reader.Execute()
-                            ct_3d_arr = sitk.GetArrayFromImage(ct_img)
+                        ct_vol = np.load(vol_f, mmap_mode='r')
+                        m_img = sitk.ReadImage(str(mask_f))
+                        m_arr = sitk.GetArrayFromImage(m_img)
+                        if ct_vol.shape == m_arr.shape:
+                            ct_3d_arr = ct_vol
                             matched_mask_arr = m_arr
                             sp_xyz = m_img.GetSpacing()
+                            draft_file = pd / 'annotation_sagittal_draft.json'
+                            if draft_file.is_file():
+                                try:
+                                    d_info = json.loads(draft_file.read_text(encoding='utf-8'))
+                                    mid_x = d_info.get('slice_x_index')
+                                except Exception:
+                                    pass
                             break
-                    if ct_3d_arr is not None:
-                        break
-                except Exception:
-                    continue
+                    except Exception:
+                        pass
 
         if ct_3d_arr is None or matched_mask_arr is None:
             print(f"Warning: Could not match 3D CT and 3D Mask for {pid}. Skipping.")
@@ -602,7 +591,7 @@ def extract_real_aospine_rois(
         # Process each spine level in T10 - L5
         for lvl in SPINE_LEVELS:
             sample_id = f"{slug}_{lvl}"
-            is_injured = (lvl in parsed_true_levels) or (true_lvl and (lvl == true_lvl or lvl in true_lvl.split('-') or true_lvl in lvl))
+            is_injured = (lvl in parsed_true_levels) or (bool(true_lvl) and lvl == true_lvl)
             assigned_cls = true_cls if is_injured else 'Normal'
 
             lvl_idx = LEVELS.index(lvl) + 1 if lvl in LEVELS else 0

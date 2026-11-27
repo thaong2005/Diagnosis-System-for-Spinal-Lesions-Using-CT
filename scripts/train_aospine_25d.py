@@ -442,8 +442,27 @@ def train_aospine_dualstream(
             raise RuntimeError(f"Contract violation: rare patient {r['patient_id']} found in train set!")
 
     if smoke_test:
-        train_records = train_records[:8]
-        val_records = val_records[:4]
+        def _smoke_subset(recs: list[dict[str, Any]], total: int, max_frac: int) -> list[dict[str, Any]]:
+            fracs = [r for r in recs if r.get('aospine_class', 'Normal') != 'Normal']
+            norms = [r for r in recs if r.get('aospine_class', 'Normal') == 'Normal']
+            picked: list[dict[str, Any]] = []
+            seen_cls: set[str] = set()
+            for r in fracs:
+                c = r.get('aospine_class', '')
+                if c not in seen_cls and len(picked) < max_frac:
+                    picked.append(r)
+                    seen_cls.add(c)
+            for r in fracs:
+                if r not in picked and len(picked) < max_frac:
+                    picked.append(r)
+            for r in norms:
+                if len(picked) >= total:
+                    break
+                picked.append(r)
+            return picked[:total]
+
+        train_records = _smoke_subset(train_records, total=8, max_frac=4)
+        val_records = _smoke_subset(val_records, total=4, max_frac=1)
         epochs = 2
         batch_size = 4
 
@@ -471,10 +490,10 @@ def train_aospine_dualstream(
 
     print(f"Training DualStreamAOSpineNet on Fold {fold_idx} ({len(train_records)} train, {len(val_records)} val) using {device}...")
 
-    # Multi-task loss positive class weighting for concept imbalance
+    # Multi-task loss positive class weighting for concept imbalance (calibrated sqrt in [1.0, 3.0])
     n_frac_pos = sum(1 for r in train_records if r.get('is_fractured', 0) == 1 or r.get('aospine_class') != 'Normal')
     n_frac_neg = len(train_records) - n_frac_pos
-    pos_weight_frac = float(np.clip(n_frac_neg / max(n_frac_pos, 1), 1.0, 10.0))
+    pos_weight_frac = float(np.clip(np.sqrt(n_frac_neg / max(n_frac_pos, 1)), 1.0, 3.0))
 
     pw_c = []
     for c_idx in range(4):
@@ -487,7 +506,7 @@ def train_aospine_dualstream(
                 else:
                     n_neg += 1
         w = n_neg / max(n_pos, 1)
-        pw_c.append(float(np.clip(w, 1.0, 10.0)))
+        pw_c.append(float(np.clip(np.sqrt(w), 1.0, 3.0)))
     pos_weight_concepts = torch.tensor(pw_c, dtype=torch.float32)
 
     model = DualStreamAOSpineNet(in_channels=5, feature_dim=128).to(device)
