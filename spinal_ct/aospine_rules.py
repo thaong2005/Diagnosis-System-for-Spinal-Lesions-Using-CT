@@ -190,16 +190,28 @@ def compute_anatomical_rule_probabilities(metrics: dict[str, Any]) -> dict[str, 
     if both_endplates_fractured is not None:
         p_ep2 = max(p_collapse, 0.85) if bool(both_endplates_fractured) else min(p_collapse, 0.25)
     elif upper_deformity is not None and lower_deformity is not None:
-        p_up = fuzzy_sigmoid(float(upper_deformity), threshold=2.0, temperature=0.5)
-        p_lo = fuzzy_sigmoid(float(lower_deformity), threshold=2.0, temperature=0.5)
+        up_def = float(upper_deformity)
+        lo_def = float(lower_deformity)
+        p_up = fuzzy_sigmoid(up_def, threshold=2.0, temperature=0.5)
+        p_lo = fuzzy_sigmoid(lo_def, threshold=2.0, temperature=0.5)
         p_ep_geom = float(np.sqrt(p_up * p_lo))
-        if relative_collapse_ratio < 0.65 and ha_hp >= 0.75:
-            # Severe symmetric body collapse (pancake crush): both endplates crushed together
+        is_isolated_single_ep = ((up_def < 0.8 or lo_def < 0.8) and relative_collapse_ratio >= 0.62)
+        if (
+            (up_def >= 1.5 and lo_def >= 1.5)
+            or (relative_collapse_ratio < 0.72 and hm_hp < 0.75)
+            or (relative_collapse_ratio < 0.65 and ha_hp >= 0.75)
+            or (
+                relative_collapse_ratio < 0.65
+                and delta_posterior_mm >= 3.5
+                and not is_isolated_single_ep
+            )
+        ):
+            # Bilateral endplate involvement, central crush, or severe burst collapse -> A4
             p_ep2 = max(p_ep_geom, p_collapse)
-        elif upper_deformity >= 1.8 and lower_deformity < 1.5:
-            # Asymmetric single-endplate burst (A3)
-            p_ep2 = min(p_ep_geom, 0.25)
-        elif lower_deformity >= 1.8 and upper_deformity < 1.5:
+        elif (
+            (relative_collapse_ratio >= 0.72 or hm_hp >= 0.75)
+            and ((up_def >= 1.8 and lo_def < 1.5) or (lo_def >= 1.8 and up_def < 1.5))
+        ):
             # Asymmetric single-endplate burst (A3)
             p_ep2 = min(p_ep_geom, 0.25)
         else:
@@ -356,19 +368,26 @@ def evaluate_aospine_decision_tree(
     s_frac = probs['p_fracture']
     s_split = probs.get('p_split', 0.0)
 
+    isp_ratio = float(metrics.get('isp_ratio', 1.0))
+
     # Priority routing C > B > A > Normal
     # Type C requires confirmed translation/dislocation (s_trans >= 0.50)
     s_c = s_trans if s_trans >= 0.50 else 0.0
-    s_bc = max(s_c, s_ant_tb, s_post_tb)
+    # Clear burst (s_pw >= 0.50) without clear interspinous widening (isp_ratio < 1.45)
+    # requires s_post_tb >= 0.55 before B2 overtakes A3/A4 (keeps 1.15-1.45 in Modifier M1).
+    b2_blocked_by_burst = (s_pw >= 0.50 and isp_ratio < 1.45 and s_post_tb < 0.55)
+    s_b2_eff = 0.0 if b2_blocked_by_burst else s_post_tb
+    s_bc = max(s_c, s_ant_tb, s_b2_eff)
+    s_bc_normal = max(s_c, s_ant_tb, s_post_tb)
 
     raw_scores = {
         'C': s_c,
         'B3': (1.0 - s_c) * s_ant_tb,
-        'B2': (1.0 - s_c) * (1.0 - s_ant_tb) * s_post_tb if (s_frac >= 0.40 or s_c >= 0.40) else 0.0,
+        'B2': (1.0 - s_c) * (1.0 - s_ant_tb) * s_b2_eff if (s_frac >= 0.40 or s_c >= 0.40) else 0.0,
         'A4': (1.0 - s_bc) * s_frac * s_pw * s_ep2,
         'A3': (1.0 - s_bc) * s_frac * s_pw * (1.0 - s_ep2),
         'A0': (1.0 - s_bc) * (1.0 - s_frac) * 0.05,
-        'Normal': (1.0 - s_bc) * (1.0 - s_frac),
+        'Normal': (1.0 - s_bc_normal) * (1.0 - s_frac),
     }
 
     # A1 vs A2 routing: only activate A2 branch when explicit coronal split is present (> 2.0 mm)
@@ -382,18 +401,21 @@ def evaluate_aospine_decision_tree(
     total_raw = sum(raw_scores.values())
     class_probs = {k: float(v / max(total_raw, 1e-6)) for k, v in raw_scores.items()}
 
+    p_abnormal_val = 1.0 - float(class_probs.get('Normal', 0.0))
     predicted_class = max(class_probs, key=class_probs.get)
+    if predicted_class == 'Normal' and p_abnormal_val >= 0.70:
+        abnormal_candidates = {k: v for k, v in class_probs.items() if k not in ('Normal', 'A0')}
+        predicted_class = max(abnormal_candidates, key=abnormal_candidates.get)
     confidence = float(class_probs[predicted_class])
 
     # Check for Classic A1 Wedge Guard
     is_classic_a1_wedge = is_classic_wedge_fracture(metrics, s_ep2=s_ep2)
-    isp_ratio = float(metrics.get('isp_ratio', 1.0))
 
     # Combined Morphology Rule for B2
     # If posterior tension band is disrupted and vertebral body has fracture:
     # AO Spine dictates primary class B2 with secondary A subtype
     secondary_subtype = None
-    if s_trans < 0.50 and s_frac >= 0.40 and (
+    if (not b2_blocked_by_burst) and s_trans < 0.50 and s_frac >= 0.40 and (
         (s_post_tb >= 0.65 and isp_ratio >= 1.45) or s_post_tb >= 0.68
     ):
         predicted_class = 'B2'
@@ -492,12 +514,6 @@ def evaluate_aospine_decision_tree(
     else:
         rationale = (f"{level_name} - Đốt sống bình thường: Chiều cao thân đốt (trước/sau: {ha_hp*100:.0f}%), "
                      f"tường sau và dải căng sau đều trong giới hạn sinh lý.")
-
-    if predicted_class == 'Normal':
-        delta_pw = 0.0
-        isp_ratio = min(isp_ratio, 1.0)
-        if trans_mm < trans_thresh:
-            trans_mm = 0.0
 
     raw_metrics = dict(
         delta_posterior_mm=round(delta_pw, 2),
@@ -642,7 +658,16 @@ def rank_and_classify_spine(
         is_outside = (ev.get('level') not in AOSPINE_TARGET_LEVELS) if has_target_levels else False
         lvl = ev.get('level', '')
         lvl_idx = LEVELS.index(lvl) if lvl in LEVELS else 999
-        return (1 if is_excluded else 0, 1 if is_outside else 0, -ev.get('lesion_severity_score', 0.0), lvl_idx)
+        p_abn_tie = 1.0 - float(ev.get('class_probabilities', {}).get('Normal', 1.0))
+        p_anom_tie = float(ev.get('concept_probs', {}).get('p_anomaly', 0.0))
+        return (
+            1 if is_excluded else 0,
+            1 if is_outside else 0,
+            -ev.get('lesion_severity_score', 0.0),
+            -round(p_abn_tie, 4),
+            -round(p_anom_tie, 4),
+            lvl_idx,
+        )
 
     ranked = sorted(evaluations, key=_rank_sort_key)
 

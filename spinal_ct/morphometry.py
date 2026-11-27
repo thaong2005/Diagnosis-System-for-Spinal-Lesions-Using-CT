@@ -1,6 +1,7 @@
 """Editable body measurement sessions, review invalidation and reproducible export."""
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from typing import Any
 import csv
 import hashlib
 import html
@@ -268,8 +269,9 @@ def auto_segment_body(ct: np.ndarray, valid: np.ndarray, hint: np.ndarray,
                 arch_component = np.isin(labels_other, arch_cand_labels)
 
     cols = np.flatnonzero(body.any(axis=0))
+    pre_trim_body = body.copy()
     cut_col = None
-    if (not has_separated_posterior_arch) and len(cols) >= 6:
+    if len(cols) >= 6:
         c_min, c_max = int(cols[0]), int(cols[-1])
         span = c_max - c_min + 1
         col_heights = body[:, c_min:c_max + 1].sum(axis=0).astype(float) * sy
@@ -286,13 +288,49 @@ def auto_segment_body(ct: np.ndarray, valid: np.ndarray, hint: np.ndarray,
             # Behind the valley, check if there is a posterior peak (height rises back up)
             post_window = col_heights[s_start + min_idx_rel:]
             post_peak_height = float(np.max(post_window)) if len(post_window) > 0 else 0.0
-            has_posterior_peak = (post_peak_height >= 0.40 * ant_ref_height) or (post_peak_height >= 1.4 * max(valley_height, 1e-3))
 
-            if (valley_height <= params.neck_ratio * ant_ref_height) and has_posterior_peak:
-                drop_indices = np.flatnonzero(window <= params.neck_ratio * ant_ref_height)
-                neck_rel = int(drop_indices[0]) if len(drop_indices) else min_idx_rel
-                cut_col = c_min + min(s_start + min_idx_rel,
-                                      max(s_start + neck_rel, int(round(params.anterior_fraction * span))))
+            if not has_separated_posterior_arch:
+                has_posterior_peak = (post_peak_height >= 0.40 * ant_ref_height) or (post_peak_height >= 1.4 * max(valley_height, 1e-3))
+                if (valley_height <= params.neck_ratio * ant_ref_height) and has_posterior_peak:
+                    drop_indices = np.flatnonzero(window <= params.neck_ratio * ant_ref_height)
+                    neck_rel = int(drop_indices[0]) if len(drop_indices) else min_idx_rel
+                    cut_col = c_min + min(s_start + min_idx_rel,
+                                          max(s_start + neck_rel, int(round(params.anterior_fraction * span))))
+            else:
+                # Condition 1: Pedicle neck + genuine posterior arch/facet enlargement (excludes flat step boxes)
+                has_genuine_post_bulge = post_peak_height >= 1.35 * max(valley_height, 1e-3)
+                if (valley_height <= params.neck_ratio * ant_ref_height) and has_genuine_post_bulge:
+                    drop_indices = np.flatnonzero(window <= params.neck_ratio * ant_ref_height)
+                    neck_rel = int(drop_indices[0]) if len(drop_indices) else min_idx_rel
+                    cut_col = c_min + min(s_start + min_idx_rel,
+                                          max(s_start + neck_rel, int(round(params.anterior_fraction * span))))
+                else:
+                    # Condition 2: Off-center thin pedicle stub attached to rear half (>= 0.50*span)
+                    # Requires vertical center shift vs anterior body so central retropulsed burst fragments stay intact
+                    stub_start = max(s_start, int(round(0.50 * span)))
+                    stub_end = min(span - 1, max(stub_start + 1, int(round(0.92 * span))))
+                    if stub_end > stub_start:
+                        stub_win = col_heights[stub_start:stub_end]
+                        stub_drops = np.flatnonzero(stub_win <= 0.52 * ant_ref_height)
+                        if len(stub_drops) > 0:
+                            drop_rel = stub_start + int(stub_drops[0])
+                            tail_len_mm = float(span - drop_rel) * sx
+                            tail_slice = body[:, c_min + drop_rel:c_max + 1]
+                            front_slice = body[:, c_min:c_min + ant_span]
+                            if (
+                                tail_len_mm >= 4.0
+                                and float(np.median(col_heights[drop_rel:])) <= 0.48 * ant_ref_height
+                                and float(np.max(col_heights[drop_rel:])) <= 0.55 * ant_ref_height
+                                and tail_slice.any()
+                                and front_slice.any()
+                            ):
+                                front_rows_arr = np.flatnonzero(front_slice) // front_slice.shape[1]
+                                tail_rows_arr = np.flatnonzero(tail_slice) // tail_slice.shape[1]
+                                rc_shift_mm = abs(float(np.mean(tail_rows_arr)) - float(np.mean(front_rows_arr))) * sy
+                                if rc_shift_mm >= max(2.5, 0.12 * ant_ref_height):
+                                    cut_col = c_min + drop_rel
+
+            if cut_col is not None:
                 trimmed = body.copy()
                 trimmed[:, cut_col:] = False
                 if trimmed.any():
@@ -303,7 +341,8 @@ def auto_segment_body(ct: np.ndarray, valid: np.ndarray, hint: np.ndarray,
         raise ValueError('Segmented vertebral body region is too small (< 3 pixels).')
     if return_details:
         if arch_component is not None and arch_component.any():
-            posterior_arch = arch_component
+            cut_tail_mask = (pre_trim_body & (~body)) if cut_col is not None else np.zeros_like(body, dtype=bool)
+            posterior_arch = arch_component | cut_tail_mask
         else:
             posterior_arch = extract_posterior_arch_mask(candidate, cut_col, body_mask=body)
         return dict(body_mask=body, posterior_arch_mask=posterior_arch, cut_col=cut_col)
@@ -472,12 +511,35 @@ def compute_endplate_deformities(
     return round(float(up_def), 2), round(float(lo_def), 2)
 
 
+def _mask_touches_ct_boundary(valid_mask: np.ndarray | None, region_mask: np.ndarray | None) -> bool:
+    """Return True if region_mask touches the boundary of invalid CT voxels (~valid_mask)."""
+    if valid_mask is None or region_mask is None:
+        return False
+    valid_arr = np.asarray(valid_mask, dtype=bool)
+    reg_arr = np.asarray(region_mask, dtype=bool)
+    if valid_arr.shape != reg_arr.shape or not reg_arr.any():
+        return False
+    eroded_valid = valid_arr.copy()
+    for axis in (0, 1):
+        for shift in (-1, 1):
+            eroded_valid &= np.roll(valid_arr, shift, axis=axis)
+    return bool((reg_arr & ~eroded_valid).any())
+
+
 def is_vertebra_fov_truncated(session_or_data) -> bool:
     """Check if vertebra is truncated at the CT field of view boundary (< 8 mm height or < 200 mm2 area)."""
     if hasattr(session_or_data, 'landmarks') and getattr(session_or_data, 'landmarks', None) is not None:
         lm = session_or_data.landmarks
         mask = getattr(session_or_data, 'mask', None)
+        hint = getattr(session_or_data, 'hint', None)
+        valid = getattr(session_or_data, 'valid', None)
         plane = getattr(session_or_data, 'plane', None)
+
+        if valid is not None:
+            reg_mask = mask if (mask is not None and np.any(mask)) else hint
+            if not _mask_touches_ct_boundary(valid, reg_mask):
+                return False
+
         area_mm2 = 999.0
         if mask is not None and mask.any() and plane is not None:
             sx, sy = getattr(plane, 'spacing_xy_mm', (1.0, 1.0))
@@ -485,16 +547,28 @@ def is_vertebra_fov_truncated(session_or_data) -> bool:
             if 0.0 < area_mm2 < 200.0:
                 return True
 
-        if len(lm) == 6:
-            if plane is not None:
-                h = measure_heights(lm, plane)
-                ha = h.get('anterior_mm', 0.0)
-                hm = h.get('middle_mm', 0.0)
-                hp = h.get('posterior_mm', 0.0)
-                max_h = max(ha, hm, hp)
-                if (0.0 < max_h < 8.0) or (0.0 < max_h < 12.0 and area_mm2 < 250.0):
-                    return True
+        if len(lm) == 6 and plane is not None:
+            h = measure_heights(lm, plane)
+            ha = h.get('anterior_mm', 0.0)
+            hm = h.get('middle_mm', 0.0)
+            hp = h.get('posterior_mm', 0.0)
+            max_h = max(ha, hm, hp)
+            if (0.0 < max_h < 8.0) or (0.0 < max_h < 12.0 and area_mm2 < 250.0):
+                return True
     elif isinstance(session_or_data, dict):
+        touches = session_or_data.get('touches_ct_boundary')
+        if touches is None and 'valid_mask' in session_or_data:
+            valid_d = session_or_data.get('valid_mask')
+            reg_d = session_or_data.get('body_mask')
+            if reg_d is None or not np.any(reg_d):
+                reg_d = session_or_data.get('mask')
+            if reg_d is None or not np.any(reg_d):
+                reg_d = session_or_data.get('hint')
+            if reg_d is not None and np.any(reg_d):
+                touches = _mask_touches_ct_boundary(valid_d, reg_d)
+        if touches is False:
+            return False
+
         h = session_or_data.get('heights') or {}
         ha = h.get('anterior_mm', 0.0)
         hm = h.get('middle_mm', 0.0)
@@ -506,6 +580,47 @@ def is_vertebra_fov_truncated(session_or_data) -> bool:
         if (0.0 < max_h < 8.0) or (0.0 < max_h < 12.0 and area < 250.0):
             return True
     return False
+
+
+def _measure_retropulsion_from_body_mask(
+    body_mask: np.ndarray | None,
+    spacing_mm: tuple[float, float],
+) -> float | None:
+    """Measure posterior cortical convexity directly from body_mask corners (neutralizes inset_mm)."""
+    if body_mask is None or not np.any(body_mask):
+        return None
+    mask_arr = np.asarray(body_mask, dtype=bool)
+    rows = np.flatnonzero(mask_arr.any(axis=1))
+    if len(rows) < 4:
+        return 0.0
+    sx, sy = spacing_xy(spacing_mm)
+    quarter = max(1, len(rows) // 4)
+    r_bot_band = rows[:quarter]
+    r_top_band = rows[-quarter:]
+    c_bot = float(np.median([int(np.flatnonzero(mask_arr[r, :])[-1]) for r in r_bot_band if mask_arr[r, :].any()]))
+    c_top = float(np.median([int(np.flatnonzero(mask_arr[r, :])[-1]) for r in r_top_band if mask_arr[r, :].any()]))
+    r_bot = float(np.median(r_bot_band))
+    r_top = float(np.median(r_top_band))
+
+    x1, y1 = c_bot * sx, r_bot * sy
+    x2, y2 = c_top * sx, r_top * sy
+    dx = x2 - x1
+    dy = y2 - y1
+    line_len = float(np.hypot(dx, dy))
+    if line_len < 1e-4 or abs(dy) < 1e-4:
+        dx, dy, line_len = 0.0, 1.0, 1.0
+
+    max_protrusion = 0.0
+    for r in rows:
+        cols = np.flatnonzero(mask_arr[r, :])
+        if len(cols) == 0:
+            continue
+        x_mm = float(cols[-1]) * sx
+        y_mm = float(r) * sy
+        d_perp = ((x_mm - x1) * dy - (y_mm - y1) * dx) / line_len
+        if d_perp > max_protrusion:
+            max_protrusion = float(d_perp)
+    return round(max_protrusion, 3)
 
 
 def measure_posterior_wall_retropulsion(
@@ -615,8 +730,9 @@ def measure_posterior_wall_retropulsion(
         rows = np.flatnonzero(body_mask.any(axis=1))
         if len(rows) >= 4:
             quarter = max(1, len(rows) // 4)
-            r_top = rows[:quarter]
-            r_bot = rows[-quarter:]
+            # BodyPlane convention: row=0 is Inferior (lower), row=H-1 is Superior (upper)
+            r_bot = rows[:quarter]
+            r_top = rows[-quarter:]
             c_top = max(np.flatnonzero(body_mask[r, :])[-1] for r in r_top if body_mask[r, :].any())
             c_bot = max(np.flatnonzero(body_mask[r, :])[-1] for r in r_bot if body_mask[r, :].any())
             x_top_body = c_top * sx
@@ -642,11 +758,22 @@ def measure_posterior_wall_retropulsion(
     r_start = max(0, int(np.floor(y_min_mm / sy)))
     r_end = min(h, int(np.ceil(y_max_mm / sy)) + 1)
 
-    slices_to_scan = [ct_arr]
+    # Keep scan inside the target body_mask row span so safety_margin_mm never hits adjacent vertebrae/S1
+    if body_mask is not None and np.any(body_mask):
+        body_rows = np.flatnonzero(np.asarray(body_mask, dtype=bool).any(axis=1))
+        if len(body_rows) > 0:
+            r_b_start = max(r_start, int(body_rows[0]))
+            r_b_end = min(r_end, int(body_rows[-1]) + 1)
+            if r_b_end > r_b_start:
+                r_start, r_end = r_b_start, r_b_end
+
+    dp_mask = _measure_retropulsion_from_body_mask(body_mask, (sx, sy))
+
+    para_slices: list[np.ndarray] = []
     if parasagittal_slices:
         for s in parasagittal_slices:
             if s is not None and s.shape == ct_arr.shape:
-                slices_to_scan.append(np.asarray(s, dtype=float))
+                para_slices.append(np.asarray(s, dtype=float))
 
     # Calculate baseline cortex offset:
     # When landmarks are inset into the body (by BodyAutoParams.inset_mm = 2.5 mm),
@@ -677,13 +804,17 @@ def measure_posterior_wall_retropulsion(
         if p20 >= 1.0:
             baseline_offset_mm = min(p20, 3.5)
 
-    max_delta = 0.0
-    best_pt = None
-    retropulsed_mask = np.zeros((h, w), dtype=bool)
-    retropulsed_pixel_count = 0
-
-    for slice_idx, s_arr in enumerate(slices_to_scan):
-        for r in range(r_start, r_end):
+    def _scan_slice_rows(
+        s_arr: np.ndarray,
+        row_lo: int,
+        row_hi: int,
+        record_mask: bool = False,
+        cap_delta: float | None = None,
+    ) -> tuple[float, list[float] | None]:
+        nonlocal retropulsed_pixel_count
+        slice_max = 0.0
+        slice_pt = None
+        for r in range(row_lo, row_hi):
             y_mm = r * sy
             x_line_mm = x1 + (dx / dy) * (y_mm - y1)
             c_line = x_line_mm / sx
@@ -715,13 +846,42 @@ def measure_posterior_wall_retropulsion(
                 # Normal vector pointing into canal (increasing x): (dy, -dx) / line_len
                 d_perp = ((x_mm - x1) * dy - (y_mm - y1) * dx) / line_len
                 eff_delta = max(0.0, d_perp - baseline_offset_mm)
+                if cap_delta is not None:
+                    eff_delta = min(eff_delta, cap_delta)
                 if eff_delta > 0.0:
-                    if slice_idx == 0:
+                    if record_mask:
                         retropulsed_mask[r, c] = True
                         retropulsed_pixel_count += 1
-                    if eff_delta > max_delta:
-                        max_delta = float(eff_delta)
-                        best_pt = [round(x_mm, 2), round(y_mm, 2)]
+                    if eff_delta > slice_max:
+                        slice_max = float(eff_delta)
+                        slice_pt = [round(x_mm, 2), round(y_mm, 2)]
+        return slice_max, slice_pt
+
+    retropulsed_mask = np.zeros((h, w), dtype=bool)
+    retropulsed_pixel_count = 0
+
+    # 1. Scan mid-sagittal slice first
+    delta_mid, best_pt_mid = _scan_slice_rows(ct_arr, r_start, r_end, record_mask=True)
+    max_delta = float(delta_mid)
+    best_pt = best_pt_mid
+
+    # 2. Gate parasagittal (+/- 4mm) slices to prevent anatomical pedicles from creating false bursts
+    #    when both the mid-sagittal slice (< 1.5 mm) and body_mask posterior wall (< 1.5 mm) are flat.
+    has_mid_or_mask_protrusion = (delta_mid >= 1.5) or (dp_mask is not None and dp_mask >= 1.5)
+    if has_mid_or_mask_protrusion:
+        para_r_start, para_r_end = r_start, r_end
+        para_cap = None
+    else:
+        r_span = max(1, r_end - r_start)
+        para_r_start = max(r_start, int(np.floor(r_start + 0.25 * r_span)))
+        para_r_end = min(r_end, int(np.ceil(r_start + 0.55 * r_span)) + 1)
+        para_cap = max(float(delta_mid), float(dp_mask) if dp_mask is not None else 0.0)
+
+    for p_arr in para_slices:
+        p_max, p_pt = _scan_slice_rows(p_arr, para_r_start, para_r_end, record_mask=False, cap_delta=para_cap)
+        if p_max > max_delta:
+            max_delta = float(p_max)
+            best_pt = p_pt
 
     encroachment_ratio = float(np.clip(max_delta / max(canal_depth_mm, 0.1), 0.0, 1.0))
 
@@ -874,6 +1034,26 @@ def compute_intervertebral_metrics(vertebrae_data: list[dict],
     else:
         # List is cranial-to-caudal: neighbor above has index - 1
         sup_offset, inf_offset = -1, 1
+
+    # A vertebra sandwiched between valid non-truncated superior and inferior neighbors
+    # lies inside the middle of the CT scan and cannot be FOV-truncated at a boundary.
+    for idx in range(n):
+        if parsed[idx].get('is_fov_truncated'):
+            sup_idx = idx + sup_offset
+            inf_idx = idx + inf_offset
+            if 0 <= sup_idx < n and 0 <= inf_idx < n:
+                if (not parsed[sup_idx].get('is_fov_truncated')) and (not parsed[inf_idx].get('is_fov_truncated')):
+                    lvl_c = parsed[idx]['raw'].get('level')
+                    lvl_s = parsed[sup_idx]['raw'].get('level')
+                    lvl_i = parsed[inf_idx]['raw'].get('level')
+                    contiguous = (
+                        (lvl_c in LEVELS and lvl_s in LEVELS and lvl_i in LEVELS
+                         and abs(LEVELS.index(lvl_c) - LEVELS.index(lvl_s)) == 1
+                         and abs(LEVELS.index(lvl_c) - LEVELS.index(lvl_i)) == 1)
+                        or not (lvl_c in LEVELS and lvl_s in LEVELS and lvl_i in LEVELS)
+                    )
+                    if contiguous:
+                        parsed[idx]['is_fov_truncated'] = False
 
     def _get_neighbor(idx: int, offset: int) -> dict | None:
         target = idx + offset
@@ -1075,7 +1255,7 @@ def compute_intervertebral_metrics(vertebrae_data: list[dict],
         opening_angle = angle_deg if d_ant > d_post else 0.0
         return opening_angle, ratio
 
-    # Step 2b: Helper for intervertebral translation (step-off) perpendicular to vertebral wall tangents & spinal axis
+    # Step 2b: Helper for intervertebral translation (step-off) combining endplate tangent & spinal-axis orthogonality
     def _calc_step_off(v_sup: dict, v_inf: dict) -> float:
         lvl_u = v_sup['raw'].get('level')
         lvl_l = v_inf['raw'].get('level')
@@ -1085,57 +1265,76 @@ def compute_intervertebral_metrics(vertebrae_data: list[dict],
         if v_sup.get('landmarks_lps') and v_inf.get('landmarks_lps'):
             lm_sup = v_sup['landmarks_lps']
             lm_inf = v_inf['landmarks_lps']
-            as_sup, ai_sup = np.array(lm_sup[0], dtype=float), np.array(lm_sup[1], dtype=float)
-            ps_sup, pi_sup = np.array(lm_sup[4], dtype=float), np.array(lm_sup[5], dtype=float)
-            as_inf, ai_inf = np.array(lm_inf[0], dtype=float), np.array(lm_inf[1], dtype=float)
-            ps_inf, pi_inf = np.array(lm_inf[4], dtype=float), np.array(lm_inf[5], dtype=float)
-            c_sup = np.mean([as_sup, ai_sup, ps_sup, pi_sup], axis=0)
-            c_inf = np.mean([as_inf, ai_inf, ps_inf, pi_inf], axis=0)
-            u_spine = c_sup - c_inf
-            len_s = float(np.linalg.norm(u_spine))
-            d_post = pi_sup - ps_inf
-            d_ant = ai_sup - as_inf
-            if len_s > 1e-4:
-                e_tan = u_spine / len_s
-                d_post_par = np.dot(d_post, e_tan) * e_tan
-                d_ant_par = np.dot(d_ant, e_tan) * e_tan
-                step_post = float(np.linalg.norm(d_post - d_post_par))
-                step_ant = float(np.linalg.norm(d_ant - d_ant_par))
-            else:
-                step_post = float(np.linalg.norm(d_post))
-                step_ant = float(np.linalg.norm(d_ant))
-            return float(min(step_post, step_ant))
+            as_sup = np.array(lm_sup[0], dtype=float)[1:]
+            ai_sup = np.array(lm_sup[1], dtype=float)[1:]
+            ps_sup = np.array(lm_sup[4], dtype=float)[1:]
+            pi_sup = np.array(lm_sup[5], dtype=float)[1:]
+            as_inf = np.array(lm_inf[0], dtype=float)[1:]
+            ai_inf = np.array(lm_inf[1], dtype=float)[1:]
+            ps_inf = np.array(lm_inf[4], dtype=float)[1:]
+            pi_inf = np.array(lm_inf[5], dtype=float)[1:]
         elif has_any_lps:
             return 0.0
         else:
-            # Posterior wall step-off across disc space
-            ps_inf = np.array(v_inf['ps_pt'], dtype=float)
-            pi_inf = np.array(v_inf['pi_pt'], dtype=float)
-            ps_sup = np.array(v_sup['ps_pt'], dtype=float)
-            pi_sup = np.array(v_sup['pi_pt'], dtype=float)
-            d_post = pi_sup - ps_inf
-
-            # Anterior wall step-off across disc space
-            as_inf = np.array(v_inf['as_pt'], dtype=float)
-            ai_inf = np.array(v_inf['ai_pt'], dtype=float)
             as_sup = np.array(v_sup['as_pt'], dtype=float)
             ai_sup = np.array(v_sup['ai_pt'], dtype=float)
-            d_ant = ai_sup - as_inf
+            ps_sup = np.array(v_sup['ps_pt'], dtype=float)
+            pi_sup = np.array(v_sup['pi_pt'], dtype=float)
+            as_inf = np.array(v_inf['as_pt'], dtype=float)
+            ai_inf = np.array(v_inf['ai_pt'], dtype=float)
+            ps_inf = np.array(v_inf['ps_pt'], dtype=float)
+            pi_inf = np.array(v_inf['pi_pt'], dtype=float)
 
-            # Local spinal axis across the two adjacent vertebrae
-            u_spine = np.array(v_sup['centroid_xy'], dtype=float) - np.array(v_inf['centroid_xy'], dtype=float)
-            len_s = float(np.linalg.norm(u_spine))
-            if len_s > 1e-4:
-                e_tan = u_spine / len_s
-                e_norm = np.array([-e_tan[1], e_tan[0]])
-                step_post = abs(float(np.dot(d_post, e_norm)))
-                step_ant = abs(float(np.dot(d_ant, e_norm)))
-            else:
-                step_post = abs(float(d_post[0]))
-                step_ant = abs(float(d_ant[0]))
+        d_post = pi_sup - ps_inf
+        d_ant = ai_sup - as_inf
 
-            # True spinal dislocation involves displacement across both walls perpendicular to spinal axis
-            return float(min(step_post, step_ant))
+        # 1) Project onto inferior vertebra's superior endplate tangent (immune to v_sup B2 kyphotic wedge)
+        ep_tan = ps_inf - as_inf
+        len_ep = float(np.linalg.norm(ep_tan))
+        if len_ep > 1e-4:
+            e_ep = ep_tan / len_ep
+            step_ep = min(abs(float(np.dot(d_post, e_ep))), abs(float(np.dot(d_ant, e_ep))))
+        else:
+            step_ep = min(abs(float(d_post[0])), abs(float(d_ant[0])))
+
+        # 2) Project orthogonal to local column axis (c_sup - c_inf), scaled by u_len / h_avg
+        #    so true translation stays exact while single-endplate fracture bevel/tilt cannot inflate step-off
+        c_sup = 0.25 * (as_sup + ai_sup + ps_sup + pi_sup)
+        c_inf = 0.25 * (as_inf + ai_inf + ps_inf + pi_inf)
+        u_axis = c_sup - c_inf
+        len_u = float(np.linalg.norm(u_axis))
+        if len_u > 1e-4:
+            e_u = u_axis / len_u
+            orth_post = float(np.linalg.norm(d_post - float(np.dot(d_post, e_u)) * e_u))
+            orth_ant = float(np.linalg.norm(d_ant - float(np.dot(d_ant, e_u)) * e_u))
+            h_sup = 0.5 * (float(np.linalg.norm(as_sup - ai_sup)) + float(np.linalg.norm(ps_sup - pi_sup)))
+            h_inf = 0.5 * (float(np.linalg.norm(as_inf - ai_inf)) + float(np.linalg.norm(ps_inf - pi_inf)))
+            h_avg = max(0.5 * (h_sup + h_inf), 10.0)
+            scale = float(np.clip(len_u / h_avg, 1.0, 1.8))
+            step_axis = min(orth_post, orth_ant) * scale
+        else:
+            step_axis = 0.0
+
+        return float(min(step_ep, step_axis))
+
+    # Global coronal X(Z) slope across >= 3 valid non-S1 LPS vertebrae to remove patient tilt on endpoints
+    lps_centers_zx: list[tuple[float, float]] = []
+    for item in parsed:
+        if item.get('is_fov_truncated') or item['raw'].get('level') == 'S1':
+            continue
+        if item.get('landmarks_lps'):
+            c_item = np.mean(item['landmarks_lps'], axis=0)
+            lps_centers_zx.append((float(c_item[2]), float(c_item[0])))
+    has_global_coronal_slope = len(lps_centers_zx) >= 3
+    global_dx_dz = 0.0
+    if has_global_coronal_slope:
+        z_arr = np.array([p[0] for p in lps_centers_zx], dtype=float)
+        x_arr = np.array([p[1] for p in lps_centers_zx], dtype=float)
+        z_mean = float(np.mean(z_arr))
+        x_mean = float(np.mean(x_arr))
+        dz_var = float(np.sum((z_arr - z_mean) ** 2))
+        if dz_var > 1e-4:
+            global_dx_dz = float(np.sum((z_arr - z_mean) * (x_arr - x_mean)) / dz_var)
 
     # Step 3: Compute all 4 metrics for each vertebra
     results: list[dict] = []
@@ -1269,18 +1468,16 @@ def compute_intervertebral_metrics(vertebrae_data: list[dict],
                 dev_a = 0.0
 
             dev_curve = min(dev_c, dev_a)
-            # If vertebra is genuinely dislocated from the spinal trajectory (dev_curve >= 4.0),
-            # use max to capture the dislocation; if smoothly following spinal curvature (< 3.0), clamp to dev_curve
-            if dev_curve >= 4.0:
-                translation_mm = max(step_raw, dev_curve)
-            elif dev_curve < 3.0:
+            # Only use dev_curve to damp smooth spinal curve false step-offs (< 3.0mm);
+            # never inflate step_raw from physiological lordotic sagitta (dev_curve >= 4.0) into phantom Type C
+            if dev_curve < 3.0:
                 translation_mm = min(step_raw, dev_curve)
             else:
                 translation_mm = step_raw
         else:
             translation_mm = step_raw
 
-        # d) Relative collapse ratio (A4)
+        # d) Relative collapse ratio (A4) — compute early so global continuity check can use rel_collapse & ha_val
         if v_sup and v_inf:
             adj_mean = 0.5 * (v_sup['h_total'] + v_inf['h_total'])
             rel_collapse = float(curr['h_total'] / max(adj_mean, 0.1))
@@ -1291,16 +1488,77 @@ def compute_intervertebral_metrics(vertebrae_data: list[dict],
         else:
             rel_collapse = 1.0
 
-        out = dict(curr['raw'])
         ha_val = float(curr['heights'].get('anterior_posterior_ratio', 1.0))
         hm_val = float(curr['heights'].get('middle_posterior_ratio', 1.0))
+
+        # Global (i-1, i+1) posterior-wall continuity check for severely wedged/collapsed vertebrae (e.g. B2)
+        if (
+            v_sup and v_inf
+            and v_sup['raw'].get('level') != 'S1'
+            and v_inf['raw'].get('level') != 'S1'
+            and rel_collapse < 0.72
+            and ha_val < 0.65
+        ):
+            if v_sup.get('landmarks_lps') and v_inf.get('landmarks_lps'):
+                c_sup_g = np.mean(v_sup['landmarks_lps'], axis=0)[1:]
+                c_inf_g = np.mean(v_inf['landmarks_lps'], axis=0)[1:]
+                pi_sup_g = np.array(v_sup['landmarks_lps'][5], dtype=float)[1:]
+                ps_inf_g = np.array(v_inf['landmarks_lps'][4], dtype=float)[1:]
+            else:
+                c_sup_g = np.array(v_sup['centroid_xy'], dtype=float)
+                c_inf_g = np.array(v_inf['centroid_xy'], dtype=float)
+                pi_sup_g = np.array(v_sup['pi_pt'], dtype=float)
+                ps_inf_g = np.array(v_inf['ps_pt'], dtype=float)
+            u_glob = c_sup_g - c_inf_g
+            len_ug = float(np.linalg.norm(u_glob))
+            if len_ug > 1e-4:
+                e_glob = u_glob / len_ug
+                d_glob = pi_sup_g - ps_inf_g
+                global_wall_offset = float(np.linalg.norm(d_glob - np.dot(d_glob, e_glob) * e_glob))
+                if global_wall_offset < 3.5:
+                    translation_mm = min(translation_mm, max(global_wall_offset, 3.2))
+
+        # Coronal plane lateral step-off along X (Left-Right in 3D LPS) after linear scoliosis compensation
+        coronal_step_mm = 0.0
+        if curr.get('landmarks_lps'):
+            c_curr_lps = np.mean(curr['landmarks_lps'], axis=0)
+            x_curr = float(c_curr_lps[0])
+            z_curr = float(c_curr_lps[2])
+            has_sup_lps = bool(v_sup and v_sup['raw'].get('level') != 'S1' and v_sup.get('landmarks_lps'))
+            has_inf_lps = bool(v_inf and v_inf['raw'].get('level') != 'S1' and v_inf.get('landmarks_lps'))
+            if has_sup_lps and has_inf_lps:
+                c_sup_lps = np.mean(v_sup['landmarks_lps'], axis=0)
+                c_inf_lps = np.mean(v_inf['landmarks_lps'], axis=0)
+                dz_si = float(c_sup_lps[2] - c_inf_lps[2])
+                if abs(dz_si) > 1e-4:
+                    t_z = float((z_curr - c_inf_lps[2]) / dz_si)
+                    x_exp = float(c_inf_lps[0] + t_z * (c_sup_lps[0] - c_inf_lps[0]))
+                    coronal_step_mm = abs(x_curr - x_exp)
+                else:
+                    coronal_step_mm = abs(x_curr - 0.5 * float(c_sup_lps[0] + c_inf_lps[0]))
+            else:
+                dx_cands = []
+                if has_global_coronal_slope:
+                    if has_sup_lps:
+                        c_adj = np.mean(v_sup['landmarks_lps'], axis=0)
+                        dx_cands.append(abs((x_curr - float(c_adj[0])) - global_dx_dz * (z_curr - float(c_adj[2]))))
+                    if has_inf_lps:
+                        c_adj = np.mean(v_inf['landmarks_lps'], axis=0)
+                        dx_cands.append(abs((x_curr - float(c_adj[0])) - global_dx_dz * (z_curr - float(c_adj[2]))))
+                coronal_step_mm = max(dx_cands) if dx_cands else 0.0
+            if coronal_step_mm >= 3.8:
+                translation_mm = max(translation_mm, coronal_step_mm)
+
+        out = dict(curr['raw'])
         out.update({
+            'is_fov_truncated': False,
             'ha_hp_ratio': round(ha_val, 3),
             'hm_hp_ratio': round(hm_val, 3),
             'isp_ratio': round(isp_ratio, 3),
             'anterior_disc_angle_deg': round(ant_disc_angle, 2),
             'disc_opening_ratio': round(disc_open_ratio, 3),
             'translation_mm': round(translation_mm, 2),
+            'coronal_step_mm': round(coronal_step_mm, 2),
             'relative_collapse_ratio': round(rel_collapse, 3),
             'upper_endplate_deformity_mm': curr.get('upper_endplate_deformity_mm', 0.0),
             'lower_endplate_deformity_mm': curr.get('lower_endplate_deformity_mm', 0.0),
@@ -1409,6 +1667,7 @@ class BodySession:
     _cached_proto_sig: str | None = None
     _cached_proto_result: dict | None = None
     parasagittal_slices: list[np.ndarray] | None = None
+    source_ct: Any | None = field(default=None, repr=False)
 
     def __post_init__(self):
         shape = tuple(self.plane.size_xy[::-1])
@@ -1448,23 +1707,112 @@ class BodySession:
         if getattr(self, '_cached_rois_sig', None) == sig and getattr(self, '_cached_rois', None) is not None:
             return self._cached_rois
 
-        from spinal_ct.aospine_dataset import extract_body_canal_roi_25d, extract_posterior_arch_roi_25d
+        from spinal_ct.aospine_dataset import (
+            BONE_WINDOW_LEVEL,
+            BONE_WINDOW_WIDTH,
+            DEFAULT_PHYSICAL_FOV_MM,
+            apply_ct_window,
+            extract_body_canal_roi_25d,
+            extract_posterior_arch_roi_25d,
+        )
         spacing = getattr(self.plane, 'spacing_xy_mm', (1.0, 1.0))
         arch_mask = getattr(self, 'posterior_arch_mask', None)
         if arch_mask is None or not arch_mask.any():
             arch_mask = np.zeros_like(self.mask)
 
         try:
-            body_roi = extract_body_canal_roi_25d(
-                self.ct, self.mask, spacing,
-                curr_vert_landmarks=self.landmarks if len(self.landmarks) == 6 else None,
-                parasagittal_slices=self.parasagittal_slices,
-            )
-            arch_roi = extract_posterior_arch_roi_25d(
-                self.ct, arch_mask, spacing,
-                body_mask=self.mask,
-                parasagittal_slices=self.parasagittal_slices,
-            )
+            source_ct = getattr(self, 'source_ct', None)
+            if source_ct is not None and hasattr(source_ct, 'GetSpacing'):
+                from spinal_ct.body_region import sample_parasagittal_slices
+
+                sx_p, sy_p = spacing_xy(spacing)
+                h_orig, w_orig = self.mask.shape
+                pad_mm = 60.0
+                pad_c = max(0, int(round(pad_mm / sx_p)))
+                pad_r = max(0, int(round(pad_mm / sy_p)))
+                # Keep wide plane safely within BodyPlane's 4_000_000-pixel cap.
+                while (w_orig + 2 * pad_c) * (h_orig + 2 * pad_r) > 3_500_000 and max(pad_c, pad_r) > 0:
+                    pad_c = pad_c // 2
+                    pad_r = pad_r // 2
+
+                u_vec = np.asarray(self.plane.u_lps, dtype=float)
+                v_vec = np.asarray(self.plane.v_lps, dtype=float)
+                wide_origin = (
+                    np.asarray(self.plane.origin_lps_mm, dtype=float)
+                    - (pad_c * sx_p) * u_vec
+                    - (pad_r * sy_p) * v_vec
+                )
+                wide_plane = BodyPlane(
+                    tuple(wide_origin.tolist()),
+                    self.plane.u_lps,
+                    self.plane.v_lps,
+                    self.plane.spacing_xy_mm,
+                    (int(w_orig + 2 * pad_c), int(h_orig + 2 * pad_r)),
+                )
+                wide_ct, _, _ = sample_plane(source_ct, wide_plane)
+                wide_para = sample_parasagittal_slices(source_ct, wide_plane)
+
+                wide_mask = np.zeros(wide_ct.shape, dtype=bool)
+                wide_mask[pad_r:pad_r + h_orig, pad_c:pad_c + w_orig] = self.mask
+                wide_arch = np.zeros(wide_ct.shape, dtype=bool)
+                wide_arch[pad_r:pad_r + h_orig, pad_c:pad_c + w_orig] = arch_mask
+
+                shifted_landmarks = (
+                    [[float(pt[0]) + pad_c * sx_p, float(pt[1]) + pad_r * sy_p] for pt in self.landmarks]
+                    if len(self.landmarks) == 6
+                    else None
+                )
+                body_roi = extract_body_canal_roi_25d(
+                    wide_ct, wide_mask, (sx_p, sy_p),
+                    curr_vert_landmarks=shifted_landmarks,
+                    parasagittal_slices=wide_para,
+                )
+                arch_roi = extract_posterior_arch_roi_25d(
+                    wide_ct, wide_arch, (sx_p, sy_p),
+                    body_mask=wide_mask,
+                    parasagittal_slices=wide_para,
+                )
+
+                # Replace Ch 3 with true Axial Bone-Window slice at upper 1/3 of vertebral body
+                occ_rows, occ_cols = np.where(self.mask)
+                if len(occ_rows) > 0:
+                    r_min, r_max = int(occ_rows.min()), int(occ_rows.max())
+                    r_axial = float(r_min) + 0.67 * float(r_max - r_min)
+                    c_center_px = 0.5 * float(occ_cols.min() + occ_cols.max()) + 6.0 / max(sx_p, 1e-4)
+                    ax_center_lps = np.asarray(
+                        self.plane.point_lps((c_center_px * sx_p, r_axial * sy_p)),
+                        dtype=float,
+                    )
+                    fov_mm = DEFAULT_PHYSICAL_FOV_MM
+                    target_h, target_w = body_roi.shape[1], body_roi.shape[2]
+                    px_mm = fov_mm / float(target_w)
+                    py_mm = fov_mm / float(target_h)
+                    normal = np.cross(u_vec, v_vec)
+                    ax_origin = (
+                        ax_center_lps
+                        + (-0.5 * fov_mm + 0.5 * px_mm) * normal
+                        + (-0.5 * fov_mm + 0.5 * py_mm) * u_vec
+                    )
+                    ax_ref = sitk.Image([target_w, target_h, 1], sitk.sitkFloat32)
+                    ax_ref.SetOrigin(ax_origin.tolist())
+                    ax_ref.SetSpacing([px_mm, py_mm, 1.0])
+                    ax_ref.SetDirection(np.column_stack((normal, u_vec, v_vec)).ravel().tolist())
+                    ax_img = sitk.Resample(
+                        source_ct, ax_ref, sitk.Transform(), sitk.sitkLinear, -1024.0, sitk.sitkFloat32
+                    )
+                    ax_hu = sitk.GetArrayFromImage(ax_img)[0]
+                    body_roi[3] = apply_ct_window(ax_hu, BONE_WINDOW_LEVEL, BONE_WINDOW_WIDTH)
+            else:
+                body_roi = extract_body_canal_roi_25d(
+                    self.ct, self.mask, spacing,
+                    curr_vert_landmarks=self.landmarks if len(self.landmarks) == 6 else None,
+                    parasagittal_slices=self.parasagittal_slices,
+                )
+                arch_roi = extract_posterior_arch_roi_25d(
+                    self.ct, arch_mask, spacing,
+                    body_mask=self.mask,
+                    parasagittal_slices=self.parasagittal_slices,
+                )
             self._cached_rois_sig = sig
             self._cached_rois = (body_roi, arch_roi)
             return self._cached_rois
@@ -1487,7 +1835,14 @@ class BodySession:
         self.auto_provenance = None
         self.invalidate()
 
-    def set_landmarks(self, points):
+    def set_landmarks(
+        self,
+        points,
+        *,
+        recompute_classification: bool = True,
+        inference_engine: Any = None,
+        prototype_bank: Any = None,
+    ):
         points = np.asarray(points, float)
         if points.size == 0:
             self.landmarks = []
@@ -1503,7 +1858,11 @@ class BodySession:
         self.invalidate()
         if len(self.landmarks) == 6:
             self._ensure_retropulsion(force=True)
-            self.recompute_aospine_classification()
+            if recompute_classification:
+                self.recompute_aospine_classification(
+                    inference_engine=inference_engine,
+                    prototype_bank=prototype_bank,
+                )
 
     def _ensure_posterior_arch(self):
         if self.spinous_tip is not None and self.spinous_tip.get('tip_xy_mm') is not None:
@@ -1572,7 +1931,16 @@ class BodySession:
             ha_hp = float(h.get('anterior_posterior_ratio', 1.0))
             hm_hp = float(h.get('middle_posterior_ratio', 1.0))
             up_d, lo_d = compute_endplate_deformities(self.landmarks, body_mask=self.mask, spacing_mm=self.plane.spacing_xy_mm)
-            if ha_hp >= 0.80 and hm_hp >= 0.80 and up_d < 2.0 and lo_d < 2.0:
+            is_intact_body = (ha_hp >= 0.80 and hm_hp >= 0.80 and up_d < 2.0 and lo_d < 2.0)
+            # L4-L5 lumbosacral hinge protection: prevent beveled L5-S1 inferior edge from false PW boost
+            is_intact_lumbar_hinge = (
+                self.level in ('L4', 'L5')
+                and ha_hp >= 0.80
+                and hm_hp >= 0.85
+                and up_d < 2.5
+                and lo_d < 2.5
+            )
+            if is_intact_body or is_intact_lumbar_hinge:
                 if self.retropulsion:
                     self.retropulsion['delta_posterior_mm'] = 0.0
                     self.retropulsion['canal_encroachment_ratio'] = 0.0
@@ -1581,7 +1949,13 @@ class BodySession:
                 self.retropulsion['delta_posterior_mm'] = 0.0
                 self.retropulsion['canal_encroachment_ratio'] = 0.0
 
-    def recompute_aospine_classification(self, spine_sessions: list | dict | None = None) -> dict:
+    def recompute_aospine_classification(
+        self,
+        spine_sessions: list | dict | None = None,
+        *,
+        inference_engine: Any = None,
+        prototype_bank: Any = None,
+    ) -> dict:
         """Fast (< 10 ms) real-time recomputation of AO Spine classification."""
         self._ensure_posterior_arch()
         self._ensure_retropulsion()
@@ -1699,6 +2073,8 @@ class BodySession:
                     sp_lps = plane.point_lps(sp_pt) if (plane is not None and sp_pt is not None and hasattr(plane, 'point_lps')) else None
                     lm_lps = [plane.point_lps(pt) for pt in s.landmarks] if (plane is not None and s.landmarks and hasattr(plane, 'point_lps')) else None
                     up_d, lo_d = compute_endplate_deformities(s.landmarks, body_mask=s.mask, spacing_mm=s.plane.spacing_xy_mm)
+                    reg_m = s.mask if (s.mask is not None and s.mask.any()) else s.hint
+                    touches_b = _mask_touches_ct_boundary(s.valid, reg_m)
                     is_trunc = is_vertebra_fov_truncated(s)
                     v_metrics_list.append({
                         'level': s.level,
@@ -1712,6 +2088,7 @@ class BodySession:
                         'heights': h,
                         'upper_endplate_deformity_mm': up_d,
                         'lower_endplate_deformity_mm': lo_d,
+                        'touches_ct_boundary': touches_b,
                         'is_fov_truncated': is_trunc,
                     })
                 elif isinstance(s, dict) and len(s.get('landmarks', [])) == 6:
@@ -1722,7 +2099,16 @@ class BodySession:
 
                 # Batch DL concept inference across spine session
                 dl_probs_map: dict[str, dict[str, float]] = {}
-                engine = get_aospine_inference_engine()
+                custom_engine_supplied = (inference_engine is not None)
+                if custom_engine_supplied:
+                    if hasattr(inference_engine, 'predict_batch'):
+                        engine = inference_engine
+                    else:
+                        from spinal_ct.aospine_model import BatchedCPUInferenceEngine
+                        engine = BatchedCPUInferenceEngine(inference_engine)
+                else:
+                    engine = get_aospine_inference_engine()
+
                 if engine is not None:
                     sessions_to_infer = []
                     body_rois = []
@@ -1730,7 +2116,11 @@ class BodySession:
                     for s in session_list:
                         if isinstance(s, BodySession) and s.mask is not None and s.mask.any() and s.level in AOSPINE_TARGET_LEVELS:
                             sig = s._signature()
-                            if getattr(s, '_cached_dl_sig', None) == sig and getattr(s, '_cached_dl_probs', None) is not None:
+                            if (
+                                not custom_engine_supplied
+                                and getattr(s, '_cached_dl_sig', None) == sig
+                                and getattr(s, '_cached_dl_probs', None) is not None
+                            ):
                                 dl_probs_map[s.level] = s._cached_dl_probs
                             else:
                                 rois = s.extract_dualstream_rois()
@@ -1742,8 +2132,9 @@ class BodySession:
                         try:
                             batch_probs, _ = engine.predict_batch(body_rois, arch_rois)
                             for sess, probs in zip(sessions_to_infer, batch_probs):
-                                sess._cached_dl_sig = sess._signature()
-                                sess._cached_dl_probs = probs
+                                if not custom_engine_supplied:
+                                    sess._cached_dl_sig = sess._signature()
+                                    sess._cached_dl_probs = probs
                                 dl_probs_map[sess.level] = probs
                         except Exception as ex:
                             import warnings
@@ -1753,13 +2144,18 @@ class BodySession:
 
                 # Batch Prototype bank inference across spine session (T10-L5 only)
                 proto_results_map: dict[str, dict[str, Any]] = {}
-                bank = get_aospine_prototype_bank()
+                custom_bank_supplied = (prototype_bank is not None)
+                bank = prototype_bank if custom_bank_supplied else get_aospine_prototype_bank()
                 if bank is not None:
                     from spinal_ct.prototype_bank import extract_roi_prototype_features
                     for s in session_list:
                         if isinstance(s, BodySession) and s.mask is not None and s.mask.any() and s.level in AOSPINE_TARGET_LEVELS:
                             sig = s._signature()
-                            if getattr(s, '_cached_proto_sig', None) == sig and getattr(s, '_cached_proto_result', None) is not None:
+                            if (
+                                not custom_bank_supplied
+                                and getattr(s, '_cached_proto_sig', None) == sig
+                                and getattr(s, '_cached_proto_result', None) is not None
+                            ):
                                 proto_results_map[s.level] = s._cached_proto_result
                             else:
                                 rois = s.extract_dualstream_rois()
@@ -1767,8 +2163,9 @@ class BodySession:
                                     try:
                                         feats = extract_roi_prototype_features(rois[0], rois[1])
                                         res = bank.predict(feats, level=s.level)
-                                        s._cached_proto_sig = sig
-                                        s._cached_proto_result = res
+                                        if not custom_bank_supplied:
+                                            s._cached_proto_sig = sig
+                                            s._cached_proto_result = res
                                         proto_results_map[s.level] = res
                                     except Exception as ex_p:
                                         import warnings
@@ -1820,6 +2217,8 @@ class BodySession:
             q_val = self.spinous_tip.get('q_seg', 1.0) if self.spinous_tip else 1.0
 
             up_d, lo_d = compute_endplate_deformities(self.landmarks, body_mask=self.mask, spacing_mm=self.plane.spacing_xy_mm)
+            reg_m = self.mask if (self.mask is not None and self.mask.any()) else self.hint
+            touches_b = _mask_touches_ct_boundary(self.valid, reg_m)
             is_trunc = is_vertebra_fov_truncated(self)
 
             v_metrics = {
@@ -1831,15 +2230,29 @@ class BodySession:
                 'heights': h,
                 'upper_endplate_deformity_mm': up_d,
                 'lower_endplate_deformity_mm': lo_d,
+                'touches_ct_boundary': touches_b,
                 'is_fov_truncated': is_trunc,
             }
             dl_concept = None
-            engine = get_aospine_inference_engine()
+            custom_engine_supplied = (inference_engine is not None)
+            if custom_engine_supplied:
+                if hasattr(inference_engine, 'predict_batch'):
+                    engine = inference_engine
+                else:
+                    from spinal_ct.aospine_model import BatchedCPUInferenceEngine
+                    engine = BatchedCPUInferenceEngine(inference_engine)
+            else:
+                engine = get_aospine_inference_engine()
+
             rois = None
             if self.mask is not None and self.mask.any() and self.level in AOSPINE_TARGET_LEVELS:
                 sig = self._signature()
                 if engine is not None:
-                    if getattr(self, '_cached_dl_sig', None) == sig and getattr(self, '_cached_dl_probs', None) is not None:
+                    if (
+                        not custom_engine_supplied
+                        and getattr(self, '_cached_dl_sig', None) == sig
+                        and getattr(self, '_cached_dl_probs', None) is not None
+                    ):
                         dl_concept = self._cached_dl_probs
                     else:
                         rois = self.extract_dualstream_rois()
@@ -1848,16 +2261,22 @@ class BodySession:
                                 batch_probs, _ = engine.predict_batch([rois[0]], [rois[1]])
                                 if batch_probs:
                                     dl_concept = batch_probs[0]
-                                    self._cached_dl_sig = sig
-                                    self._cached_dl_probs = dl_concept
+                                    if not custom_engine_supplied:
+                                        self._cached_dl_sig = sig
+                                        self._cached_dl_probs = dl_concept
                             except Exception:
                                 pass
 
             proto_result = None
-            bank = get_aospine_prototype_bank()
+            custom_bank_supplied = (prototype_bank is not None)
+            bank = prototype_bank if custom_bank_supplied else get_aospine_prototype_bank()
             if bank is not None and self.mask is not None and self.mask.any() and self.level in AOSPINE_TARGET_LEVELS:
                 sig = self._signature()
-                if getattr(self, '_cached_proto_sig', None) == sig and getattr(self, '_cached_proto_result', None) is not None:
+                if (
+                    not custom_bank_supplied
+                    and getattr(self, '_cached_proto_sig', None) == sig
+                    and getattr(self, '_cached_proto_result', None) is not None
+                ):
                     proto_result = self._cached_proto_result
                 else:
                     if rois is None:
@@ -1867,8 +2286,9 @@ class BodySession:
                             from spinal_ct.prototype_bank import extract_roi_prototype_features
                             feats = extract_roi_prototype_features(rois[0], rois[1])
                             proto_result = bank.predict(feats, level=self.level)
-                            self._cached_proto_sig = sig
-                            self._cached_proto_result = proto_result
+                            if not custom_bank_supplied:
+                                self._cached_proto_sig = sig
+                                self._cached_proto_result = proto_result
                         except Exception:
                             pass
 
@@ -1892,7 +2312,15 @@ class BodySession:
 
         return self.aospine
 
-    def auto_populate(self, *, params: BodyAutoParams | None = None, approve: bool = False):
+    def auto_populate(
+        self,
+        *,
+        params: BodyAutoParams | None = None,
+        approve: bool = False,
+        recompute_classification: bool = True,
+        inference_engine: Any = None,
+        prototype_bank: Any = None,
+    ):
         params = params or BodyAutoParams()
         res = auto_segment_body(self.ct, self.valid, self.hint, self.plane.spacing_xy_mm,
                                 params=params, return_details=True)
@@ -1900,7 +2328,7 @@ class BodySession:
         cut_col = res.get('cut_col')
         landmarks = auto_detect_landmarks(mask, self.plane, params=params)
         self.set_mask(mask, clear_landmarks=True)
-        self.set_landmarks(landmarks)
+        self.set_landmarks(landmarks, recompute_classification=False)
         self.auto_provenance = dict(method='auto_v1', params=params.to_dict())
         if 'posterior_arch_mask' in res and res['posterior_arch_mask'] is not None and res['posterior_arch_mask'].any():
             self.posterior_arch_mask = res['posterior_arch_mask']
@@ -1909,7 +2337,11 @@ class BodySession:
             self.posterior_arch_mask = extract_posterior_arch_mask(self.hint, cut_col, body_mask=mask)
             self.spinous_tip = find_spinous_process_tip(self.posterior_arch_mask, self.plane.spacing_xy_mm)
         self._ensure_retropulsion(force=True)
-        self.recompute_aospine_classification()
+        if recompute_classification:
+            self.recompute_aospine_classification(
+                inference_engine=inference_engine,
+                prototype_bank=prototype_bank,
+            )
         if approve:
             self.approve()
 
@@ -2133,7 +2565,8 @@ def load_session(folder, source, *, fingerprint=None):
     if mask_digest(mask) != document.get('mask_sha256'):
         raise ValueError('Body mask has changed since this region was saved.')
     session = BodySession(fingerprint, document['level'], document['source_kind'], plane, ct, valid, hint,
-                          mask=mask, age_group=document['age_group'], parasagittal_slices=parasagittal_slices)
+                          mask=mask, age_group=document['age_group'], parasagittal_slices=parasagittal_slices,
+                          source_ct=source if hasattr(source, 'GetSpacing') else None)
     session.set_landmarks(document['landmarks_xy_mm'])
     session.auto_provenance = document.get('auto_provenance')
     if session._signature() != document.get('region_signature'):
@@ -2170,7 +2603,12 @@ class SpineSession:
         self.sessions[session.level] = session
         session.adjacent_sessions = self.sessions
 
-    def recompute_aospine_classification(self) -> dict:
+    def recompute_aospine_classification(
+        self,
+        *,
+        inference_engine: Any = None,
+        prototype_bank: Any = None,
+    ) -> dict:
         """Fast (< 10 ms) real-time recomputation for all vertebrae in session."""
         if not self.sessions:
             return dict(ranked_vertebrae=[], patient_summary={})
@@ -2180,7 +2618,11 @@ class SpineSession:
             key=lambda s: LEVELS.index(s.level) if s.level in LEVELS else 999
         )
         first_session = sorted_sessions[0]
-        first_session.recompute_aospine_classification(sorted_sessions)
+        first_session.recompute_aospine_classification(
+            sorted_sessions,
+            inference_engine=inference_engine,
+            prototype_bank=prototype_bank,
+        )
 
         self.ranked_vertebrae = []
         for s in sorted_sessions:
@@ -2202,7 +2644,16 @@ class SpineSession:
             is_outside = (ev.get('level') not in AOSPINE_TARGET_LEVELS) if has_target_levels else False
             lvl = ev.get('level', '')
             lvl_idx = LEVELS.index(lvl) if lvl in LEVELS else 999
-            return (1 if is_excluded else 0, 1 if is_outside else 0, -ev.get('lesion_severity_score', 0.0), lvl_idx)
+            p_abn_tie = 1.0 - float(ev.get('class_probabilities', {}).get('Normal', 1.0))
+            p_anom_tie = float(ev.get('concept_probs', {}).get('p_anomaly', 0.0))
+            return (
+                1 if is_excluded else 0,
+                1 if is_outside else 0,
+                -ev.get('lesion_severity_score', 0.0),
+                -round(p_abn_tie, 4),
+                -round(p_anom_tie, 4),
+                lvl_idx,
+            )
 
         self.ranked_vertebrae.sort(key=_spine_rank_sort_key)
         for rank_idx, v in enumerate(self.ranked_vertebrae, 1):

@@ -489,5 +489,52 @@ class TestAOSpinePrototypeBank(unittest.TestCase):
             self.assertAlmostEqual(anom_orig['anomaly_distance'], anom_loaded['anomaly_distance'], places=4)
 
 
+class TestGroundTruthAndSeriesSelection(unittest.TestCase):
+    """Phase 4.1 regression tests for CSV cleanup, level parsing, flat C-prefix dirs, and ROI extraction."""
+
+    def test_csv_nbsp_and_complex_levels_matching(self):
+        import tempfile
+        from scripts.evaluate_aospine_baseline import (
+            load_ground_truth,
+            normalize_level_name,
+            parse_levels,
+            discover_patient_cases,
+            strip_accents,
+        )
+
+        self.assertEqual(normalize_level_name('Gãy L1\xa0'), 'L1')
+        self.assertEqual(normalize_level_name('D11-D12'), 'T11-T12')
+        self.assertEqual(parse_levels('Gãy L1'), ['L1'])
+        self.assertEqual(parse_levels('D11-D12'), ['T11', 'T12'])
+        self.assertEqual(parse_levels('L3L4'), ['L3', 'L4'])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            csv_file = root / 'gt.csv'
+            csv_file.write_text(
+                "STT,Tên,Năm sinh,Đốt gãy,ID,phân loại,kèm theo\n"
+                "6,Phạm Sỹ Thế ,1996,L2,1240010187\xa0,A4,\n"
+                "24,Võ Văn Nhi,1995,Gãy L1,1240060146,A4,\n"
+                "15,Lê Quang Huy,1992,D11-D12,1240069906,C,\n"
+                "51,Lê Nữ Thu Giang,2002,L3L4,1240090611\xa0,C,\n",
+                encoding='utf-8-sig',
+            )
+            gt = load_ground_truth(csv_file)
+            self.assertEqual(gt[strip_accents('pham sy the')]['true_level'], 'L2')
+            self.assertEqual(gt[strip_accents('vo van nhi')]['true_level'], 'L1')
+            self.assertEqual(gt['1240010187']['name'], 'Phạm Sỹ Thế')
+            self.assertEqual(parse_levels(gt[strip_accents('le nu thu giang')]['true_level']), ['L3', 'L4'])
+
+            # Flat directory whose name starts with 'C' and contains a DICOM subfolder must NOT be split as category 'C'
+            data_dir = root / 'raw'
+            (data_dir / 'A3' / 'duong kim hoa').mkdir(parents=True)
+            (data_dir / 'Chau Doc' / 'DICOM').mkdir(parents=True)
+            found = discover_patient_cases(data_dir)
+            names = [p.name for p in found]
+            self.assertIn('duong kim hoa', names)
+            self.assertIn('Chau Doc', names)
+            self.assertNotIn('DICOM', names)
+
+
 if __name__ == '__main__':
     unittest.main()

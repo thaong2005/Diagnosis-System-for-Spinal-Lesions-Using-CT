@@ -377,6 +377,158 @@ class TestProductionThreePillarIntegration(unittest.TestCase):
         finally:
             plt.close(fig)
 
+    def test_body_session_source_ct_roi_parity_and_signature(self):
+        """Hotfix 3.2 Task 1: source_ct gives 80x80mm full context + true Axial Ch3 without altering _signature."""
+        import SimpleITK as sitk
+        from spinal_ct.body_region import propose_plane, sample_plane, sample_parasagittal_slices
+        from spinal_ct.morphometry import ct_fingerprint
+
+        # Build synthetic 3D LPS CT (Z=100, Y=100, X=60) with T12, L1, L2 bodies + canal
+        vol = np.full((100, 100, 60), -200.0, dtype=np.float32)
+        lbl = np.zeros((100, 100, 60), dtype=np.uint8)
+        # Body block cols Y=30..55, X=20..40 for three levels T12(14), L1(15), L2(16)
+        vol[65:85, 30:55, 20:40] = 420.0
+        vol[38:58, 30:55, 20:40] = 420.0
+        vol[12:32, 30:55, 20:40] = 420.0
+        lbl[65:85, 30:55, 20:40] = 14
+        lbl[38:58, 30:55, 20:40] = 15
+        lbl[12:32, 30:55, 20:40] = 16
+        # Posterior elements
+        vol[38:58, 70:82, 27:33] = 360.0
+
+        ct_img = sitk.GetImageFromArray(vol)
+        ct_img.SetSpacing((1.0, 1.0, 1.0))
+        lbl_img = sitk.GetImageFromArray(lbl)
+        lbl_img.SetSpacing((1.0, 1.0, 1.0))
+
+        # propose_plane keeps default margin_mm=5.0
+        plane = propose_plane(ct_img, lbl_img, 15)
+        self.assertLessEqual(max(plane.size_xy), 60)
+
+        ct_slice, valid_s, hint = sample_plane(ct_img, plane, lbl_img, 15)
+        para = sample_parasagittal_slices(ct_img, plane)
+        fp = ct_fingerprint(ct_img)
+
+        sess_2d = BodySession(fp, 'L1', 'Baseline', plane, ct_slice, valid_s, hint,
+                              mask=hint.copy(), age_group='adult', parasagittal_slices=para)
+        sess_3d = BodySession(fp, 'L1', 'Baseline', plane, ct_slice, valid_s, hint,
+                              mask=hint.copy(), age_group='adult', parasagittal_slices=para,
+                              source_ct=ct_img)
+
+        self.assertEqual(sess_2d._signature(), sess_3d._signature())
+
+        roi2d_body, _ = sess_2d.extract_dualstream_rois()
+        roi3d_body, _ = sess_3d.extract_dualstream_rois()
+
+        # 2D clipped plane has substantial zero (-1024 HU) border padding at top/bottom,
+        # whereas 3D wide extraction captures adjacent T12 & L2 context (> -200 HU)
+        self.assertGreater(float(np.mean(roi2d_body[0] == 0.0)), float(np.mean(roi3d_body[0] == 0.0)))
+        # Ch 3 (Axial bone window vs 2D sagittal soft-tissue window) must differ substantially
+        self.assertFalse(np.allclose(roi2d_body[3], roi3d_body[3]))
+
+    def test_run_batch_diagnosis_oof_fold_resolution_and_singleton_isolation(self):
+        """Hotfix 3.3 / Phase 4.2: OOF batch mode excludes non-CSV folders and keeps singletons None."""
+        import SimpleITK as sitk
+        import torch
+        from unittest.mock import patch
+        import spinal_ct.morphometry as morph
+        from spinal_ct.aospine_model import DualStreamAOSpineNet
+        from spinal_ct.prototype_bank import AOSpinePrototypeBank
+        from scripts.run_batch_diagnosis import resolve_oof_fold_for_patient, run_batch_diagnosis
+
+        splits = {
+            'rare_class_challenge_set': ['huynhtriet', 'havanquyet'],
+            'folds': [
+                {'fold_id': 0, 'val_patient_ids': ['patalpha'], 'train_patient_ids': ['patbeta']},
+                {'fold_id': 1, 'val_patient_ids': ['patbeta'], 'train_patient_ids': ['patalpha']},
+            ],
+        }
+        self.assertEqual(resolve_oof_fold_for_patient('patalpha', splits), (0, True, False))
+        self.assertEqual(resolve_oof_fold_for_patient('patbeta', splits), (1, True, False))
+        self.assertEqual(resolve_oof_fold_for_patient('huynhtriet', splits), (0, True, True))
+        self.assertEqual(resolve_oof_fold_for_patient('alal', splits), (None, False, False))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            raw_root = tmp / 'raw'
+            out_root = tmp / 'output'
+            models_dir = tmp / 'models'
+            banks_dir = tmp / 'banks'
+            models_dir.mkdir(parents=True)
+            banks_dir.mkdir(parents=True)
+
+            # CSV with only pat_alpha (A3 L1) and pat_beta (A4 L2); A4/a lal is absent from CSV
+            (raw_root / 'A3' / 'pat alpha').mkdir(parents=True)
+            (raw_root / 'A4' / 'pat beta').mkdir(parents=True)
+            (raw_root / 'A4' / 'a lal').mkdir(parents=True)
+            (raw_root / 'data ngay 27.09.2026.csv').write_text(
+                'STT,Tên,Đốt gãy,phân loại,ID,kèm theo\n'
+                '1,pat alpha,L1,A3,P01,\n'
+                '2,pat beta,L2,A4,P02,\n',
+                encoding='utf-8',
+            )
+            splits_file = tmp / 'splits.json'
+            splits_file.write_text(json.dumps(splits), encoding='utf-8')
+
+            # Create minimal synthetic 3D CT/mask shared via patched DICOM loader
+            from spinal_ct.localization import LEVELS
+            vol = np.full((90, 80, 60), -200.0, dtype=np.float32)
+            lbl = np.zeros((90, 80, 60), dtype=np.uint8)
+            for z0, lvl_name in [(62, 'T12'), (38, 'L1'), (14, 'L2')]:
+                lid = LEVELS.index(lvl_name) + 1
+                vol[z0:z0 + 16, 15:35, 20:40] = 400.0
+                lbl[z0:z0 + 16, 15:35, 20:40] = lid
+                vol[z0 + 4:z0 + 12, 46:60, 27:33] = 350.0
+                lbl[z0 + 4:z0 + 12, 46:60, 27:33] = lid
+            ct_img = sitk.GetImageFromArray(vol)
+            lbl_img = sitk.GetImageFromArray(lbl)
+
+            for slug in ('pat_alpha', 'pat_beta', 'a_lal'):
+                m_dir = out_root / slug / 'dinh_vi_cot_song' / 'run_fast_test'
+                m_dir.mkdir(parents=True)
+                sitk.WriteImage(lbl_img, str(m_dir / 'vertebrae.nii.gz'))
+
+            # Save two fold checkpoints and two fold prototype banks
+            for fid, trained_pid in [(0, 'patbeta'), (1, 'patalpha')]:
+                net = DualStreamAOSpineNet(in_channels=5, feature_dim=128)
+                torch.save(net.state_dict(), str(models_dir / f'aospine_dualstream_fold{fid}.pt'))
+                bank = AOSpinePrototypeBank()
+                dummy_feats = np.ones((2, 16), dtype=np.float32)
+                dummy_feats[1] *= 2.0
+                samples = [
+                    {'sample_id': f'{trained_pid}_T12', 'patient_id': trained_pid, 'level': 'T12', 'aospine_class': 'Normal', 'prototype_features': dummy_feats[0].tolist()},
+                    {'sample_id': f'{trained_pid}_L1', 'patient_id': trained_pid, 'level': 'L1', 'aospine_class': 'A3', 'prototype_features': dummy_feats[1].tolist()},
+                ]
+                bank.build_from_fold(samples, {s['sample_id'] for s in samples}, {trained_pid}, fold_id=fid)
+                bank.save(banks_dir / f'bank_fold_{fid}.json')
+
+            morph._INFERENCE_ENGINE = None
+            morph._PROTOTYPE_BANK = None
+            fake_ser = {'uid': '1.2.3.4', 'slices': 60, 'kernel': 'BONEPLUS', 'axial': True}
+
+            with patch('scripts.run_batch_diagnosis.select_best_series', return_value=fake_ser), \
+                 patch('scripts.run_batch_diagnosis.load_ct', return_value=ct_img):
+                summary = run_batch_diagnosis(
+                    force=True,
+                    oof=True,
+                    splits_path=splits_file,
+                    models_dir=models_dir,
+                    banks_dir=banks_dir,
+                    raw_root=raw_root,
+                    output_root=out_root,
+                )
+
+            self.assertEqual(summary['evaluation_mode'], '5fold_oof')
+            self.assertTrue(summary['singleton_isolated'])
+            self.assertEqual(summary['evaluated_cases'], 2)
+            self.assertEqual(summary['unlabeled_cases_count'], 0)
+            self.assertEqual(summary['skipped_unlabeled_oof'], ['A4/a lal'])
+            self.assertEqual(summary['failure_count'], 0)
+            fold_by_slug = {r['slug']: r['diagnosis']['oof_fold_id'] for r in summary['results']}
+            self.assertEqual(fold_by_slug, {'pat_alpha': 0, 'pat_beta': 1})
+            self.assertIsNone(morph._INFERENCE_ENGINE)
+            self.assertIsNone(morph._PROTOTYPE_BANK)
+
 
 if __name__ == '__main__':
     unittest.main()
